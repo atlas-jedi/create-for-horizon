@@ -339,7 +339,7 @@ impl Subsystem for Display {
 pub(crate) fn with_language<T>(host: &dyn Host, f: impl FnOnce(&Lang<'_>) -> T) -> T {
     f(&Lang {
         resolve: &|key, args| {
-            host.text_string(&Text::translate(
+            crate::glue::compat::text_string(host, &Text::translate(
                 key,
                 args.iter().map(|&s| Text::literal(s)).collect(),
             ))

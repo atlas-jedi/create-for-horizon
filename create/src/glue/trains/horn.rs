@@ -5,6 +5,7 @@
 //! manual whistle (`whistle_train_manual`, or `_low` for a large whistle) at the train's nearest
 //! carriage at the whistle's pitch, fading in and out, with its end sound as it stops.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::net;
 use super::super::server::ServerLevel;
 use super::super::world::{level_index, with_world};

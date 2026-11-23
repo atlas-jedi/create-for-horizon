@@ -679,12 +679,12 @@ pub(super) fn right_click_block(mut host: HostSide, event: &mut RightClickBlockE
     };
     let (is_clipboard, sneaking) = match &host {
         HostSide::Server(h) => (
-            stack.item().id(&**h) == Some("create:clipboard"),
+            stack.item().id(&**h) == "create:clipboard",
             h.player(click.player)
                 .is_some_and(|p| items::sneaking(&**h, p)),
         ),
         HostSide::Client(h) => (
-            stack.item().id(&**h) == Some("create:clipboard"),
+            stack.item().id(&**h) == "create:clipboard",
             h.local_player()
                 .is_some_and(|p| p.entity().is_shift_key_down(&**h) == Some(true)),
         ),
@@ -880,7 +880,7 @@ pub(crate) fn hover_tip(host: &dyn ClientHost) -> Option<([i32; 3], Vec<String>)
         let args = mapping
             .map(|m| vec![Text::new(mod_api::text::TextContent::Keybind(m.into()))])
             .unwrap_or_default();
-        host.text_string(&Text::translate(key, args))
+        host.text_string(&Text::translate(key, args)).unwrap_or_default()
     };
     if block == Block::Clipboard {
         return Some((

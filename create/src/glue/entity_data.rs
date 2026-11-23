@@ -16,10 +16,99 @@ use super::states;
 use super::subsystem::Subsystem;
 use super::world::with_world;
 use create_engine::Block;
+#[allow(unused_imports)]
 use mod_api::{
-    BlockEntityLoadAdditionalEvent, BlockEntityPart, BlockEntitySaveAdditionalEvent,
-    BlockEntityTypeKey, BlockPart, Compound, LevelHost, LevelRef, Registrar, Tag,
+    AttachmentCodec, AttachmentType, BlockEntityPart, BlockEntityTypeKey, BlockPart, Compound,
+    Holder, LevelHost, LevelRef, Registrar, Tag,
 };
+
+/// Horizon has no `saveAdditional`/`loadAdditional` hooks for a mod's block entity, so the
+/// fields of a column's block entities are kept in a chunk attachment of their own instead,
+/// written with the column and read back when it loads.
+static FIELDS: AttachmentType<Compound> = AttachmentType {
+    namespace: "create",
+    name: "entity_fields",
+    default: Compound::new,
+    codec: Some(AttachmentCodec {
+        encode: |data| Ok(data.clone()),
+        decode: |data| Ok(data.clone()),
+    }),
+    copy_on_death: false,
+    sync: false,
+};
+
+fn pos_key(pos: [i32; 3]) -> String {
+    format!("{},{},{}", pos[0], pos[1], pos[2])
+}
+
+fn key_pos(key: &str) -> Option<[i32; 3]> {
+    let mut it = key.split(',').map(|v| v.parse::<i32>().ok());
+    Some([it.next()??, it.next()??, it.next()??])
+}
+
+/// Writes the records of column `chunk` of `lv` into its fields attachment.
+fn store_column(lv: &mut ServerLevel<'_>, chunk: [i32; 2]) {
+    let level = lv.level;
+    let inside = |p: &[i32; 3]| [p[0] >> 4, p[2] >> 4] == chunk;
+    let data: Compound = RECORDS.with_borrow(|r| {
+        r.iter()
+            .filter(|((l, p), _)| *l == level && inside(p))
+            .map(|((_, p), record)| {
+                let mut entry = Compound::new();
+                entry.insert("block".into(), Tag::String(record.block.name().into()));
+                entry.insert("fields".into(), Tag::Compound(record.fields.clone()));
+                (pos_key(*p).as_str().into(), Tag::Compound(entry))
+            })
+            .collect()
+    });
+    let result = if data.is_empty() {
+        FIELDS
+            .remove(&mut *lv.host, Holder::Chunk(chunk))
+            .map(|_| ())
+    } else {
+        FIELDS.set(&mut *lv.host, Holder::Chunk(chunk), data)
+    };
+    if let Err(e) = result {
+        crate::create_log!("[create] writing block entity fields of {chunk:?}: {e:?}");
+    }
+}
+
+/// Queues the fields column `chunk` of `lv` kept, for [`load`] to give the subsystems.
+pub fn restore_column(lv: &mut ServerLevel<'_>, chunk: [i32; 2]) {
+    let level = lv.level;
+    let data = match FIELDS.get_existing(&mut *lv.host, Holder::Chunk(chunk)) {
+        Ok(Some(data)) => data,
+        _ => return,
+    };
+    let mut loaded: Vec<Loaded> = Vec::new();
+    for (key, entry) in data.iter() {
+        let (Some(pos), Tag::Compound(entry)) = (key_pos(&key.to_string_lossy()), entry) else {
+            continue;
+        };
+        let Some(Tag::String(block)) = entry.get(&"block".into()) else {
+            continue;
+        };
+        let Some(block) = Block::from_name(&block.to_string_lossy()) else {
+            continue;
+        };
+        let Some(Tag::Compound(fields)) = entry.get(&"fields".into()) else {
+            continue;
+        };
+        loaded.push((
+            level,
+            pos,
+            Record {
+                block,
+                fields: fields.clone(),
+            },
+            true,
+        ));
+    }
+    PENDING.with_borrow_mut(|p| {
+        p.retain(|(l, q, _, _)| !(*l == level && loaded.iter().any(|(_, x, _, _)| x == q)));
+        p.extend(loaded);
+    });
+}
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap};
 
@@ -82,6 +171,7 @@ impl BlockPart for SavedFields {}
 
 #[mod_api::horizon_part]
 impl BlockEntityPart for SavedFields {
+    #[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
     fn block_entity_save_additional(
         &self,
         level: &dyn LevelHost,
@@ -93,6 +183,7 @@ impl BlockEntityPart for SavedFields {
         write_record(SUBSYSTEMS, event.level, event.pos, block, event.tag);
     }
 
+    #[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
     fn block_entity_load_additional(&self, event: &mut BlockEntityLoadAdditionalEvent<'_>) {
         let Some((at, pos, state)) = event
             .subject
@@ -237,7 +328,9 @@ pub fn save(lv: &mut ServerLevel<'_>, chunk: [i32; 2]) {
             Some((pos, Record { block, fields }))
         })
         .collect();
-    for pos in changed(lv.level, chunk, fresh) {
+    let changed_now = changed(lv.level, chunk, fresh);
+    store_column(lv, chunk);
+    for pos in changed_now {
         let marked = lv
             .host
             .block_entity(lv.level, pos)

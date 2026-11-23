@@ -224,7 +224,8 @@ impl BlockPart for Supported {
         let facing = states::level_info(level, event.state)?.1.facing?;
         let o = facing.opposite().offset();
         let p = [event.pos.x + o[0], event.pos.y + o[1], event.pos.z + o[2]];
-        level.collision_shape(p).map(|boxes| !boxes.is_empty())
+        // Horizon: no collision shapes in the level view; any solid-looking block holds it.
+        crate::glue::compat::has_collision(level, p)
     }
 }
 

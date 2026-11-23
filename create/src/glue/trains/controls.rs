@@ -328,7 +328,7 @@ fn client_tick(host: &mut dyn ClientHost) {
     // by the wheel goes to the server until it agrees.
     let width = PROMPT.with_borrow(|p| {
         p.as_ref()
-            .map(|(t, _)| host.text_width(t))
+            .map(|(t, _)| host.text_width(t).unwrap_or(0))
             .map(|w| w as f32)
     });
     let throttle = HUD.with_borrow_mut(|h| {
@@ -362,7 +362,7 @@ fn hud(host: &dyn ClientHost, event: &mut RenderGuiPostEvent<'_>) {
     let prompt = PROMPT.with_borrow(Clone::clone);
     let width = prompt
         .as_ref()
-        .map(|(t, _)| host.text_width(t))
+        .map(|(t, _)| host.text_width(t).unwrap_or(0))
         .map(|w| w as f32);
     let drawn = HUD.with_borrow(|h| th::layout(h, size, 1.0, width));
     for (src, dst) in &drawn.parts {

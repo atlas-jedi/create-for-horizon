@@ -332,7 +332,7 @@ fn insert_stacked(
     }
     // An index the plan counted on refused: the rest goes wherever it goes.
     if went < count {
-        went += to.insert(host, tx, resource, count - went).unwrap_or(0);
+        went += to.insert_any(host, tx, resource, count - went);
     }
     went.min(count)
 }

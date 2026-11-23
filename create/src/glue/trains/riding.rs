@@ -200,7 +200,7 @@ pub fn sit_entity(host: &mut dyn ServerHost, dim: usize, rider: EntityRef, at: T
     let Some(stand) = host.entity(id) else {
         return false;
     };
-    let rode = rider.start_riding(host, stand, true).is_ok();
+    let rode = rider.start_riding(host, stand, true);
     if !rode {
         stand.discard(host);
         return false;

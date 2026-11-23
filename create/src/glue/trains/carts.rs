@@ -17,6 +17,7 @@
 //! rides (`tick_cart_actors`), dropping into its storage blocks and then into a chest
 //! minecart's own inventory (`addExtraInventories`).
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::net;
 use super::super::server::{ServerLevel, update_all};
 use super::super::states;
@@ -40,12 +41,13 @@ use create_engine::mounted::{self, Mode, Mounted, RailShape};
 use mod_api::{
     AttachmentCodec, AttachmentHolder, AttachmentQueries, AttachmentType, BlockPart, BlockState,
     BreakBlockEvent, ClientHost, Compound, EntityInteractEvent, EntityJoinLevelEvent, EntityPart,
-    EntityRef, EntitySpawn, EntityUuid, Flow, GeneralEntityCategory, GeneralEntityTickEvent,
+    EntityRef, EntityUuid, Flow, GeneralEntityCategory, GeneralEntityTickEvent,
     GeneralSavePolicy, Holder, Host, HostSide, HostTransaction, InteractionResult, ItemPart,
     ItemStack, MinecartPassEvent, Registrar, RegistrationContext, RemovalReason,
-    RenderLevelStageEvent, ServerHost, SoundSource, SpawnBody, Tag, Text, UseItemOnEvent,
+    RenderLevelStageEvent, ServerHost, SoundSource, Tag, Text, UseItemOnEvent,
     UseOnEvent,
 };
+use crate::glue::compat::{EntitySpawn, LevelSpawn as _, SpawnBody};
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -326,7 +328,7 @@ fn tick_cart_actors(lv: &mut ServerLevel<'_>, nc: &Cart, on: &mut OnCart) {
                     };
                     if added > 0 {
                         let r = mod_api::ItemResource::of(now);
-                        items.insert_at(h, tx, i, &r, added);
+                        items.insert(h, tx, i, &r, added);
                     }
                 }
                 Ok::<(), ()>(())
@@ -435,11 +437,8 @@ impl Subsystem for Carts {
             GeneralEntityCategory::Misc,
             1.0,
             1.0,
-            None,
             GeneralSavePolicy::Save,
             false,
-            false,
-            Some(mod_api::PushReaction::IgnoreEntity),
             5,
             3,
             1,
@@ -453,9 +452,8 @@ impl Subsystem for Carts {
             RIDER_MOTION.name,
             RIDER_DROPS.name,
         ] {
-            if let Err(e) = r.register_attachment_type(&format!("create:{name}"), false) {
-                crate::create_log!("[create] declaring {name}: {e:?}");
-            }
+            // Horizon: attachment types need no declaration at registration.
+            let _ = name;
         }
         r.entity_part(CONTRAPTION, ContraptionRider);
         let _ = END_ROD.set(r.particle_key("minecraft:end_rod"));
@@ -1515,7 +1513,7 @@ fn board_contraption(lv: &mut ServerLevel<'_>, cart: &Cart) -> Option<EntityRef>
         cart.pos,
         &EntitySpawn::new(SpawnBody::General),
     )?;
-    if rider.start_riding(lv.host, cart.entity, false).is_ok() {
+    if rider.start_riding(lv.host, cart.entity, false) {
         return Some(rider);
     }
     rider.remove(lv.host, RemovalReason::Discarded);
@@ -1712,13 +1710,9 @@ fn deliver_drops(lv: &mut ServerLevel<'_>) {
         return;
     };
     let mut rows = Vec::new();
-    let mut iter = query.iter();
-    while let Ok(Some(row)) = iter.try_next() {
-        if let AttachmentHolder::Entity(rider) = row.holder
-            && let Ok(scope) = lv.host.attachment_read_scope()
-            && let Ok(drops) = row.with_value(scope, Vec::clone)
-        {
-            rows.push((rider, drops));
+    for row in query.iter().flatten() {
+        if let AttachmentHolder::Entity(rider) = row.holder {
+            rows.push((rider, row.value.clone()));
         }
     }
     for (rider, drops) in rows {

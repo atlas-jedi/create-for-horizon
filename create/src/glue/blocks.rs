@@ -8,6 +8,7 @@
 //! their menu's screen and its recolouring are here. A postbox's packages are the packages
 //! port's (`port_stacks`).
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::server::{ServerLevel, UPDATE_CLIENTS, update_all};
 use super::states;
 use super::subsystem::Subsystem;

@@ -629,7 +629,7 @@ fn column_widths(host: &dyn ClientHost, e: &Entry) -> Vec<f32> {
             g.iter()
                 .map(|c| {
                     let s = summary(host, &Field::Condition(c.clone()));
-                    let tw = host.text_width(&mod_api::Text::literal(s.1.as_str())) as f32;
+                    let tw = host.text_width(&mod_api::Text::literal(s.1.as_str())).unwrap_or(0) as f32;
                     (tw + if s.0.is_some() { 20.0 } else { 0.0 } + 16.0).max(32.0)
                 })
                 .fold(0.0, f32::max)
@@ -1039,7 +1039,7 @@ fn action(
         let sum = summary(host, &Field::Instruction(e.instruction.clone()));
         // `getFieldSize(100, ...)` with a font: the draw context isn't here, so the width is
         // measured as the client's font does.
-        let text_w = host.text_width(&mod_api::Text::literal(sum.1.as_str())) as f32;
+        let text_w = host.text_width(&mod_api::Text::literal(sum.1.as_str())).unwrap_or(0) as f32;
         let field = (text_w + 20.0 + 16.0).max(100.0);
         if x > 25.0 && x <= 25.0 + field && y > 4.0 && y <= 20.0 {
             push(Change::Edit(Target::Instruction(i)), 0);
@@ -1749,7 +1749,7 @@ fn draw_slots(
             if o.cursor.is_none()
                 && let Some(s) = o.stack(slot)
             {
-                tips.extend(host.hover_name(s).ok());
+                tips.extend(Some(crate::glue::compat::hover_text(&*host, s)));
             }
         }
     }
@@ -1762,7 +1762,7 @@ fn draw_slots(
         if over_slot(p, mouse) {
             draw.fill([p[0], p[1], 16.0, 16.0], 0x80FF_FFFF);
             match (&ed.ghosts[i], &ed.field) {
-                (Some(s), _) if o.cursor.is_none() => tips.extend(host.hover_name(s).ok()),
+                (Some(s), _) if o.cursor.is_none() => tips.extend(Some(crate::glue::compat::hover_text(&*host, s))),
                 (None, Field::Condition(c)) => {
                     tips.extend(slot_tip(host, c, i).into_iter().map(Text::literal))
                 }

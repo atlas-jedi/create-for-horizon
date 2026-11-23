@@ -15,9 +15,7 @@ pub(super) fn register(r: &mut dyn Registrar) {
     r.block_capability(
         &ITEMS,
         &states::key(Block::CreativeCrate),
-        |_, at, _, _, offer| {
-            offer.offer(|| Box::new(Bottomless(at)) as Box<dyn ResourceHandler<ItemResource>>);
-        },
+        |_, at, _, _| Some(Box::new(Bottomless(at)) as Box<dyn ResourceHandler<ItemResource>>),
     );
 }
 

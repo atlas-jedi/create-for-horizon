@@ -12,6 +12,7 @@
 //! and the sanding sound plays every 7 ticks (`triggerUseEffects`), and a finished polish
 //! scatters 20 (`spawnParticles`).
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::{custom, held, set_custom, set_held};
 use crate::glue::names::Named as _;
 use crate::glue::owned::LevelLists as _;
@@ -337,12 +338,9 @@ pub(super) fn finished(
 
 /// The registered scrape or wax-off result; true for wax-off's distinct particles.
 fn copper_transition(host: &dyn Host, state: BlockState) -> Option<(BlockState, bool)> {
-    let facts = host.block_states();
-    if let Some(previous) = facts.previous_weathering_stage(state) {
-        Some((previous, false))
-    } else {
-        Some((facts.unwaxed(state)?, true))
-    }
+    // Horizon: no weathering/wax tables in the API; sandpaper doesn't scrape copper.
+    let _ = (host, state);
+    None
 }
 
 /// `SandPaperItem.useOn`: copper scraped an age back, else its wax taken off, with the sanding

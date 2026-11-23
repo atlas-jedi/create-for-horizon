@@ -35,7 +35,7 @@ pub fn register(r: &mut dyn Registrar) {
         .collect();
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let kind = r.block_entity_type(TOOLBOX_TYPE).blocks(&names).build();
-    r.block_entity_capability_before_game(&mod_api::ITEMS, &kind, super::toolbelt::provide_items);
+    r.block_entity_capability_before_game(&mod_api::ITEMS, &kind, crate::glue::compat::be_offer(super::toolbelt::provide_items));
     super::super::entity_data::attach(r, &kind);
     if let Err(e) = r.block_entity_part(&kind, ToolboxDraw) {
         crate::create_log!("[create] the toolboxes' drawing part was refused: {e:?}");
@@ -63,7 +63,8 @@ impl mod_api::BlockEntityPart for ToolboxDraw {
         event: &mut mod_api::PreRemoveSideEffectsEvent<'_>,
     ) {
         // `ToolboxBlock.onRemove` does not spill. Its loot table carries the contents instead.
-        event.keep_contents = true;
+        // Horizon: no keep-contents switch; the container's slots spill as the game's do.
+        let _ = event;
     }
 
     fn block_entity_submit(
@@ -121,7 +122,6 @@ fn containers() -> Vec<(Block, ModContainer)> {
         out.push((
             b,
             ModContainer {
-                insert_rules: Vec::new(),
                 slots: toolbox::SLOTS,
                 faces: every(&stored),
                 inputs: stored.clone(),
@@ -134,7 +134,6 @@ fn containers() -> Vec<(Block, ModContainer)> {
     out.push((
         Block::MechanicalCrafter,
         ModContainer {
-            insert_rules: Vec::new(),
             slots: 1,
             faces: every(&[0]),
             inputs: vec![0],
@@ -148,7 +147,6 @@ fn containers() -> Vec<(Block, ModContainer)> {
     out.push((
         Block::Deployer,
         ModContainer {
-            insert_rules: Vec::new(),
             slots: super::deployer::OVERFLOW_SLOTS,
             faces: every(&overflow),
             inputs: vec![],
@@ -161,7 +159,6 @@ fn containers() -> Vec<(Block, ModContainer)> {
     out.push((
         Block::Basin,
         ModContainer {
-            insert_rules: Vec::new(),
             slots: basin::SLOTS,
             faces: every(&all),
             inputs: basin::INPUTS.collect(),
@@ -175,7 +172,6 @@ fn containers() -> Vec<(Block, ModContainer)> {
     out.push((
         Block::Millstone,
         ModContainer {
-            insert_rules: Vec::new(),
             slots: 10,
             faces: every(&all),
             inputs: vec![0],

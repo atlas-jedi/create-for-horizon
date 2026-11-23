@@ -16,6 +16,7 @@
 //! clients draw is in the cloth's block entity data
 //! (`TableCloth`). The clipboard copies and pastes the price (`Filtering`, the payment item).
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::items;
 use super::super::server::{ServerLevel, update_all};
 use super::super::states;
@@ -1107,20 +1108,18 @@ pub(super) fn placed(
 
 /// `TableClothBlock.getDrops`: a shop's cloth drops programmed again
 /// (`AutoRequestData.writeToItem`), glinting.
-pub(super) fn drops(dim: usize, pos: [i32; 3], drops: &mut mod_api::PreparedBlockDrops<'_>) {
+pub(super) fn drops(dim: usize, pos: [i32; 3], drops: &mut Vec<mod_api::ItemDrop>) {
     let Some(shop) = cloths(dim, |m| m.get(&pos).and_then(|c| c.shop.clone())) else {
         return;
     };
     // A cloth drops itself alone (what lay on it drops when it goes).
-    let Some(mut d) = drops.get_mut(0) else {
+    let Some(d) = drops.get_mut(0) else {
         return;
     };
-    let Some(mut stack) = d.stack().and_then(|s| s.project()) else {
-        return;
-    };
+    let mut stack = d.stack.clone();
     items::set_custom(&mut stack, &[(super::AUTO_REQUEST, Some(shop.item_data))]);
     let _ = stack.set(&super::Glint, true);
-    let _ = d.set_stack(stack);
+    d.stack = stack;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -1352,7 +1351,7 @@ impl BlockEntityPart for ClothEntity {
                 draw.rotate_about([0.0, 1.0, 0.0], -a, [0.0; 3]);
             }
             // TableClothRenderer: ask the resolved model whether it is three-dimensional.
-            let block_item = host.item_uses_block_light(s, ItemDisplayContext::Fixed);
+            let block_item = crate::glue::compat::item_uses_block_light(&*host, s, ItemDisplayContext::Fixed);
             if !block_item {
                 draw.rotate_about([0.0, 1.0, 0.0], -rot + 180.0, [0.0; 3]);
             }
@@ -1395,7 +1394,7 @@ fn draw_price(
             Dir::East => 270.0,
             _ => 0.0,
         };
-    let solid = host.item_uses_block_light(price, ItemDisplayContext::Fixed);
+    let solid = crate::glue::compat::item_uses_block_light(&*host, price, ItemDisplayContext::Fixed);
     let scale = 0.5 * (if solid { 1.0 } else { 0.5 } + 1.0 / 64.0);
     draw.push();
     draw.translate(slot.map(|v| v as f32));
@@ -1466,7 +1465,7 @@ impl mod_api::ItemPart for ClothItem {
             .lines
             .push((line("create.table_cloth.shop_configured"), 0xFFAA00));
         for (k, n) in order_of(host, c.get(&"EncodedRequest".into())) {
-            let name = host.hover_name(&k.0).unwrap_or_default();
+            let name = crate::glue::compat::hover_text(&*host, &k.0);
             event
                 .lines
                 .push((name.append(Text::literal(format!(" x{n}"))), 0xAAAAAA));
@@ -1538,7 +1537,7 @@ impl mod_api::ItemPart for ShoppingListPart {
                         String::new()
                     };
                     let line = Text::literal(head)
-                        .append(host.hover_name(s).unwrap_or_default())
+                        .append(crate::glue::compat::hover_text(&*host, s))
                         .append(Text::literal(format!(" x{n}")));
                     event.lines.push((line, colour));
                 } else {
@@ -1549,7 +1548,7 @@ impl mod_api::ItemPart for ShoppingListPart {
                         ));
                     }
                     for (s, n) in entries {
-                        let name = host.hover_name(&s).unwrap_or_default();
+                        let name = crate::glue::compat::hover_text(&*host, &s);
                         event
                             .lines
                             .push((name.append(Text::literal(format!(" x{n}"))), colour));

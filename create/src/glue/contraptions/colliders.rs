@@ -11,6 +11,7 @@
 //! where its structure is going. Left out (`API_GAPS.md`): a structure moving into an entity
 //! does not push it, and its blocks have no contact effects.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::server::ServerLevel;
 use super::super::subsystem::Subsystem;
 use super::super::world::level_index;
@@ -20,11 +21,11 @@ use crate::glue::owned::LevelLists as _;
 use create_engine::collider::{self, Aabb, Frame, Pose};
 use create_engine::kinetics::Dir;
 use mod_api::{
-    AttachmentCodec, AttachmentError, AttachmentType, BlockShapeKind, BlockState, Collider,
-    ColliderBox, Compound, EntityJoinLevelEvent, EntityPart, EntityRef, EntitySpawn, Flow,
+    AttachmentCodec, AttachmentError, AttachmentType, BlockShapeKind, BlockState, Compound, EntityJoinLevelEvent, EntityPart, EntityRef, Flow,
     GeneralEntityCategory, GeneralEntityTickEvent, GeneralSavePolicy, Holder, Registrar,
-    RegistrationContext, RemovalReason, ServerHost, SpawnBody, Tag,
+    RegistrationContext, RemovalReason, ServerHost, Tag,
 };
+use crate::glue::compat::{EntitySpawn, LevelSpawn as _, SpawnBody};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -155,11 +156,8 @@ impl Subsystem for Colliders {
                 GeneralEntityCategory::Misc,
                 0.5,
                 0.5,
-                None,
                 GeneralSavePolicy::Save,
                 false,
-                false,
-                Some(mod_api::PushReaction::IgnoreEntity),
                 chunks,
                 1,
                 1,
@@ -171,9 +169,7 @@ impl Subsystem for Colliders {
         for kind in [STATIONARY, GANTRY, CARRIAGE] {
             r.entity_part(kind, Carrying);
         }
-        if let Err(e) = r.register_attachment_type("create:carried_structure", false) {
-            crate::create_log!("[create] declaring carried_structure: {e:?}");
-        }
+        // Horizon: attachment types need no declaration at registration.
     }
 
     fn world_closed(&self) {

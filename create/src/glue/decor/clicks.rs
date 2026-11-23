@@ -3,6 +3,7 @@
 //! table cloth on a table cloth; and the left clicks that take a placard's item back or collect a
 //! clipboard. Also the desk bell's signal.
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::persist;
 use super::super::server::{ServerLevel, update_all};
 use super::super::states;
@@ -384,8 +385,7 @@ fn use_hatch(
         let moved: u32 = host
             .transaction(|host, tx| {
                 let n = inventory
-                    .insert(host, tx, &ItemResource::of(stack), count)
-                    .unwrap_or(0);
+                    .insert_any(host, tx, &ItemResource::of(stack), count);
                 if n == 0 {
                     return Err(());
                 }

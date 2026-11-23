@@ -11,6 +11,8 @@
 //! `right_click_block`), a bracket (decor's part), a cart assembler (trains' part), a redstone
 //! link (redstone's part).
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::server::{ServerLevel, update_all};
 use super::super::states;
 use super::super::world::with_world;

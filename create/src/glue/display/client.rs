@@ -260,7 +260,7 @@ fn speed_of(nbt: &mod_api::Compound) -> f32 {
 
 /// The width of `s` in font pixels.
 fn width(draw: &dyn BlockEntityDrawContext, s: &str) -> f32 {
-    draw.text_width(&Text::literal(s))
+    draw.text_width(&Text::literal(s)).unwrap_or(0.0)
 }
 
 /// Draws `text` at `pose` (font pixels from the block's corner), `rgb`, glowing or not.

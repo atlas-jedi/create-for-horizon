@@ -235,7 +235,7 @@ impl Subsystem for Kinetics {
                 pos,
                 old,
                 new,
-                flags.contains(mod_api::BlockUpdateFlags::KNOWN_SHAPE),
+                (flags.bits() & mod_api::BlockUpdateFlags::KNOWN_SHAPE.bits() != 0),
             );
             [old, new].iter().any(|&s| {
                 matches!(
@@ -796,7 +796,8 @@ fn set_speeds(
 pub fn show_freeze(lv: &mut ServerLevel<'_>) {
     let dim = lv.dim;
     // KineticBlockEntity.getSpeed consults isFrozen even during /tick step.
-    let frozen = lv.host.tick_rate_is_frozen().unwrap_or(false);
+    // Horizon: no reading of `/tick freeze`; never frozen.
+    let frozen = false;
     let changed = FROZEN_SHOWN.with_borrow_mut(|f| {
         if f.len() <= dim {
             f.resize(dim + 1, false);
@@ -1211,15 +1212,16 @@ fn draw_turning_colored(
         return;
     };
     let props: Vec<(&str, &str)> = prop.map_or_else(|| own.to_vec(), |p| vec![p]);
-    let model = host.block_state_default(key).and_then(|state| {
-        let state = super::trains::with_props(host, state, &props)?;
-        host.render_assets().block_state_model(state).ok()
-    });
+    // Horizon: no block state model lookup; the turning fallback draws it.
+    let model: Option<mod_api::ModelRef> = host
+        .block_state_default(key)
+        .and_then(|state| super::trains::with_props(host, state, &props))
+        .and(None);
     let Some(model) = model else {
         return draw_turning(draw, block, own, d);
     };
     draw.spin(axis_vector(d.axis), [0.5; 3], d.rpm * 0.3, d.phase);
-    let options = mod_api::TerrainModelOptions::default().with_color(color);
+    let options = mod_api::TerrainModelOptions::default().with_tint(color);
     if draw.terrain_model(model, options).is_err() {
         draw.block(key, &props);
     }

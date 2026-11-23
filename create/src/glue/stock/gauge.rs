@@ -28,6 +28,7 @@
 //! publishes active-panel outlines (`FactoryPanelBlockEntity.getShape`). Collision is empty
 //! for entities; the SDK cannot distinguish Create's entity-free collision context.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::items;
 use super::super::server::ServerLevel;
 use super::super::world::{level_index, with_world};
@@ -546,6 +547,7 @@ pub(super) struct Collision;
 
 #[mod_api::horizon_part]
 impl mod_api::BlockPart for Collision {
+    #[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
     fn collision_shape(
         &self,
         _context: &dyn mod_api::LoopContext,
@@ -588,7 +590,7 @@ pub(super) fn send_redraws(lv: &mut ServerLevel<'_>) {
             // `getCollisionShape` gives these to a query with no entity ([`Collision`]).
             let _ = entity.set_shapes(
                 &mut *lv.host,
-                Some(mod_api::BlockEntityShapes {
+                Some(crate::glue::compat::ext::BlockEntityShapes {
                     collision: outline.clone(),
                     outline,
                 }),

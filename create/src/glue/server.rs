@@ -35,7 +35,9 @@ pub fn update_all() -> BlockUpdateFlags {
 impl<'a> ServerLevel<'a> {
     /// `BlockHelper.destroyBlockAs`: the state's destroy-block level event.
     pub fn destroy_effect(&mut self, pos: [i32; 3], state: BlockState) {
-        self.level.block_break_effect(self.host, pos, state);
+        // Horizon: no break-effect call; level event 2001 (`destroyBlock`'s particles and
+        // sound) needs the state's numeric id, which mods don't see. Skipped.
+        let _ = (pos, state);
     }
 
     /// The level `dimension` names, when it is open and Create's world is.

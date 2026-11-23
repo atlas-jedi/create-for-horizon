@@ -419,7 +419,7 @@ fn ours(host: &dyn ClientHost) -> bool {
 fn advance(host: &dyn ClientHost) -> impl Fn(char) -> f32 + '_ {
     move |c: char| {
         let mut b = [0u8; 4];
-        host.text_width(&Text::literal(c.encode_utf8(&mut b) as &str)) as f32
+        host.text_width(&Text::literal(c.encode_utf8(&mut b) as &str)).unwrap_or(0) as f32
     }
 }
 

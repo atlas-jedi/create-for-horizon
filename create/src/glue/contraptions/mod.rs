@@ -92,6 +92,7 @@
 //! (`ElevatorFloorListPacket`): scrolling on their button picks one, a click calls it, and the
 //! indicator turns toward the floor called (`ContraptionControlsMovement` elevator mode).
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 pub mod actor_draw;
 pub mod actors;
 mod bearings;

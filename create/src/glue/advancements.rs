@@ -10,6 +10,7 @@
 //! entity's `Owner`), and [`award_placer`] awards that player
 //! when they are in the block's level.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::persist;
 use super::server::ServerLevel;
 use super::subsystem::Subsystem;
@@ -731,7 +732,7 @@ pub(crate) fn seated(host: &mut dyn ServerHost, rider: u128) {
         return;
     };
     let list = at.iter().map(|v| Tag::Double(v.to_bits())).collect();
-    let _ = player.set_persistent_data_key(host, &MOUNT_LOCATION.into(), Some(&Tag::List(list)));
+    let _ = player.set_persistent_data_key(host, MOUNT_LOCATION, Some(&Tag::List(list)));
 }
 
 /// `getDismountLocationForPassenger`: a player let off at `at`, 5000 blocks or more from where
@@ -746,7 +747,7 @@ pub(crate) fn let_off(host: &mut dyn ServerHost, rider: u128, at: [f64; 3]) {
     else {
         return;
     };
-    let _ = player.set_persistent_data_key(host, &MOUNT_LOCATION.into(), None);
+    let _ = player.set_persistent_data_key(host, MOUNT_LOCATION, None);
     let from: Vec<f64> = from
         .iter()
         .filter_map(|t| match t {

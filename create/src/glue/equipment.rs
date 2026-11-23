@@ -27,6 +27,7 @@
 //! hold a native mod's enchantments, so it is not offered by enchanting tables nor shown in tooltips.
 //! A placed backtank is put on by a click with the chest free (`BacktankBlock.useItemOn`).
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::server::ServerLevel;
 use super::states;
 use super::subsystem::Subsystem;
@@ -432,7 +433,7 @@ impl Subsystem for Equipment {
             off.is_some_and(|s| matches!(gear_of(host, &s), Gear::ExtendoGrip))
                 && main.is_some_and(|s| {
                     host.item_block(s.item()).is_some()
-                        && host.item_uses_block_light(&s, mod_api::ItemDisplayContext::Gui)
+                        && crate::glue::compat::item_uses_block_light(&*host, &s, mod_api::ItemDisplayContext::Gui)
                 })
         });
         let mut grip = GRIP_RENDER.get();
@@ -597,17 +598,15 @@ impl Subsystem for Equipment {
         let found = event
             .drops
             .iter()
-            .position(|d| d.stack().map(|s| s.item()) == item);
+            .position(|d| Some(d.stack.item()) == item);
         if let Some(mut drop) = found.and_then(|i| event.drops.get_mut(i))
-            && let Some(mut stack) = drop.stack().and_then(|s| s.project())
+            && let Some(mut stack) = Some(drop.stack.clone())
         {
             if let Err(error) = set_stack_air(&mut stack, tank.air) {
                 crate::create_log!("[create] dropped backtank air could not be written: {error:?}");
             }
             set_capacity(&mut stack, tank.capacity);
-            if let Err(error) = drop.set_stack(stack) {
-                crate::create_log!("[create] the dropped backtank could not be written: {error:?}");
-            }
+            drop.stack = stack;
         }
         Flow::Continue
     }
@@ -912,9 +911,9 @@ fn breathe(host: &mut dyn ServerHost, player: PlayerRef, fire_resistant: bool) -
 
 /// `LivingBreatheEvent` for a player the helmet gives breath this tick: `setCanBreathe(true)`,
 /// `setRefillAirAmount(getMaxAirSupply())`.
-pub(crate) fn living_breathe(event: &mut mod_api::LivingBreatheEvent) {
+pub(crate) fn living_breathe(event: &mut mod_api::LivingBreatheEvent<'_>) {
     if BREATHING.with_borrow_mut(|b| {
-        let at = b.iter().position(|e| *e == event.entity.entity().id());
+        let at = b.iter().position(|e| *e == event.entity);
         at.map(|i| b.swap_remove(i)).is_some()
     }) {
         event.can_breathe = true;
@@ -946,17 +945,16 @@ fn debit_air(
         slot: HEAD_INVENTORY_SLOT - slot as i32,
     };
     let mut warnings = None;
-    place
-        .edit(host, tx, |stack| {
-            let Some(before) = stack.original().project() else {
-                return;
-            };
-            let (after, triggered) = eq::consume_air(stack_air(&before), capacity(&before), amount);
-            if stack.apply_components(&air_patch(&before, after)).is_ok() {
-                warnings = Some(triggered);
-            }
-        })
-        .map_err(|_| ())?;
+    let edited = place.edit(host, tx, |stack| {
+        let before = stack.clone();
+        let (after, triggered) = eq::consume_air(stack_air(&before), capacity(&before), amount);
+        if stack.apply_components(&air_patch(&before, after)).is_ok() {
+            warnings = Some(triggered);
+        }
+    });
+    if !edited {
+        return Err(());
+    }
     warnings.ok_or(())
 }
 

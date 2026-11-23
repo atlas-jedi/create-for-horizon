@@ -260,17 +260,18 @@ struct LenientSupport;
 impl mod_api::BlockPart for LenientSupport {
     fn can_survive(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut mod_api::CanSurviveEvent,
     ) -> Option<bool> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let (_, info) = states::level_info(level, event.state)?;
         let offset = create_engine::factory::connected_direction(info.face?, info.facing?)
             .opposite()
             .offset();
         let pos = [event.pos.x, event.pos.y, event.pos.z];
-        level
-            .collision_shape([0, 1, 2].map(|i| pos[i] + offset[i]))
-            .map(|boxes| !boxes.is_empty())
+        // Horizon: no collision shapes in the level view; any solid-looking block holds it.
+        crate::glue::compat::has_collision(level, [0, 1, 2].map(|i| pos[i] + offset[i]))
     }
 }

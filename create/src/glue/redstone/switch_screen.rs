@@ -766,8 +766,7 @@ fn draw(host: &dyn ClientHost, draw: &mut dyn DrawContext, mouse: [f32; 2], open
             }
             Some(key) => {
                 lines.push(
-                    host.hover_name(&mod_api::ItemStack::of(key))
-                        .unwrap_or_default(),
+                    crate::glue::compat::hover_text(&*host, &mod_api::ItemStack::of(key)),
                 );
                 if s.kind == Kind::Unsupported {
                     lines.push(styled(

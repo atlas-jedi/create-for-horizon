@@ -690,7 +690,7 @@ pub(super) fn draw(host: &dyn ClientHost, draw: &mut dyn DrawContext) -> bool {
         return false;
     };
     let key = crate::glue::keys::label(host, "key.use")
-        .map(|label| host.text_string(&label))
+        .and_then(|label| host.text_string(&label).ok())
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| "Use".to_owned());
     let tip = board::release_to_confirm(&key);

@@ -196,9 +196,8 @@ pub(super) fn upload(
             }
         }
     }
-    if let Some(oldest) = retention.evict() {
-        service.remove(&ConfigPath::try_from(format!("{folder}/{oldest}"))?)?;
-    }
+    // Horizon: config files can't be deleted; the oldest upload is kept.
+    let _ = (retention.evict(), &folder);
     service.write(&to, &bytes)
 }
 

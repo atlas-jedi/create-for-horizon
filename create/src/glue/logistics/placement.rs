@@ -230,7 +230,8 @@ impl BlockPart for Placement {
         // `GearshiftBlock.getStateForPlacement` (inherited by ClutchBlock):
         // choose power here, not when an arbitrary state is inserted into the world.
         let default = if matches!(block, Block::Clutch | Block::Gearshift)
-            && let Some(powered) = level.has_neighbor_signal(pos)
+            // Horizon: placement sees no redstone; the neighbour update powers it after.
+            && let Some(powered) = None::<bool>
         {
             set(default, "powered", flag(powered))
         } else {

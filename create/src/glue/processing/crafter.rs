@@ -520,7 +520,7 @@ fn insert_item(lv: &mut ServerLevel<'_>, t: [i32; 3], face: Direction, item: &st
             let Some(cap) = level.capability(host, &ITEMS, t, Some(face)) else {
                 return Err(());
             };
-            Ok::<u32, ()>(cap.insert(host, tx, &resource, n).unwrap_or(0))
+            Ok::<u32, ()>(cap.insert_any(host, tx, &resource, n))
         })
         .unwrap_or(0)
 }

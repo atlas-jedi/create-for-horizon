@@ -13,6 +13,7 @@
 //! of the block the mirror stands in when the client can read it (`LevelRef::brightness`
 //! answers on the logical server only), else as in open daylight.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::net;
 use super::super::server::{ServerLevel, update_all};
 use super::super::states;

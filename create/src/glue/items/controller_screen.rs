@@ -393,7 +393,7 @@ fn draw(host: &dyn ClientHost, draw: &mut dyn DrawContext, o: &Open, mouse: [f32
             if o.cursor.is_none()
                 && let Some(s) = o.stack(slot)
             {
-                hover = Some(vec![host.hover_name(s).unwrap_or_default()]);
+                hover = Some(vec![crate::glue::compat::hover_text(&*host, s)]);
             }
         }
     }
@@ -409,7 +409,7 @@ fn draw(host: &dyn ClientHost, draw: &mut dyn DrawContext, o: &Open, mouse: [f32
                 // `addToTooltip`: the frequency slot and its button's key, in gold.
                 let mut lines = Vec::new();
                 if let Some((_, s)) = s {
-                    lines.push(host.hover_name(s).unwrap_or_default());
+                    lines.push(crate::glue::compat::hover_text(&*host, s));
                 }
                 let key = crate::glue::keys::label(host, MAPPINGS[i / 2]).unwrap_or_else(|| {
                     Text::translate(create_engine::controller::KEYS[i / 2], Vec::new())

@@ -30,10 +30,7 @@ struct Create;
 impl Hooks for Create {
     fn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {
         states::register(r);
-        let _ = r.register_attachment_type("create:column", false);
-        let _ = r.register_attachment_type("create:logistics_networks", false);
-        let _ = r.register_attachment_type("create:station_ports", false);
-        let _ = r.register_attachment_type("create:haunting", false);
+        // Horizon: attachment types need no declaration at registration.
 
         for &block in create_engine::Block::ALL.iter() {
             r.block_part(states::key(block), CreateBlock);
@@ -50,7 +47,7 @@ impl Hooks for Create {
             s.standalone_models(&mut models);
         }
         for model in models {
-            event.register_model(model);
+            event.models.push(model);
         }
     }
 
@@ -152,7 +149,8 @@ impl Hooks for Create {
             return;
         }
         for s in SUBSYSTEMS {
-            s.block_changed(dim, pos, old, new, event.flags);
+            // Horizon: the change's flags aren't told; read as a plain update.
+            s.block_changed(dim, pos, old, new, glue::server::update_all());
         }
     }
 
@@ -402,7 +400,16 @@ impl Hooks for Create {
         }
     }
 
-    fn living_breathe(&self, _host: &mut dyn ServerHost, event: &mut mod_api::LivingBreatheEvent) {
+    /// Hot: an entity on the ground over a belt or ejector, each tick it moves.
+    fn block_step_on(&self, event: &mut mod_api::BlockStepOnEvent<'_>) {
+        glue::logistics::step_on(event);
+    }
+
+    fn living_breathe(
+        &self,
+        _context: &dyn mod_api::LoopContext,
+        event: &mut mod_api::LivingBreatheEvent<'_>,
+    ) {
         glue::equipment::living_breathe(event);
     }
 
@@ -433,23 +440,20 @@ impl Hooks for Create {
 
     /// Each subsystem's usages, run by that subsystem.
     fn register_commands(&self, host: &mut dyn ServerHost, event: &mut RegisterCommandsEvent<'_>) {
-        for (i, s) in SUBSYSTEMS.iter().enumerate() {
+        for s in SUBSYSTEMS {
             let mut usages = Vec::new();
             s.register_commands(host, &mut usages);
-            for usage in usages {
-                event
-                    .commands
-                    .push(usage.executes(move |host, source, command| {
-                        let mut call = glue::subsystem::CommandCall { source, command };
-                        match SUBSYSTEMS[i].run_mod_command(host, &mut call) {
-                            Flow::Cancel => Ok(1),
-                            _ => Err(Box::new(mod_api::Text::literal(
-                                "create_debug: unknown arguments",
-                            ))),
-                        }
-                    }));
-            }
+            event.commands.extend(usages);
         }
+    }
+
+    /// Each subsystem's usages, run by the first subsystem that takes the invocation.
+    fn run_mod_command(&self, host: &mut dyn ServerHost, event: &mut mod_api::RunModCommandEvent<'_>) -> Flow {
+        let mut call = glue::subsystem::CommandCall {
+            source: event.source,
+            command: event.command,
+        };
+        until_cancel(|s| s.run_mod_command(host, &mut call))
     }
 
     fn level_save(&self, host: &mut dyn ServerHost, event: &mut LevelSaveEvent<'_>) {

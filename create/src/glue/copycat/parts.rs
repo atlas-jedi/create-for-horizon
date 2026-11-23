@@ -282,6 +282,7 @@ impl BlockPart for CopycatBlock {
 
     /// `CopycatBlock.getFriction`: the material's, at the copycat's position (`getMaterial`:
     /// air without a block entity, the copycat base without a material).
+    #[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
     fn friction(&self, level: mod_api::LevelSide<'_>, event: &mut FrictionEvent<'_>) {
         let (level, server) = states::level_view(level);
         let pos = [event.pos.x, event.pos.y, event.pos.z];
@@ -342,7 +343,7 @@ impl BlockPart for CopycatBlock {
             .and_then(|e| host.living(e))
             .and_then(|l| l.hand_item(host, Hand::Main));
         event.can_harvest = !requires
-            || held.is_some_and(|s| facts.is_correct_tool_for_drops(&s, material) == Some(true));
+            || held.is_some_and(|s| facts.is_correct_tool_for_drops(material, &s) == Some(true));
     }
 }
 

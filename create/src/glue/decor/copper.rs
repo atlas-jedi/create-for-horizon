@@ -4,15 +4,16 @@
 //! `getToolModifiedState`), and honeycomb waxes them (`HoneycombItem.useOn`). Vanilla's code
 //! steps only vanilla's copper; these are Create's chains, from the engine.
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::server::ServerLevel;
 use super::super::states;
 use super::{create_block, player_dimension, use_one};
 use create_engine::Block;
 use create_engine::decor;
+use crate::glue::compat::WeatheringAge;
 use mod_api::{
     BlockState, Flow, GameEventContext, Host, HostSide, InteractionResult, ItemPart, LevelHost,
     LevelWriteHost, RandomTickEvent, Registrar, ToolAbility, ToolModifiedStateEvent, UseOnEvent,
-    WeatheringAge,
 };
 
 pub(super) fn register(r: &mut dyn Registrar) {
@@ -65,7 +66,7 @@ impl mod_api::BlockPart for Copper {
         let Some(next) = decor::copper_next(block) else {
             return Flow::Continue;
         };
-        let Some(age) = level.block_states().weathering_age(event.state) else {
+        let Some(age) = crate::glue::compat::weathering_age(event.state) else {
             return Flow::Continue;
         };
         let pos = [event.pos.x, event.pos.y, event.pos.z];
@@ -119,7 +120,6 @@ fn change_over_time(level: &mut dyn LevelWriteHost, pos: [i32; 3], own: Weatheri
 /// `getNextState`'s look round `pos`: None when a younger block is near, else the share of older
 /// ones.
 fn neighbour_chance(level: &dyn LevelHost, pos: [i32; 3], own: WeatheringAge) -> Option<f32> {
-    let facts = level.block_states();
     let (mut same, mut older) = (0u32, 0u32);
     for x in -4i32..=4 {
         for y in -4i32..=4 {
@@ -128,7 +128,7 @@ fn neighbour_chance(level: &dyn LevelHost, pos: [i32; 3], own: WeatheringAge) ->
                     continue;
                 }
                 let at = [pos[0] + x, pos[1] + y, pos[2] + z];
-                let Some(age) = level.block_state(at).and_then(|s| facts.weathering_age(s)) else {
+                let Some(age) = level.block_state(at).and_then(crate::glue::compat::weathering_age) else {
                     continue;
                 };
                 match age.cmp(&own) {

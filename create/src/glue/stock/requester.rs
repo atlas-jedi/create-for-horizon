@@ -379,7 +379,7 @@ pub(super) fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRender
                 let send = crate::glue::item_name_message(
                     "create.gui.factory_panel.send_item",
                     Some("Send %1$s"),
-                    host.hover_name(s).unwrap_or_default(),
+                    crate::glue::compat::hover_text(&*host, s),
                     Some(o.amounts[i]),
                 );
                 vec![

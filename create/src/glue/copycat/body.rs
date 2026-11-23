@@ -8,7 +8,8 @@ use crate::glue::names::Named as _;
 use create_engine::Block;
 use create_engine::copycat::{self as cc, Candidate, Shape, Special};
 use create_engine::kinetics::{Axis, Dir};
-use mod_api::{BlockClass, BlockShapeKind, BlockState, Host, HostBlockStates, ItemStack};
+use crate::glue::compat::BlockClass;
+use mod_api::{BlockShapeKind, BlockState, Host, HostBlockStates, ItemStack};
 
 /// The default state of the block `stack` places (`BlockItem.getBlock().defaultBlockState()`).
 fn item_block(host: &dyn Host, stack: &ItemStack) -> Option<BlockState> {
@@ -45,7 +46,7 @@ pub(super) fn candidate(
         .is_some_and(|s| !s.is_empty());
     let facts = host.block_states();
     let has = |k: &str| state.property(&facts, k).ok().flatten().is_some();
-    let class = |class| facts.block_class(state, class).ok().flatten();
+    let class = |class| crate::glue::compat::block_class(host, state, class);
     // `CopycatSpecialCases`: Create's `GlassPaneBlock` variants and vanilla's panes
     // inherit from `IronBarsBlock` but are not the special bar material.
     let create_pane = create.is_some_and(|block| {
@@ -180,6 +181,7 @@ mod tests {
         }
     }
     impl BlockStatesBackend for Materials {
+        #[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
         fn block_state_class(
             &self,
             _: BlockState,

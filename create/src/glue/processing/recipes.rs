@@ -94,9 +94,7 @@ pub fn register(r: &mut dyn mod_api::Registrar) {
 }
 
 fn item_name(host: &dyn ReloadContext, item: mod_api::ItemKey) -> String {
-    host.item_key_id(item)
-        .map(str::to_owned)
-        .unwrap_or_default()
+    item.id(host)
 }
 
 /// The crafting recipes whose file is of serializer `serializer` (`minecraft:crafting_shaped`,

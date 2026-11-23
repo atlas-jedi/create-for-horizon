@@ -20,6 +20,7 @@
 //! The overworld's saved networks are read at its first tick (an attachment is reached through
 //! a level's own host): a link whose column loaded before then is not counted as unloaded.
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 mod categories;
 mod gauge;
 pub(crate) mod gauge_client;
@@ -858,7 +859,7 @@ impl Subsystem for Stock {
     ) -> Flow {
         if let Some(dim) = level_index(event.dimension.key().id()) {
             let pos = [event.pos.x, event.pos.y, event.pos.z];
-            shop::drops(dim, pos, &mut event.drops);
+            shop::drops(dim, pos, event.drops);
         }
         Flow::Continue
     }

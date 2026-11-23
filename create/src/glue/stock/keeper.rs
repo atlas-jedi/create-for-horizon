@@ -1588,7 +1588,7 @@ fn render(host: &dyn ClientHost, draw: &mut dyn DrawContext, o: &Open, mouse: [f
     let tip: Option<Vec<Text>> = if let Some(s) = tip_stack {
         let lines = crate::glue::items::tooltip_lines(host, &s, false);
         Some(if lines.is_empty() {
-            vec![host.hover_name(&s).unwrap_or_default()]
+            vec![crate::glue::compat::hover_text(&*host, &s)]
         } else {
             lines
         })

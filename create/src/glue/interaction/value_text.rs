@@ -151,7 +151,7 @@ pub(crate) fn draw(host: &dyn ClientHost, pos: [i32; 3], draw: &mut dyn BlockEnt
     };
     DRAWN.set(Some(pos));
     let text = styled(text);
-    let width = draw.text_width(&text);
+    let width = draw.text_width(&text).unwrap_or(0.0);
     // `AngleHelper.horizontalAngle(side) + 180` about y, then 90 (up) or 270 (down) about x; a
     // diode's box (`BrassDiodeScrollSlot`) lies on it, turned by its facing.
     let horizontal = |d: Dir| -> f32 {

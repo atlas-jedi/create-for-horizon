@@ -625,7 +625,7 @@ fn nameplate_hovered(
     draw.rotate_about([0.0, 1.0, 0.0], 180.0 - cam.yaw, [0.0; 3]);
     draw.rotate_about([1.0, 0.0, 0.0], -cam.pitch, [0.0; 3]);
     draw.scale([0.025, -0.025, 0.025]);
-    let width = draw.text_width(&text);
+    let width = draw.text_width(&text).unwrap_or(0.0);
     let _ = draw.text(&text, [-(width / 2.0).floor(), 0.0], 0xFF_FFFF, false, None);
     draw.pop();
     true

@@ -8,6 +8,8 @@
 //! recovery or leftovers, and sound and crumbs. See `API_GAPS.md` for missing native projectile
 //! movement, impact, rendering, and damage operations.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::equipment;
 use super::super::subsystem::Subsystem;
 use super::{creative, custom, held};
@@ -18,12 +20,12 @@ use create_engine::potato::{self, Type};
 use mod_api::{
     ActiveEffect, AttachmentCodec, AttachmentError, AttachmentType, BlockEntityDrawContext,
     BlockFace, ClientHost, ClipHit, Compound, EntityPart, EntityRef, EntityRenderState,
-    EntityRenderer, EntitySpawn, GeneralEntityCategory, GeneralEntityTickEvent, GeneralSavePolicy,
+    EntityRenderer, GeneralEntityCategory, GeneralEntityTickEvent, GeneralSavePolicy,
     Hand, Holder, Host, HostSide, HostTransaction, Identifier, InteractionResult,
     ItemDisplayContext, ItemKey, ItemPart, ItemPlace, ItemStack, LevelRef, ParticleKey,
-    ParticleOptions, PlayerRef, Registrar, RegistrationContext, ServerHost, SoundSource, SpawnBody,
-    Tag, Text, TooltipEvent, UseItemEvent,
+    ParticleOptions, PlayerRef, Registrar, RegistrationContext, ServerHost, SoundSource, Tag, Text, TooltipEvent, UseItemEvent,
 };
+use crate::glue::compat::{EntitySpawn, LevelSpawn as _, SpawnBody};
 use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -262,20 +264,16 @@ impl Subsystem for PotatoCannon {
             ("create:potato_flight", false),
             ("create:potato_stuck", false),
         ] {
-            if let Err(e) = r.register_attachment_type(id, sync) {
-                crate::create_log!("[create] declaring potato projectile data: {e:?}");
-            }
+            // Horizon: attachment types need no declaration at registration.
+            let _ = (id, sync);
         }
         if let Err(e) = r.declare_general_entity(
             "potato_projectile",
             GeneralEntityCategory::Misc,
             f64::from(potato::SIZE),
             f64::from(potato::SIZE),
-            None,
             GeneralSavePolicy::Save,
             false,
-            false,
-            None,
             4,
             20,
             1,
@@ -332,12 +330,11 @@ impl EntityRenderer for Projectile {
         entity: &EntityRenderState,
         draw: &mut dyn BlockEntityDrawContext,
     ) -> Result<(), String> {
-        let Some(ammo) = entity
-            .attachments
-            .as_ref()
-            .and_then(|a| a.get(&AMMO).ok().flatten())
-            .and_then(Option::as_ref)
-        else {
+        // Horizon: a render state carries no attachments, so the shot's ammo (its model) is
+        // unknown here and nothing is drawn.
+        let _ = entity;
+        let ammo: Option<&Arc<Ammo>> = None;
+        let Some(ammo) = ammo else {
             return Ok(());
         };
         let [yaw, pitch] = CAMERA.get();
@@ -395,7 +392,7 @@ impl ItemPart for CannonPart {
             (Text::literal(format!(" {text}")), DARK_GREEN)
         };
         event.lines.push((Text::literal(""), u32::MAX));
-        let name = host.hover_name(&stack).unwrap_or_default();
+        let name = crate::glue::compat::hover_text(&*host, &stack);
         event.lines.push((name.append(Text::literal(":")), GRAY));
         event
             .lines

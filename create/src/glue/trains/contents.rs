@@ -193,7 +193,6 @@ impl mod_api::BlockEntityDrawContext for Recorder<'_> {
         0xF0F0
     }
     fn set_light(&mut self, _light: u32) {}
-    fn level_light(&mut self) {}
     fn quad(&mut self, _: &str, _: [[f32; 3]; 4], _: [f32; 4], _: u32) -> bool {
         false
     }
@@ -281,8 +280,8 @@ impl mod_api::BlockEntityDrawContext for Recorder<'_> {
     ) -> Result<f32, mod_api::TextFormError> {
         Ok(0.0)
     }
-    fn text_width(&self, _: &mod_api::Text) -> f32 {
-        0.0
+    fn text_width(&self, _: &mod_api::Text) -> Result<f32, mod_api::TextFormError> {
+        Ok(0.0)
     }
     fn model_part(&mut self, _: &mod_api::ModelPart, _: &str, _: u32) -> bool {
         false

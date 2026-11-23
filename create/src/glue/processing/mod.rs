@@ -156,7 +156,7 @@ impl Subsystem for Processing {
         // The crafter's group inventory, ahead of the game's plain slot (it is the kinetic type's,
         // declared by `Kinetics`).
         let kind = r.block_entity_type_key(super::kinetics::TYPE);
-        r.block_entity_capability_before_game(&mod_api::ITEMS, &kind, provide_items);
+        r.block_entity_capability_before_game(&mod_api::ITEMS, &kind, crate::glue::compat::be_offer(provide_items));
         client::register(r);
         air::register(r);
         // Entity Part state is offered to native mods only.
@@ -547,7 +547,7 @@ fn provide_items(
     side: mod_api::BlockSide,
     state: mod_api::BlockState,
     _entity: mod_api::BlockEntityRef,
-    offer: &mut mod_api::BlockCapabilityOffer<
+    offer: &mut crate::glue::compat::BlockCapabilityOffer<
         '_,
         dyn mod_api::ResourceHandler<mod_api::ItemResource>,
     >,
@@ -630,9 +630,11 @@ struct BurnerPlacement;
 impl BlockPart for BurnerPlacement {
     fn state_for_placement(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut mod_api::StateForPlacementEvent<'_>,
     ) -> Option<Option<mod_api::BlockState>> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = crate::glue::states::level_view(level);
         let c = event.context;
         let facing = create_engine::decor::horizontal_facing(c.yaw).opposite();

@@ -1086,7 +1086,7 @@ fn draw_moving_controls(
     draw.translate([0.275 + 0.125, 1.0 + 2.0 / 16.0, 0.5]);
     draw.rotate_about(EAST, -67.5, [0.0; 3]);
     if !sel.short.trim().is_empty() && distance < 100.0 {
-        let actual = draw.text_width(&short);
+        let actual = draw.text_width(&short).unwrap_or(0.0);
         let width = actual.max(12.0);
         let scale = 1.0 / (5.0 * (width - 0.5));
         let centring = (width - 8.0) / 2.0;
@@ -1101,7 +1101,7 @@ fn draw_moving_controls(
     }
     let long_blank = !sel.unreachable && sel.long.trim().is_empty();
     if !long_blank && distance < 20.0 {
-        let actual = draw.text_width(&long);
+        let actual = draw.text_width(&long).unwrap_or(0.0);
         let width = actual.max(55.0);
         let scale = 1.0 / (3.0 * (width - 0.5));
         let centring = (width - 8.0) / 2.0;

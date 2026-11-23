@@ -5,7 +5,7 @@
 //! cannon's ticks; its buttons are menu buttons (`ConfigureSchematicannonPacket`).
 
 use create_engine::schematicannon::{Cannon, Configure, SHOTS_PER_GUNPOWDER, State, Status};
-use mod_api::{ClientHost, DrawContext, MenuScreenLayout, Text, text::TextStyle};
+use mod_api::{ClientHost, DrawContext, Text, text::TextStyle};
 use std::cell::Cell;
 
 const TEX: &str = "create:gui/schematics_2";
@@ -35,6 +35,7 @@ pub(super) fn cannon_data(c: &Cannon) -> Vec<i32> {
 
 /// `SchematicannonMenu`: its five slots, the player's inventory at (37, 161), in a window of
 /// `SCHEMATICANNON_TOP` and `_BOTTOM` with the inventory under them.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 pub(super) fn cannon_screen() -> MenuScreenLayout {
     MenuScreenLayout {
         width: 213.0,
@@ -415,6 +416,7 @@ pub(super) fn configure(id: i32, data: &[i32]) -> Option<Configure> {
 
 /// `SchematicTableMenu`: the input and output slots (as the hopper's first and last), the
 /// player's inventory at (38, 107), under `SCHEMATIC_TABLE`.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 pub(super) fn table_screen() -> MenuScreenLayout {
     MenuScreenLayout {
         width: 214.0,

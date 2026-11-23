@@ -291,7 +291,9 @@ fn fluid_particle(keys: &Keys, fluid: Fluid) -> Option<ParticleOptions> {
     };
     let [r, g, b] = [16, 8, 0].map(|s| 0.8 * ((tint >> s) & 0xFF) as f32 / 255.0);
     let sprite = still_sprite(fluid);
-    Some(ParticleOptions::item(keys.item, vec![sprite.into()]).with_color([r, g, b, 1.0]))
+    let mut options = ParticleOptions::item(keys.item, vec![sprite.into()]);
+    options.color = [r, g, b, 1.0];
+    Some(options)
 }
 
 /// The fluid's still sprite (`IClientFluidTypeExtensions.getStillTexture`).

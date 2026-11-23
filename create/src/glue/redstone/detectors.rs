@@ -264,7 +264,7 @@ fn container_slots(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Vec<Slot<I
                     .host
                     .max_stack_size(r.item())
                     .unwrap_or(64)
-                    .min(handler.capacity(&mut *lv.host, i, Some(&r)).max(1)),
+                    .min(handler.capacity(&mut *lv.host, i, &r).max(1)),
             },
             _ => Slot {
                 item: None,
@@ -412,11 +412,11 @@ fn capability_tanks(
                 .host
                 .fluid_key("minecraft:water")
                 .map(|k| mod_api::FluidResource::of(&mod_api::FluidStack::new(k, 1)));
-            let capacity = water.map_or(0, |w| handler.capacity(&mut *lv.host, i, Some(&w)));
+            let capacity = water.map_or(0, |w| handler.capacity(&mut *lv.host, i, &w));
             tanks.push(create_engine::observe::TankSlot::of(None, capacity));
             continue;
         };
-        let capacity = handler.capacity(&mut *lv.host, i, Some(&r));
+        let capacity = handler.capacity(&mut *lv.host, i, &r);
         let fluid = r
             .fluid()
             .key()

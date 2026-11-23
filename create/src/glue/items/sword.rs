@@ -4,6 +4,7 @@
 //! level and a sprint make it, less the target’s knockback resistance.
 //! `CardboardSwordItem` also stops the attacker’s sprint after a positive-strength blow.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::{Item, held, is};
 use mod_api::{
     ActiveEffect, AttackEntityEvent, Flow, Hand, LeftClickBlockEvent, MobCategory, ServerHost,

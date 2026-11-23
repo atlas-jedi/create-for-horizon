@@ -27,6 +27,8 @@
 //! `pre_remove_side_effects` suppresses the container's separate spill: breaking keeps the
 //! contents only in the toolbox item, and replacement without drops loses them as in Create.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::net;
 use super::super::server::ServerLevel;
 use crate::glue::names::Named as _;
@@ -277,7 +279,7 @@ pub(crate) fn provide_items(
     side: BlockSide,
     state: mod_api::BlockState,
     _entity: mod_api::BlockEntityRef,
-    offer: &mut mod_api::BlockCapabilityOffer<'_, dyn ResourceHandler<ItemResource>>,
+    offer: &mut crate::glue::compat::BlockCapabilityOffer<'_, dyn ResourceHandler<ItemResource>>,
 ) {
     let toolbox = super::super::states::id(state)
         .and_then(|id| {
@@ -604,7 +606,7 @@ fn set_equipped(host: &mut dyn ServerHost, player: PlayerRef, list: &[(usize, [i
         c.insert(hotbar.to_string().as_str().into(), Tag::Compound(e));
     }
     let value = (!c.is_empty()).then_some(Tag::Compound(c));
-    let _ = player.set_persistent_data_key(host, &DATA.into(), value.as_ref());
+    let _ = player.set_persistent_data_key(host, DATA, value.as_ref());
 }
 
 /// `syncData`: the equipped slots to the player's client.
@@ -1630,7 +1632,7 @@ fn draw_menu(
                             draw.item_stack(kind, [at[0] + 3.0, at[1] + 3.0], 16.0);
                             if pick == Some(slot as i32) && !*empty {
                                 widget(draw, SLOT_HIGHLIGHT, [at[0] - 1.0, at[1] - 1.0]);
-                                tip = Some(host.hover_name(kind).unwrap_or_default());
+                                tip = Some(crate::glue::compat::hover_text(&*host, kind));
                             }
                         }
                         (None, _) => widget(draw, EMPTY_SLOT, at),
@@ -1666,7 +1668,7 @@ fn draw_menu(
                     .local_player()
                     .and_then(|p| host.living(p.entity()))
                     .and_then(|l| l.hand_item(host, mod_api::Hand::Main))
-                    .and_then(|s| host.hover_name(&s).ok())
+                    .and_then(|s| Some(crate::glue::compat::hover_text(&*host, &s)))
                     .unwrap_or_default();
                 tip = Some(gold(crate::glue::item_name_message(
                     "create.toolbox.unequip",
@@ -1680,7 +1682,7 @@ fn draw_menu(
     if let Some(tip) = tip {
         let a = (fade * 255.0) as u32;
         if a > 8 {
-            let w = host.text_width(&tip) as f32;
+            let w = host.text_width(&tip).unwrap_or(0) as f32;
             let _ = draw.gui_paint(&[mod_api::GuiDraw::Text {
                 text: tip,
                 x: (c[0] - (w / 2.0).round()) as i32,
@@ -1955,6 +1957,7 @@ impl mod_api::MenuPart for CompartmentRules {
                 event
                     .context
                     .slot(event.container, c * STACKS_PER_COMPARTMENT + i)
+                    .cloned()
             })
         });
         if kind.is_some_and(|k| !same_kind(host, &k, event.stack)) {

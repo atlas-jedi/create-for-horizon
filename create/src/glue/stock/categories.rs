@@ -778,7 +778,7 @@ fn render(host: &dyn ClientHost, draw: &mut dyn DrawContext, o: &Open, mouse: [f
             // `getTooltipFromContainerItem`: the slot's stack under "Category Filter".
             Some(s) => vec![
                 header("create.gui.stock_ticker.category_filter", "Category Filter"),
-                host.hover_name(s).unwrap_or_default(),
+                crate::glue::compat::hover_text(&*host, s),
             ],
             None => vec![
                 header("create.gui.stock_ticker.category_filter", "Category Filter"),
@@ -806,7 +806,7 @@ fn render(host: &dyn ClientHost, draw: &mut dyn DrawContext, o: &Open, mouse: [f
             .into_iter()
             .find(|(_, r)| inside(*r, mouse))
             .and_then(|(i, _)| o.inventory.iter().find(|(k, _)| *k == i))
-            .map(|(_, s)| vec![host.hover_name(s).unwrap_or_default()])
+            .map(|(_, s)| vec![crate::glue::compat::hover_text(&*host, s)])
     };
     if let Some(lines) = tip {
         let _ = draw.gui_tooltip(&lines, mouse);

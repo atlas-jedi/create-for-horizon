@@ -172,7 +172,6 @@ impl Subsystem for Logistics {
             r.block_container(
                 &states::key(block),
                 ModContainer {
-                    insert_rules: Vec::new(),
                     slots,
                     faces: std::array::from_fn(|_| all.clone()),
                     inputs,
@@ -587,7 +586,7 @@ impl Subsystem for Entities {
             crate::create_log!("[create] no kinetic block entity type: logistics has no renderer");
             return;
         };
-        r.block_entity_capability_before_game(&ITEMS, &kind, handlers::offer);
+        r.block_entity_capability_before_game(&ITEMS, &kind, crate::glue::compat::be_offer(handlers::offer));
         if let Err(e) = r.block_entity_part(&kind, client::LogisticsEntity) {
             crate::create_log!("[create] the logistics block entity part was refused: {e:?}");
         }
@@ -599,14 +598,14 @@ impl Subsystem for Entities {
 /// is noted to be carried (`belt::stepped_on`).
 /// `updateEntityAfterFallOn` of a belt or an ejector, from the server's `step_on` of the block
 /// under a grounded entity.
-fn step_on(event: &mod_api::StepOnEvent<'_>) {
+pub(crate) fn step_on(event: &mod_api::BlockStepOnEvent<'_>) {
     if event.kind == "minecraft:item" {
         return;
     }
     let block = states::id(event.state)
         .and_then(|id| with_world(|w| w.table.get(id).map(|(b, _)| b)))
         .flatten();
-    let pos = [event.pos.x, event.pos.y, event.pos.z];
+    let pos = event.position;
     match block {
         Some(Block::Belt) => belt::stepped_on(pos, event.entity as u32),
         // `EjectorBlock.updateEntityAfterFallOn`: a player's own client triggers it.
@@ -727,12 +726,7 @@ fn use_block(
 
 #[mod_api::horizon_part]
 impl BlockPart for LogisticsBlock {
-    /// Hot: an entity on the ground over a belt or ejector, each tick it moves.
-    fn step_on(&self, level: mod_api::LevelRandomSide<'_>, event: &mut mod_api::StepOnEvent<'_>) {
-        if let mod_api::LevelRandomSide::Server(_) = level {
-            step_on(event);
-        }
-    }
+    // Horizon: stepping on a block is the global `Hooks::block_step_on` (server), in lib.rs.
 
     fn use_item_on(
         &self,

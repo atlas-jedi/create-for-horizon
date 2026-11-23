@@ -34,6 +34,7 @@
 //! at the schematic position (e.g. shulker boxes), the SDK cannot answer without a placed cell;
 //! those entries still use the full collision cube approximation.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 pub mod body;
 mod deploy;
 mod quill;
@@ -65,7 +66,7 @@ use mod_api::{
     BlockEntityUpdateTagEvent, BlockKey, BlockPart, BlockShapeKind, BlockState, BlockUpdateFlags,
     ClientHost, Command, CommandArgumentValue, Compound, ContentsChangedEvent, Direction, Flow,
     Host, HostBlockStates, HostTransaction, ITEMS, ItemPart, ItemResource, ItemStack, MenuPart,
-    MenuScreen, ModContainer, OnBlockPlacedByEvent, PlayerRef, Registrar, RegistrationContext,
+    ModContainer, OnBlockPlacedByEvent, PlayerRef, Registrar, RegistrationContext,
     ServerHost, SoundSource, Tag,
 };
 use std::cell::{Cell, RefCell};
@@ -372,7 +373,6 @@ impl Subsystem for Schematics {
             r.block_container(
                 &states::key(b),
                 ModContainer {
-                    insert_rules: Vec::new(),
                     slots: CANNON_SLOTS,
                     faces: std::array::from_fn(|_| Vec::new()),
                     inputs: Vec::new(),
@@ -380,20 +380,12 @@ impl Subsystem for Schematics {
                     menu: Some(menu.into()),
                 },
             );
-            r.menu_part(menu, SchematicMenus);
         }
-        for (menu, factory) in [
-            (
-                CANNON_MENU,
-                Arc::new(cannon_screen) as Arc<dyn mod_api::MenuScreenFactory>,
-            ),
-            (TABLE_MENU, Arc::new(table_screen)),
-        ] {
-            if let Err(e) = r.register_menu_screen(menu, factory) {
-                crate::create_log!("[create] the {menu} screen was refused: {e}");
-            }
-        }
+        // Horizon: no menu screen API; the cannon's and the table's screens are off.
         for kind in [cannon, table] {
+            if let Err(e) = r.block_entity_part(&kind, SchematicMenus) {
+                crate::create_log!("[create] the schematic menus' part was refused: {e:?}");
+            }
             if let Err(e) = r.block_entity_part(&kind, SchematicEntity) {
                 crate::create_log!(
                     "[create] the schematic block entities' part was refused: {e:?}"
@@ -719,7 +711,7 @@ impl World<'_, '_> {
                 if got >= max {
                     break;
                 }
-                got += inv.extract_at(h, tx, *index, r, max - got);
+                got += inv.extract(h, tx, *index, r, max - got);
             }
             Ok::<u32, ()>(got)
         })
@@ -1142,9 +1134,8 @@ fn entry(lv: &ServerLevel<'_>, p: &PaletteState, rotation: Rotation, mirror: Mir
         air: state.is_none_or(|s| is_air(host, s)),
         plain_air,
         conductor: state.is_some_and(|s| {
-            host.block_states()
-                .is_redstone_conductor(s)
-                .unwrap_or_else(|| full_cube(lv, s, [0; 3]))
+            // Horizon: no per-state conductor fact; a full cube conducts.
+            full_cube(lv, s, [0; 3])
         }),
         requirement,
         ignore,
@@ -1320,9 +1311,7 @@ fn table_button(host: &mut dyn ServerHost, context: &mod_api::item::menu::MenuBu
     let Some(file) = body::local_files(&*host).into_iter().nth(index) else {
         return;
     };
-    let Some(pos) = context.pos else {
-        return;
-    };
+    let pos = context.pos;
     let name = player.name(&*host).unwrap_or_default().to_owned();
     UPLOADS.with_borrow_mut(|u| u.push((dim, name, pos, file)));
 }
@@ -1356,9 +1345,7 @@ fn cannon_button(host: &mut dyn ServerHost, context: &mod_api::item::menu::MenuB
     let Some(dim) = level_index(&dimension) else {
         return;
     };
-    let Some(pos) = context.pos else {
-        return;
-    };
+    let pos = context.pos;
     let data = with(dim, |d| d.sent_data.get(&pos).cloned()).unwrap_or_default();
     let Some(option) = screens::configure(context.id, &data) else {
         return;
@@ -1548,17 +1535,19 @@ impl BlockEntityPart for SchematicEntity {
     /// gunpowder to the fuel slot (`SchematicannonInventory.isItemValid`); the table takes blank
     /// schematics, quills and schematics in its input. The game's own routing (the first slot
     /// with room) is replaced by the destination order of Create’s menu, including whole stacks.
-    fn menu_quick_move(&self, event: &mut mod_api::MenuQuickMoveEvent<'_>) -> Flow {
+    fn menu_quick_move(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::MenuQuickMoveEvent<'_>,
+    ) -> Flow {
         if event.slot < event.container_slots {
             return Flow::Continue;
         }
-        let Some(stack) = event.stack.as_ref().cloned() else {
+        let stack = event.stack.clone();
+        if stack.count() == 0 {
             return Flow::Continue;
-        };
-        let Some(kind) = event.subject.with_view(|v| v.id().to_owned()) else {
-            return Flow::Continue;
-        };
-        let host = event.subject.host();
+        }
+        let kind = event.entity.id().to_owned();
         let id = packages::body::item_id(&*host, &stack);
         let to = match (kind.as_str(), id.as_str()) {
             ("create:schematicannon", SCHEMATIC) => 0,
@@ -1574,29 +1563,26 @@ impl BlockEntityPart for SchematicEntity {
             Some(t) if t.is_stackable_with(&stack) => max.saturating_sub(t.count()),
             Some(_) => 0,
         };
-        let moved = event.subject.with_view(|mut v| {
-            if v.item_slots() <= to {
-                return None;
-            }
-            let held = v.item_slot(to as u32).and_then(|s| s.to_owned());
-            let n = room(&held).min(stack.count());
-            if n == 0 {
-                return None;
-            }
-            let there = held.as_ref().map_or(0, ItemStack::count);
-            v.set_item_slot(to as u32, packages::body::with_count(&stack, there + n))
-                .ok()
-                .filter(|set| *set)
-                .map(|_| n)
-        });
-        if let Some(Some(n)) = moved {
-            *event.stack = packages::body::with_count(&stack, stack.count() - n);
+        let items = &mut event.entity.items;
+        if items.len() <= to {
+            return Flow::Cancel;
+        }
+        let held = items[to].clone();
+        let n = room(&held).min(stack.count());
+        if n == 0 {
+            return Flow::Cancel;
+        }
+        let there = held.as_ref().map_or(0, ItemStack::count);
+        if let Some(put) = packages::body::with_count(&stack, there + n) {
+            items[to] = Some(put);
+            let _ = event.stack.set_count(stack.count() - n);
         }
         Flow::Cancel
     }
 }
 
 /// The cannon's screen (`SchematicannonScreen`), over its menu's data slots.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn cannon_screen(_host: &dyn ClientHost, open: mod_api::MenuScreenOpen<'_>) -> Option<MenuScreen> {
     (open.block == Some("create:schematicannon")).then_some(())?;
     Some(
@@ -1614,6 +1600,7 @@ fn cannon_screen(_host: &dyn ClientHost, open: mod_api::MenuScreenOpen<'_>) -> O
 }
 
 /// The table's screen (`SchematicTableScreen`): its input and output slots.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn table_screen(_host: &dyn ClientHost, open: mod_api::MenuScreenOpen<'_>) -> Option<MenuScreen> {
     (open.block == Some("create:schematic_table")).then_some(())?;
     Some(
@@ -1635,13 +1622,13 @@ fn table_screen(_host: &dyn ClientHost, open: mod_api::MenuScreenOpen<'_>) -> Op
 struct SchematicMenus;
 
 #[mod_api::horizon_part]
-impl MenuPart for SchematicMenus {
-    fn menu_button(&self, event: &mut mod_api::MenuButtonEvent<'_>) {
+impl BlockPart for SchematicMenus {}
+
+#[mod_api::horizon_part]
+impl BlockEntityPart for SchematicMenus {
+    fn menu_button(&self, host: &mut dyn ServerHost, event: &mut mod_api::MenuButtonEvent<'_>) {
         let context = event.context;
-        let Some(kind) = event.subject.with_view(|v| v.id().to_owned()) else {
-            return;
-        };
-        let host = event.subject.host();
+        let kind = event.entity.id().to_owned();
         match kind.as_str() {
             "create:schematicannon" => cannon_button(host, context),
             "create:schematic_table" => table_button(host, context),

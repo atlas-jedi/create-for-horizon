@@ -1242,7 +1242,7 @@ fn attr_line(host: &dyn Host, kind: &str, value: Option<String>) -> filter_scree
                     .and_then(|id| {
                         item_groups(host)?
                             .tab(id)
-                            .map(|t| host.text_string(&t.display_name))
+                            .map(|t| crate::glue::compat::text_string(host, &t.display_name))
                     })
                     .unwrap_or_else(|| "<none>".to_owned()),
             ),

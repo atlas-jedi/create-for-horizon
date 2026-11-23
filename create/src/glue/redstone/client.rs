@@ -402,7 +402,7 @@ fn draw_link(host: &dyn ClientHost, draw: &mut dyn BlockEntityDrawContext, pos: 
             continue;
         };
         // `isGui3d`: an item that places a block is drawn whole.
-        let block_item = host.item_uses_block_light(&stack, ItemDisplayContext::Fixed);
+        let block_item = crate::glue::compat::item_uses_block_light(&*host, &stack, ItemDisplayContext::Fixed);
         let pose = create_engine::link::slot_pose(facing, first, block_item);
         draw.push();
         pose::apply(draw, &pose);

@@ -492,7 +492,7 @@ pub(crate) fn sync_movement_capture(host: &mut dyn ClientHost) {
     for mapping in MAPPINGS {
         let down = !captured && crate::glue::keys::physical_down(&*host, mapping);
         if let Err(error) = crate::glue::keys::set_down(host, mapping, down)
-            && error != mod_api::MappingError::Unavailable
+            && error != mod_api::MappingError::NoWorld
         {
             crate::create_log!("[create] could not set movement mapping {mapping}: {error:?}");
         }

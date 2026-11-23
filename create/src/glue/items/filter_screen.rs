@@ -515,7 +515,7 @@ fn screen_tooltip(
             (attribute && inside(r, at)).then(|| {
                 selector_tip(
                     host,
-                    host.hover_name(&reference).unwrap_or_default(),
+                    crate::glue::compat::hover_text(&*host, &reference),
                     o.options(),
                     o.option,
                 )
@@ -539,9 +539,8 @@ impl MenuPart for FilterScreen {
         _context: &dyn mod_api::LoopContext,
         event: &mut mod_api::MenuStillValidEvent<'_>,
     ) {
-        if let Some(opened) = &event.opening_item {
-            event.valid &= opened.stack_matches;
-        }
+        // Horizon: no opening item on the event; the filter menu never opens anyway.
+        let _ = event;
     }
 
     /// The ghost slots take nothing from the cursor and give nothing up: the server's clicks
@@ -549,7 +548,7 @@ impl MenuPart for FilterScreen {
     fn menu_slot_rules(&self, _host: &dyn Host, event: &mut mod_api::MenuSlotRulesEvent<'_>) {
         if attribute_menu(event.menu).is_some() && event.container == mod_api::MenuContainer::Main {
             event.may_place = false;
-            event.may_pickup = false;
+            // Horizon: no pickup rule on the event.
         }
     }
 }
@@ -653,7 +652,7 @@ fn button_tip(host: &dyn ClientHost, o: &Open, at: [f32; 2]) -> Option<Vec<Text>
         );
         if host.modifiers().shift() {
             let desc = tr(host, desc);
-            for line in cut(|t| host.text_width(&Text::literal(t)) as f32, &desc) {
+            for line in cut(|t| host.text_width(&Text::literal(t)).unwrap_or(0) as f32, &desc) {
                 lines.push(styled(line, "gray", false));
             }
         }

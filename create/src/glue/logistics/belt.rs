@@ -3,6 +3,7 @@
 //! from beside, above or another belt (`DirectBeltInputBehaviour.handleInsertion`); what is
 //! thrown off the end; the items clients draw (`create:belt`).
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::net;
 use super::super::server::{ServerLevel, update_all};
 use super::super::states;

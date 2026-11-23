@@ -6,7 +6,6 @@ use mod_api::{
     EntityRef, EquipmentSlot, Hand, Host, ItemEntityRef, ItemPlace, ItemStack, LevelRef, LivingRef,
     PlayerRef, ServerHost,
 };
-use std::ops::ControlFlow;
 
 pub trait OwnedInventory {
     /// `Inventory.items`: the non-empty main inventory stacks in slot order.
@@ -15,22 +14,14 @@ pub trait OwnedInventory {
     fn inventory_slots(self, host: &dyn Host) -> Option<Vec<(u32, ItemStack)>>;
 }
 
+// Horizon hands out owned copies itself: these forward to its own methods.
 impl OwnedInventory for PlayerRef {
     fn inventory(self, host: &dyn Host) -> Option<Vec<ItemStack>> {
-        self.with_inventory(host, |view| {
-            view.iter()
-                .take_while(|(slot, _)| *slot < 36)
-                .filter_map(|(_, stack)| stack.project())
-                .collect()
-        })
+        PlayerRef::inventory(self, host)
     }
 
     fn inventory_slots(self, host: &dyn Host) -> Option<Vec<(u32, ItemStack)>> {
-        self.with_inventory(host, |view| {
-            view.iter()
-                .filter_map(|(slot, stack)| Some((slot, stack.project()?)))
-                .collect()
-        })
+        PlayerRef::inventory_slots(self, host)
     }
 }
 
@@ -41,13 +32,11 @@ pub trait OwnedEquipment {
 
 impl OwnedEquipment for LivingRef {
     fn hand_item(self, host: &dyn Host, hand: Hand) -> Option<ItemStack> {
-        self.with_hand_item(host, hand, |stack| stack.project())
-            .flatten()
+        LivingRef::hand_item(self, host, hand)
     }
 
     fn equipment(self, host: &dyn Host, slot: EquipmentSlot) -> Option<ItemStack> {
-        self.with_equipment(host, slot, |stack| stack.project())
-            .flatten()
+        LivingRef::equipment(self, host, slot)
     }
 }
 
@@ -57,7 +46,7 @@ pub trait OwnedStack {
 
 impl OwnedStack for ItemEntityRef {
     fn stack(self, host: &dyn Host) -> Option<ItemStack> {
-        self.with_stack(host, |stack| stack.project()).flatten()
+        ItemEntityRef::stack(self, host)
     }
 }
 
@@ -67,7 +56,7 @@ pub trait OwnedPlace {
 
 impl OwnedPlace for ItemPlace {
     fn stack(&self, host: &mut dyn ServerHost) -> Option<ItemStack> {
-        self.with_stack(host, |stack| stack.project()).flatten()
+        ItemPlace::stack(self, host)
     }
 }
 
@@ -80,24 +69,10 @@ pub trait LevelLists {
 
 impl LevelLists for LevelRef {
     fn entities_in(self, host: &dyn Host, min: [f64; 3], max: [f64; 3]) -> Option<Vec<EntityRef>> {
-        let mut found = Vec::new();
-        let _ = self
-            .visit_entities_in(host, min, max, &mut |e| {
-                found.push(e);
-                ControlFlow::Continue(())
-            })
-            .ok()?;
-        Some(found)
+        LevelRef::entities_in(self, host, min, max)
     }
 
     fn online_players(self, host: &dyn Host) -> Option<Vec<PlayerRef>> {
-        let mut found = Vec::new();
-        let _ = self
-            .visit_online_players(host, &mut |p| {
-                found.push(p);
-                ControlFlow::Continue(())
-            })
-            .ok()?;
-        Some(found)
+        LevelRef::online_players(self, host)
     }
 }

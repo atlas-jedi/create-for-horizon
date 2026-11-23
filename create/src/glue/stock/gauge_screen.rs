@@ -856,7 +856,7 @@ fn render_config(
         crate::glue::item_name_message(
             key,
             Some(fallback),
-            host.hover_name(stack).unwrap_or_default(),
+            crate::glue::compat::hover_text(&*host, stack),
             count,
         )
         .with_style(style)
@@ -1240,7 +1240,7 @@ fn render_config(
                 .panel
                 .filter
                 .as_ref()
-                .and_then(|f| host.hover_name(f).ok())
+                .and_then(|f| Some(crate::glue::compat::hover_text(&*host, f)))
                 .unwrap_or_default();
             vec![
                 head("create.gui.factory_panel.promised_items", "Promised items"),

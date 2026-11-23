@@ -777,9 +777,8 @@ fn draw_blocks(
     let level = matches!(lighting, Lighting::Sampled(_))
         .then(|| host.level(host.dimension()))
         .flatten();
-    if let Lighting::Host = lighting {
-        draw.level_light();
-    }
+    // Horizon: no switch to the level's light for a whole structure; the draw's own light.
+    let _ = matches!(lighting, Lighting::Host);
     for b in blocks {
         let props: Vec<(&str, &str)> = b
             .props
@@ -1003,9 +1002,6 @@ impl BlockEntityDrawContext for Unkept<'_> {
     fn set_light(&mut self, light: u32) {
         self.0.set_light(light);
     }
-    fn level_light(&mut self) {
-        self.0.level_light();
-    }
     fn quad(&mut self, sprite: &str, corners: [[f32; 3]; 4], uv: [f32; 4], tint: u32) -> bool {
         self.0.quad(sprite, corners, uv, tint)
     }
@@ -1064,7 +1060,7 @@ impl BlockEntityDrawContext for Unkept<'_> {
     ) -> Result<f32, mod_api::TextFormError> {
         self.0.text(text, at, color, glowing, outline)
     }
-    fn text_width(&self, text: &mod_api::Text) -> f32 {
+    fn text_width(&self, text: &mod_api::Text) -> Result<f32, mod_api::TextFormError> {
         self.0.text_width(text)
     }
     fn model_part(&mut self, part: &mod_api::ModelPart, sprite: &str, tint: u32) -> bool {

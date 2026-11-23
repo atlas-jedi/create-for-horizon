@@ -134,7 +134,7 @@ pub(super) fn draw(host: &dyn ClientHost, event: &mut crate::glue::Submit<'_>) {
     else {
         return;
     };
-    let block = host.item_uses_block_light(&stack, ItemDisplayContext::Fixed);
+    let block = crate::glue::compat::item_uses_block_light(&*host, &stack, ItemDisplayContext::Fixed);
     let upright = crate::glue::logistics::upright(host, &item);
     let draw = &mut *event.draw;
     let t = draw.partial();

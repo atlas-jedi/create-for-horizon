@@ -101,7 +101,7 @@ pub fn take(
             let host = &mut *lv.host;
             let r = items.resource(host, slot)?;
             let got = host
-                .transaction(|h, tx| match items.extract_at(h, tx, slot, &r, n) {
+                .transaction(|h, tx| match items.extract(h, tx, slot, &r, n) {
                     0 => Err(()),
                     got => Ok(got),
                 })
@@ -133,7 +133,7 @@ pub fn insert_items(
     let r = ItemResource::of(&stack);
     let count = stack.count();
     let went = host
-        .transaction(|h, tx| Ok::<u32, ()>(items.insert(h, tx, &r, count).unwrap_or(0)))
+        .transaction(|h, tx| Ok::<u32, ()>(items.insert_any(h, tx, &r, count)))
         .unwrap_or(0);
     stack.shrink(went)
 }
@@ -145,7 +145,7 @@ pub fn fits(lv: &mut ServerLevel<'_>, items: &Items, stacks: &[ItemStack]) -> bo
         .transaction(|h, tx| -> Result<(), bool> {
             for s in stacks {
                 let r = ItemResource::of(s);
-                if items.insert(h, tx, &r, s.count()).unwrap_or(0) < s.count() {
+                if items.insert_any(h, tx, &r, s.count()) < s.count() {
                     return Err(false);
                 }
             }

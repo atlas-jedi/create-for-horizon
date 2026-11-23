@@ -106,7 +106,7 @@ pub fn register(event: &mut RegisterRenderPipelinesEvent<'_>) {
         else {
             continue;
         };
-        event.register(
+        event.pipelines.push(
             RenderPipeline::new(id, shader.clone(), t.blend(), WorldDepth::Tested)
                 .textured(PipelineTexture::Sprite(sprite))
                 .optional(),
@@ -115,7 +115,7 @@ pub fn register(event: &mut RegisterRenderPipelinesEvent<'_>) {
     for frame in 0..STEAM_JET_FRAMES {
         let sprite = Identifier::parse(&format!("create:block/special/steam_jet_{frame}"))
             .expect("steam jet sprite id");
-        event.register(
+        event.pipelines.push(
             RenderPipeline::new(
                 steam_jet_id(frame),
                 shader.clone(),

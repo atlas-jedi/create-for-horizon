@@ -50,9 +50,8 @@ use subsystem::Subsystem;
 
 /// Resolve a stack's hover name in the caller's language for plain labels and search.
 pub(crate) fn item_name(host: &dyn Host, stack: &ItemStack) -> String {
-    host.hover_name(stack)
-        .map(|name| host.text_string(&name))
-        .unwrap_or_default()
+    // Horizon reads hover names only on a client: the id's path, as the display link does.
+    display::item_name(&stack.item().id(host))
 }
 
 /// Keep the name as a translation argument: its style and any literal percent signs are data.
@@ -185,8 +184,8 @@ pub fn connection_group(
             | (i64::from(z) & 0x3FF_FFFF) << 12
             | (i64::from(y) & 0xFFF)) as u64
     });
-    let level = lv.level;
-    let _ = level.set_connection_group(&mut *lv.host, pos, group);
+    // Horizon: no connected-texture groups; the casing joins by its own model rules.
+    let _ = (lv, pos, group);
 }
 
 /// Registers one of Create's particle types (`ICustomParticleData.createType`, which does not
@@ -224,6 +223,7 @@ pub fn ensure_column(host: &mut dyn ServerHost, dimension: &str, chunk: [i32; 2]
 
 fn load_column(lv: &mut ServerLevel<'_>, chunk: [i32; 2]) {
     let data = persist::read(lv, chunk);
+    entity_data::restore_column(lv, chunk);
     for s in SUBSYSTEMS {
         s.chunk_load(lv, chunk, &data);
     }

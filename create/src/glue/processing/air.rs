@@ -8,6 +8,7 @@
 //!   current and coloured, with their extra flame, lava, smoke, soul flame and bubble particles
 //!   (`morphAirFlow`), by the processing type of the segment they cross.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use create_engine::fan::{self, Kind, Seen};
 use create_engine::processing::Rng;
 use mod_api::{

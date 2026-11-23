@@ -27,10 +27,11 @@ use create_engine::dye::{self, DyeColor};
 use create_engine::{seat, turntable};
 use mod_api::{
     BlockPart, ClientHost, EntityInsideEvent, EntityJoinLevelEvent, EntityMountEvent, EntityRef,
-    EntitySpawn, FallOnEvent, Flow, GeneralEntityCategory, GeneralSavePolicy, InteractionResult,
+    FallOnEvent, Flow, GeneralEntityCategory, GeneralSavePolicy, InteractionResult,
     LeashHolder, LevelRandomHost, Registrar, RegistrationContext, RemovalReason, ServerHost,
-    SpawnBody, UseItemOnEvent,
+    UseItemOnEvent,
 };
+use crate::glue::compat::{EntitySpawn, LevelSpawn as _, SpawnBody};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -62,11 +63,8 @@ impl Subsystem for Seats {
             GeneralEntityCategory::Misc,
             0.25,
             f64::from(seat::HEIGHT),
-            Some([0.0, seat::PASSENGER_HEIGHT, 0.0]),
             GeneralSavePolicy::Save,
             true,
-            false,
-            None,
             5,
             i32::MAX,
             1,
@@ -198,7 +196,7 @@ fn sit_down(lv: &mut ServerLevel<'_>, pos: [i32; 3], rider: EntityRef) -> bool {
     ) else {
         return false;
     };
-    if !rider.start_riding(&mut *lv.host, seat, true).is_ok() {
+    if !rider.start_riding(&mut *lv.host, seat, true) {
         seat.discard(&mut *lv.host);
         return false;
     }
@@ -300,7 +298,7 @@ fn level_tick(lv: &mut ServerLevel<'_>) {
             seat::seat_anchor(pos, "minecraft:player"),
             None,
         );
-        if player.start_riding(&mut *lv.host, stand, true).is_ok() {
+        if player.start_riding(&mut *lv.host, stand, true) {
             SEATS.with_borrow_mut(|s| {
                 if let Some(s) = s.get_mut(&(dim, pos)) {
                     s.player = true;

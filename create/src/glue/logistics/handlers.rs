@@ -35,7 +35,7 @@ pub fn offer(
     side: BlockSide,
     state: mod_api::BlockState,
     _entity: BlockEntityRef,
-    offer: &mut mod_api::BlockCapabilityOffer<'_, dyn ResourceHandler<ItemResource>>,
+    offer: &mut crate::glue::compat::BlockCapabilityOffer<'_, dyn ResourceHandler<ItemResource>>,
 ) {
     if let Some(handler) = provide(side, state) {
         offer.offer(|| handler);
@@ -689,7 +689,7 @@ impl ResourceHandler<ItemResource> for TunnelItems {
     ) -> u32 {
         match self.target(host) {
             Some(create_engine::tunnel::HandlerTarget::BeltBelow) => {
-                self.belt().insert_at(host, tx, index, resource, amount)
+                self.belt().insert(host, tx, index, resource, amount)
             }
             Some(create_engine::tunnel::HandlerTarget::Distribute) if index == 0 => {
                 let Some(e) = self.0.entity(&*host, self.0.pos) else {
@@ -709,6 +709,6 @@ impl ResourceHandler<ItemResource> for TunnelItems {
         resource: &ItemResource,
         amount: u32,
     ) -> u32 {
-        self.belt().extract_at(host, tx, index, resource, amount)
+        self.belt().extract(host, tx, index, resource, amount)
     }
 }

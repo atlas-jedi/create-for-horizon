@@ -18,6 +18,7 @@
 //!
 //! Left out: the elytra a launched player deploys.
 
+#[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::net;
 use super::super::server::ServerLevel;
 use super::super::subsystem::Subsystem;
@@ -1997,7 +1998,7 @@ fn put_on_goggles(
         mod_api::HostSide::Client(h) => {
             let goggles = click
                 .stack
-                .is_some_and(|s| s.item().id(&**h) == Some("create:goggles"));
+                .is_some_and(|s| s.item().id(&**h) == "create:goggles");
             let arm = h
                 .level(h.dimension())
                 .and_then(|l| l.block_state(&**h, click.pos))
@@ -2011,7 +2012,7 @@ fn put_on_goggles(
         mod_api::HostSide::Server(h) => {
             if !click
                 .stack
-                .is_some_and(|s| s.item().id(&**h) == Some("create:goggles"))
+                .is_some_and(|s| s.item().id(&**h) == "create:goggles")
             {
                 return false;
             }

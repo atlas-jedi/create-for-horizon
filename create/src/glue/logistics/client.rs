@@ -407,8 +407,7 @@ struct ClientItemLayout<'a>(&'a dyn ClientHost);
 impl ItemLayout for ClientItemLayout<'_> {
     fn solid(&self, host: &dyn Host, id: &str) -> bool {
         stack_of(host, id, 1).is_some_and(|stack| {
-            self.0
-                .item_uses_block_light(&stack, ItemDisplayContext::Fixed)
+            crate::glue::compat::item_uses_block_light(self.0, &stack, ItemDisplayContext::Fixed)
         })
     }
 }

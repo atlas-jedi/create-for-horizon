@@ -202,7 +202,7 @@ fn sign(
                     .unwrap_or_else(|| mod_api::Text::literal(""))
             })
             .collect();
-        if lines.iter().all(|t| draw.text_width(t) == 0.0) {
+        if lines.iter().all(|t| draw.text_width(t).unwrap_or(0.0) == 0.0) {
             continue;
         }
         let colour = match side.get(&"color".into()) {
@@ -244,7 +244,7 @@ fn sign(
             draw.scale([0.010416667, -0.010416667, 0.010416667]);
         }
         for (i, line) in lines.iter().enumerate() {
-            let width = draw.text_width(line).min(max_width);
+            let width = draw.text_width(line).unwrap_or(0.0).min(max_width);
             if width == 0.0 {
                 continue;
             }

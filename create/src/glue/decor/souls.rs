@@ -13,6 +13,7 @@
 //! lies flat (`CustomRotationParticle.getCustomRotation`); either goes once light reaches it
 //! (`SoulParticle.tick`).
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::server::ServerLevel;
 use crate::glue::names::Named as _;
 use crate::glue::owned::OwnedEquipment as _;

@@ -330,7 +330,7 @@ pub(crate) fn restore_storage(
                 let n = stack.count();
                 let mut went = items.insert(host, tx, i, &resource, n);
                 if went < n {
-                    went += items.insert(host, tx, &resource, n - went).unwrap_or(0);
+                    went += items.insert_any(host, tx, &resource, n - went);
                 }
                 if went < n
                     && let Some(rest) = resource.to_stack(n - went)

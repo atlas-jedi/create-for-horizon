@@ -14,6 +14,7 @@
 //! another tool slower (`getDestroyProgress`) by vanilla's rule for the held stack; a block's own
 //! `canHarvestBlock` (a copycat's material) is not asked of the deployer's player there.
 
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::takes_from_side;
 use super::{press, recipes, stacks};
 use crate::glue::names::Named as _;
@@ -938,7 +939,7 @@ fn random_index(lv: &mut ServerLevel<'_>, n: usize) -> usize {
     let n = n as i32;
     let pick = lv
         .level
-        .with_random(&mut *lv.host, |r| r.next_int_bound(n))
+        .with_random(&mut *lv.host, |r| r.next_int_bound(n).unwrap_or(0))
         .unwrap_or(0) as usize;
     pick.min(n as usize - 1)
 }
@@ -992,7 +993,7 @@ fn act_with(
     };
     let mut setup = PlayerActionSetup::new(stack, eye, yaw, pitch, false);
     // DeployerFakePlayer.resetAttackStrengthTicker gives each punch a full charge.
-    setup.full_attack_charge = true;
+    // Horizon: no full-charge switch on the action setup.
     let Ok(result) = fake.perform_action_scoped(&mut *lv.host, action, setup) else {
         return (None, Vec::new());
     };
@@ -1041,7 +1042,7 @@ fn punch(
         return Vec::new();
     };
     let harvest = facts.requires_correct_tool(state) != Some(true)
-        || facts.is_correct_tool_for_drops(&tool, state) == Some(true);
+        || facts.is_correct_tool_for_drops(state, &tool) == Some(true);
     let per_hit = deployer::destroy_progress(deployer::Dig {
         hardness,
         tool_speed: lv

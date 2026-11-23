@@ -513,7 +513,7 @@ pub(super) fn screen_render_post(host: &dyn ClientHost, event: &mut ScreenRender
                         })
                 });
             hovered.map(|s| {
-                let mut lines = vec![host.hover_name(&s).unwrap_or_default()];
+                let mut lines = vec![crate::glue::compat::hover_text(&*host, &s)];
                 let to = body::address(&s);
                 if !to.is_empty() {
                     lines.push(Text::literal(format!("\u{2192} {to}")));
