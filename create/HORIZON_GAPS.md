@@ -42,3 +42,22 @@ Port experimental do create-sunrise para o SDK do Horizon (Nightly `f1bb66f`). C
 | Deployer: o soco não sai com carga cheia de ataque | `PlayerActionSetup.full_attack_charge` | `src/glue/processing/deployer.rs` |
 | Contraptions desenhadas: luz do nível para a estrutura inteira não é usada (luz do próprio desenho) | `BlockEntityDrawContext::level_light` | `src/glue/contraptions/draw.rs` |
 | Conquistas/cinto de ferramentas: dados persistentes do jogador gravados via compound inteiro (adaptação) | `PlayerRef::set_persistent_data_key` | `src/glue/compat.rs` |
+
+## Adaptações que mudam comportamento (não são cortes, mas podem dar diferença no jogo)
+
+- `state_for_placement` e `can_survive` no Horizon recebem só um `&dyn LevelHost`, sem dizer o lado. O código trata sempre como servidor (`src/glue/compat.rs`, scripts em `lifts.rs`, `redstone/parts.rs`, `copycat/parts.rs`). No cliente isso pode enfileirar trabalho que só o servidor consome.
+- `block_changed` do Horizon não informa as flags da troca; a cinética recebe sempre "atualização comum" (sem `KNOWN_SHAPE`). `src/lib.rs`.
+- `block_entity_client_tick` usa um adaptador (`compat::ClientTick`) que monta a "visão" do block entity a partir do evento do Horizon.
+- Capabilities de item (depot, esteira, funil, moedor, mixer/basin, crafter, toolbox) usam um adaptador (`compat::be_offer`) do formato "oferta" do Sunrise para o formato "retorna o handler" do Horizon.
+- `ResourceHandler`: `insert_at`/`extract_at` viraram `insert`/`extract`; o `insert`/`extract` sem índice do Sunrise virou `insert_any`/`extract_any`; `capacity` recebe o recurso sempre (não mais `Option`).
+- Partículas próprias: `register_particle_type` com codecs virou `particle_key` + provedor registrado pelo nome (`compat::ParticleType`).
+- Comandos de debug do Create: a execução passou do closure por comando para o hook global `run_mod_command`.
+- Pisar em esteira/ejetor: de `BlockPart::step_on` para o hook global `block_step_on` (só servidor).
+- Placement do câmbio/embreagem (gearshift/clutch) nasce sem energia; o vizinho liga depois.
+
+## Verificação feita
+
+- `cargo +stable-x86_64-pc-windows-msvc check`: 0 erros (≈200 warnings, a maioria de código desligado/sem uso).
+- `cargo horizon-mod build`: gera `target/horizon-mod/create.hmod` (pacote de fonte nativa; o launcher compila).
+- `cargo horizon-mod check target/horizon-mod/create.hmod`: aceito (sem assinatura).
+- `cargo horizon-mod check` (sem arquivo): falha só no passo extra de `cargo check` para `wasm32-unknown-unknown`, porque o target wasm32 não está instalado no toolchain da máquina (não instalei para não mexer fora da pasta). Não testado: `cargo test`, build release, rodar no jogo.
