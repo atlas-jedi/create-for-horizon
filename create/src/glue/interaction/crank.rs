@@ -20,7 +20,7 @@ pub(super) fn register(r: &mut dyn Registrar) {
 /// The part a hand crank carries.
 struct Crank;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Crank {
     /// `HandCrankBlock.useItemOn`, the game's own use of the block.
     fn use_item_on(

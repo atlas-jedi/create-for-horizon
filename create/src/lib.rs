@@ -26,7 +26,7 @@ use mod_api::{
 #[derive(Default)]
 struct Create;
 
-#[mod_api::sunrise_mod]
+#[mod_api::horizon_mod]
 impl Hooks for Create {
     fn register(&self, r: &mut dyn Registrar, cx: &RegistrationContext) {
         states::register(r);
@@ -109,10 +109,14 @@ impl Hooks for Create {
         }
     }
 
-    fn tags_updated(&self, cx: &dyn mod_api::ReloadContext, event: &mut TagsUpdatedEvent) {
+    fn tags_updated(&self, side: HostSide, event: &mut TagsUpdatedEvent) {
         if !matches!(event.cause, mod_api::TagsUpdateCause::ServerDataLoad { .. }) {
             return;
         }
+        let HostSide::Server(host) = side else {
+            return;
+        };
+        let cx: &dyn mod_api::Host = &*host;
         for s in SUBSYSTEMS {
             s.tags_updated(cx);
         }
@@ -167,7 +171,7 @@ impl Hooks for Create {
         let HostSide::Server(host) = host else {
             return;
         };
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.level.dimension().id(&*host) else {
             return;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -185,7 +189,7 @@ impl Hooks for Create {
         let HostSide::Server(host) = host else {
             return;
         };
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.level.dimension().id(&*host) else {
             return;
         };
         glue::net::flush(host);
@@ -227,10 +231,6 @@ impl Hooks for Create {
         for s in SUBSYSTEMS {
             s.client_tick(host);
         }
-    }
-
-    fn client_pick(&self, host: &mut dyn ClientHost, event: &mut mod_api::ClientPickEvent<'_>) {
-        glue::equipment::grip_pick(host, event);
     }
 
     fn model_baking_completed(
@@ -283,14 +283,6 @@ impl Hooks for Create {
     ) {
         glue::pipelines::register(event);
         glue::interaction::register_pipelines(event);
-    }
-
-    fn register_item_models(
-        &self,
-        _context: &RegistrationContext,
-        event: &mut mod_api::RegisterItemModelsEvent<'_>,
-    ) {
-        glue::equipment::register_grip_pose(event);
     }
 
     fn render_frame_pre(
@@ -416,7 +408,7 @@ impl Hooks for Create {
 
     fn living_incoming_damage(
         &self,
-        level: &mut dyn mod_api::HitHost,
+        level: &mut dyn mod_api::LevelRandomHost,
         event: &mut mod_api::LivingIncomingDamageEvent<'_>,
     ) -> Flow {
         until_cancel(|s| s.living_incoming_damage(level, event))
@@ -511,15 +503,11 @@ impl Hooks for Create {
         until_cancel(|s| s.interaction_key(host, event))
     }
 
-    fn movement_input_update(
-        &self,
-        host: &dyn ClientHost,
-        event: &mut mod_api::MovementInputUpdateEvent<'_>,
-    ) {
+    fn movement_input(&self, host: &dyn ClientHost, event: &mut mod_api::MovementInputEvent) {
         for s in SUBSYSTEMS {
-            s.movement_input_update(host, event.input);
+            s.movement_input_update(host, event);
         }
-        glue::equipment::sample_movement(event.input);
+        glue::equipment::sample_movement(event);
     }
 
     fn data_pack_files(
@@ -611,7 +599,7 @@ impl Hooks for Create {
 
     fn add_server_reload_listeners(
         &self,
-        _cx: &dyn mod_api::ReloadContext,
+        _cx: &dyn mod_api::Host,
         event: &mut mod_api::AddServerReloadListenersEvent<'_>,
     ) {
         glue::items::add_reload_listeners(event.listeners);
@@ -704,7 +692,7 @@ impl Hooks for Create {
 
     fn client_setup(
         &self,
-        cx: &mut dyn mod_api::ClientSetupContext,
+        cx: &mut dyn ClientHost,
         _event: &mut mod_api::ClientSetupEvent,
     ) {
         glue::pipelines::bind_steam_jets(cx.render_assets());
@@ -713,7 +701,7 @@ impl Hooks for Create {
     /// Refresh handles and models after a new resource generation is published.
     fn client_resources_reloaded(
         &self,
-        cx: &dyn mod_api::ClientReloadHost,
+        cx: &mut dyn ClientHost,
         _event: &mut mod_api::ClientResourcesReloadedEvent,
     ) {
         glue::models::forget();
@@ -743,7 +731,7 @@ fn reborrow<'a>(host: &'a mut HostSide<'_>) -> HostSide<'a> {
 /// parts to their own blocks for the rest.
 struct CreateBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for CreateBlock {
     /// A neighbour of a Create block changed (`neighborChanged`). Runs inside the write: the
     /// subsystems note it and act in the level tick.

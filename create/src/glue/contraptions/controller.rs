@@ -50,10 +50,10 @@ const BUTTON_MODEL: &str = "create:item/linked_controller/button";
 /// (`renderDepression`, `buttons` chasing 0 or 1 at 0.4 a tick).
 struct LecternDraw;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for LecternDraw {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockEntityPart for LecternDraw {
     fn block_entity_submit(
         &self,
@@ -558,7 +558,7 @@ fn sneaking(host: &dyn Host, player: Option<PlayerRef>) -> bool {
         .unwrap_or(false)
 }
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for ControllerItem {
     /// `LinkedControllerItem.use`: not sneaking, the controller toggles on its holder's client.
     fn use_item(&self, host: HostSide, event: &mut UseItemEvent<'_>) -> Option<InteractionResult> {
@@ -655,7 +655,6 @@ fn book_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3], sound: &str) {
         SoundSource::Blocks,
         1.0,
         1.0,
-        None,
     );
 }
 
@@ -889,7 +888,7 @@ fn held_controller(host: &dyn ServerHost, living: LivingRef) -> Option<(Hand, It
 
 struct LecternPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for LecternPart {
     /// A click on a lectern controller (`LecternControllerBlock.useItemOn`): sneaking with a
     /// controller swaps it for the lectern's; sneaking otherwise takes the lectern's off

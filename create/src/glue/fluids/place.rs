@@ -101,13 +101,15 @@ fn set(level: &dyn LevelHost, state: BlockState, props: &[(&str, &str)]) -> Bloc
     })
 }
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Placement {
     fn state_for_placement(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let block = states::level_block(level, event.state)?;
         let c = event.context;
@@ -258,7 +260,7 @@ pub(super) fn reset() {
     LAYERS.with_borrow_mut(Vec::clear);
 }
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::ItemPart for TankItem {
     fn on_block_placed_by(
         &self,
@@ -272,7 +274,8 @@ impl mod_api::ItemPart for TankItem {
         // The accepted placement can be followed immediately by a save. Publish
         // FluidTankBlockEntity.write state, including pending updateConnectivity,
         // before any optional layer placement is queued.
-        if let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) {
+        if let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host)) {
             let dimension = dimension.to_string();
             if let Some(mut lv) = super::super::server::ServerLevel::new(host, &dimension) {
                 super::super::persist::publish(&mut lv);
@@ -286,11 +289,8 @@ impl mod_api::ItemPart for TankItem {
             mod_api::BlockFace::Down => false,
             _ => return,
         };
-        let Some(dim) = event
-            .level
-            .dimension()
-            .id(&*host)
-            .map(str::to_owned)
+        let Some(dim) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host))
             .and_then(|d| level_index(&d.to_string()))
         else {
             return;
@@ -311,7 +311,9 @@ impl mod_api::ItemPart for TankItem {
         if start_y != pos[1] {
             return;
         }
-        let level = event.level;
+        let Some(level) = crate::glue::compat::placed_level(&*host, event) else {
+            return;
+        };
         let mut free = Vec::new();
         for x in 0..i32::from(m.width) {
             for z in 0..i32::from(m.width) {

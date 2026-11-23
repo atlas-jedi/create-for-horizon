@@ -322,7 +322,7 @@ impl Subsystem for Contraptions {
         };
         let Some(dimension) = player
             .level(&*host)
-            .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+            .and_then(|l| l.dimension().id(&*host))
         else {
             return true;
         };

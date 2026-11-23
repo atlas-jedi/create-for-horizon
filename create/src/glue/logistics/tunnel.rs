@@ -202,7 +202,6 @@ pub fn grab_stacks(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: u128) -> boo
         mod_api::SoundSource::Players,
         0.2,
         1.0 + seed,
-        None,
     );
     true
 }
@@ -212,14 +211,15 @@ pub fn grab_stacks(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: u128) -> boo
 /// its shape (`getStateForPlacement`) and looks at its connections (`onPlace`) at once.
 pub struct TunnelItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::ItemPart for TunnelItem {
     fn on_block_placed_by(
         &self,
         host: &mut dyn mod_api::ServerHost,
         event: &mut mod_api::OnBlockPlacedByEvent<'_>,
     ) {
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host)) else {
             return;
         };
         let dimension = dimension.to_string();

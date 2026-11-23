@@ -254,7 +254,7 @@ fn sound(
     let at = pos.map(|v| f64::from(v) + 0.5);
     let _ = lv
         .level
-        .play_sound(&mut *lv.host, sound, at, source, volume, pitch, None);
+        .play_sound(&mut *lv.host, sound, at, source, volume, pitch);
 }
 
 /// `BasinBlock.updateEntityAfterFallOn`: an item landing in a basin goes into its inputs as far

@@ -82,7 +82,7 @@ fn shape_of(host: &dyn Host, state: BlockState) -> Option<TrackShape> {
 /// shows on the action bar. Outside creative the tracks laid are paid for (`pay_tracks`).
 struct TrackItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for TrackItem {
     fn use_on(&self, host: HostSide, event: &mut UseOnEvent<'_>) -> Option<InteractionResult> {
         let host = match host {
@@ -102,8 +102,7 @@ impl ItemPart for TrackItem {
         let dimension = player
             .level(&*host)?
             .dimension()
-            .id(&*host)
-            .map(str::to_owned)?;
+            .id(&*host)?;
         let mut lv = ServerLevel::new(host, &dimension)?;
         use_track(&mut lv, player, event.pos, event.face)
             .then_some(InteractionResult::SuccessServer)
@@ -119,7 +118,8 @@ impl ItemPart for TrackItem {
         if shape_of(&*host, event.state).is_none() {
             return;
         }
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host)) else {
             return;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -871,7 +871,6 @@ fn click_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3], id: &str, volume: f32, p
         mod_api::SoundSource::Blocks,
         volume,
         pitch,
-        None,
     );
 }
 
@@ -944,7 +943,7 @@ fn use_signal(
 /// The signal item (`TrackTargetingBlockItem`).
 struct SignalItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for SignalItem {
     fn use_on(&self, host: HostSide, event: &mut UseOnEvent<'_>) -> Option<InteractionResult> {
         let host = match host {
@@ -972,8 +971,7 @@ impl ItemPart for SignalItem {
         let dimension = player
             .level(&*host)?
             .dimension()
-            .id(&*host)
-            .map(str::to_owned)?;
+            .id(&*host)?;
         let mut lv = ServerLevel::new(host, &dimension)?;
         use_signal(&mut lv, player, event)
     }
@@ -991,7 +989,8 @@ impl ItemPart for SignalItem {
         if event.state.block() != states::key(Block::TrackSignal) {
             return;
         }
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host)) else {
             return;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -1127,13 +1126,13 @@ fn lay_fake_track(lv: &mut ServerLevel<'_>) {
 /// when they come in, carried to clients, and drawn there.
 pub struct TrackEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for TrackEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for TrackEntity {
-    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
-        let Some((entity, host)) = crate::glue::loaded_entity(&mut event.subject) else {
+    fn block_entity_on_load(&self, side: mod_api::HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+        let Some((entity, host)) = crate::glue::loaded_entity(side, event) else {
             return;
         };
         let (Some(level), Some(pos)) = (entity.level(&*host), entity.position(&*host)) else {
@@ -1151,7 +1150,6 @@ impl BlockEntityPart for TrackEntity {
         let Some(dim) = level
             .dimension()
             .id(&*host)
-            .map(str::to_owned)
             .and_then(|d| level_index(&d))
         else {
             return;

@@ -181,7 +181,7 @@ pub fn sit_entity(host: &mut dyn ServerHost, dim: usize, rider: EntityRef, at: T
     };
     let Some(dimension) = rider
         .level(&*host)
-        .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+        .and_then(|l| l.dimension().id(&*host))
     else {
         return false;
     };

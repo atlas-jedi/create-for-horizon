@@ -205,7 +205,7 @@ fn analog_level(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<i32> {
 
 struct AnalogBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for AnalogBlock {
     fn has_analog_output(&self, _level: &dyn LevelHost, event: &mut HasAnalogOutputEvent) {
         if states::id(event.state).is_some() {
@@ -216,7 +216,7 @@ impl BlockPart for AnalogBlock {
     /// `getAnalogOutputSignal`: no Create block reads differently by side.
     fn analog_output(
         &self,
-        _level: &mut dyn mod_api::LevelRandomHost,
+        _level: &dyn mod_api::LevelHost,
         event: &mut AnalogOutputEvent,
     ) {
         let Some((block, info)) = states::id(event.state).and_then(info) else {
@@ -247,13 +247,13 @@ impl BlockPart for AnalogBlock {
 /// (`ItemVaultBlockEntity.updateComparators`), after the tick.
 struct ContentsBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for ContentsBlock {
     fn contents_changed(&self, host: &mut dyn ServerHost, event: &mut ContentsChangedEvent) {
         let Some((block, _)) = states::id(event.state).and_then(info) else {
             return;
         };
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.level.dimension().id(&*host) else {
             return;
         };
         let pos = [event.pos.x, event.pos.y, event.pos.z];

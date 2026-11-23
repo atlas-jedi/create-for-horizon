@@ -50,7 +50,7 @@ pub trait Subsystem: Sync {
 
     /// `Hooks::tags_updated` for the server's data load: its recipes and tags are published (first open and
     /// each data reload). Caches of recipes are rebuilt here.
-    fn tags_updated(&self, _cx: &dyn mod_api::ReloadContext) {}
+    fn tags_updated(&self, _cx: &dyn mod_api::Host) {}
 
     /// A committed block change in level `dim`, in engine ids (0 for any block not Create's).
     /// At least one of `old` and `new` is Create's. Runs inside the write: change the world from
@@ -367,7 +367,7 @@ pub trait Subsystem: Sync {
     /// subsystem to answer `Flow::Cancel` spares it.
     fn living_incoming_damage(
         &self,
-        _level: &mut dyn mod_api::HitHost,
+        _level: &mut dyn mod_api::LevelRandomHost,
         _event: &mut mod_api::LivingIncomingDamageEvent<'_>,
     ) -> Flow {
         Flow::Continue
@@ -446,7 +446,7 @@ pub trait Subsystem: Sync {
     }
 
     /// `Hooks::movement_input_update`, on the client: the local player's movement keys.
-    fn movement_input_update(&self, _host: &dyn ClientHost, _input: &mut mod_api::MovementInput) {}
+    fn movement_input_update(&self, _host: &dyn ClientHost, _input: &mut mod_api::MovementInputEvent) {}
     /// `Hooks::key_mapping_pre`, on the client: `Flow::Cancel` keeps the key from the game.
     fn key_mapping_pre(
         &self,

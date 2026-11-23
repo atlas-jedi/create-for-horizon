@@ -221,7 +221,6 @@ fn sound(lv: &mut ServerLevel<'_>, pos: [i32; 3], id: &str, volume: f32, pitch: 
         SoundSource::Blocks,
         volume,
         pitch,
-        None,
     );
 }
 
@@ -289,10 +288,10 @@ fn part(draw: &mut dyn BlockEntityDrawContext, name: &str) {
 
 pub(super) struct BoxDraw;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for BoxDraw {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for BoxDraw {
     fn block_entity_submit(
         &self,

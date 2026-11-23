@@ -77,10 +77,10 @@ fn own_fields(systems: &[&dyn Subsystem], block: Block, tag: &Compound) -> Compo
 
 struct SavedFields;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for SavedFields {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for SavedFields {
     fn block_entity_save_additional(
         &self,

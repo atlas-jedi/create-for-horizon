@@ -45,15 +45,17 @@ fn facing_in(text: &str) -> Option<Dir> {
 
 struct Ladder;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for Ladder {
     /// `MetalLadderBlock.canSurvive`: the same ladder facing the same way above holds it; else
     /// the ladder's own rule (a sturdy wall behind).
     fn can_survive(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut CanSurviveEvent,
     ) -> Option<bool> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let text = level.state_string(event.state)?;
         let facing = facing_in(&text)?;

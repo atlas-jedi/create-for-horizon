@@ -241,13 +241,10 @@ impl Subsystem for Colliders {
 
 struct Carrying;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl EntityPart for Carrying {
-    fn general_entity_tick(&self, event: &mut GeneralEntityTickEvent<'_>) {
-        let Some(entity) = event.subject.with_view(|v| v.handle()) else {
-            return;
-        };
-        let host = event.subject.host();
+    fn general_entity_tick(&self, host: &mut dyn mod_api::ServerHost, event: &mut GeneralEntityTickEvent<'_>) {
+        let entity = event.entity;
         apply_to(host, entity);
     }
 }

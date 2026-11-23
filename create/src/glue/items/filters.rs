@@ -40,8 +40,9 @@ use create_engine::filter::{
 };
 use create_engine::ghost_menu;
 use mod_api::HostTransaction;
+use crate::glue::compat::CreativeModeTabs;
 use mod_api::{
-    CommandArgumentValue, CommandSource, Compound, CreativeModeTabs, CreativeTabPermissions, Hand,
+    CommandArgumentValue, CommandSource, Compound, Hand,
     Host, HostSide, Identifier, InteractionResult, ItemPart, ItemStack, PlayerRef, ServerHost,
     SoundSource, Tag, Text, UseItemEvent, UseOnEvent,
 };
@@ -57,7 +58,9 @@ thread_local! {
 /// `InItemGroupAttribute.appliesTo`'s `buildContents`: the catalog is built again after a data
 /// load, where the probes read it (`built_creative_tabs`).
 pub(super) fn refresh_item_groups(host: &mut dyn ServerHost) {
-    if ITEM_GROUPS_DIRTY.get() && host.creative_tabs(CreativeTabPermissions::Normal).is_ok() {
+    // Horizon: no creative catalog to build (see HORIZON_GAPS.md).
+    let _ = host;
+    if ITEM_GROUPS_DIRTY.get() {
         ITEM_GROUPS_DIRTY.set(false);
     }
 }
@@ -68,11 +71,12 @@ pub(super) fn invalidate_item_groups() {
 
 /// The creative catalog this side last built.
 fn item_groups(host: &dyn Host) -> Option<Arc<CreativeModeTabs>> {
-    host.built_creative_tabs().ok().flatten()
+    let _ = host;
+    None
 }
 
 /// `InItemGroupAttribute.tabContainsItem`.
-fn tab_contains(host: &dyn Host, tab: &mod_api::CreativeModeTabInfo, stack: &ItemStack) -> bool {
+fn tab_contains(host: &dyn Host, tab: &crate::glue::compat::CreativeModeTabInfo, stack: &ItemStack) -> bool {
     tab.contains(host, stack) || tab.contains(host, &ItemStack::of(stack.item()))
 }
 
@@ -631,7 +635,6 @@ pub(crate) fn return_filter(
         SoundSource::Blocks,
         0.25,
         0.1,
-        None,
     );
 }
 
@@ -829,7 +832,7 @@ fn write_attributes(stack: &mut ItemStack, mode: Mode, tests: &[(String, Option<
 /// (`FilterItem.use` / `useOn`; a block's filter slot takes the click before the item).
 pub(super) struct FilterPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for FilterPart {
     fn use_item(&self, host: HostSide, event: &mut UseItemEvent<'_>) -> Option<InteractionResult> {
         used(host, event.player, event.hand)
@@ -955,7 +958,13 @@ fn selected_tags(host: &dyn Host) -> Option<ItemStack> {
     Some(tag)
 }
 
+/// Horizon: no mod menu with extra data to open (`ModMenuOpen`), so the filter's screen
+/// doesn't open (see HORIZON_GAPS.md).
+#[cfg(not(any()))]
+fn open_menu(_host: &mut dyn ServerHost, _player: PlayerRef) {}
+
 /// `player.openMenu(filter)`, with the held filter's settings as the screen's extra data.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn open_menu(host: &mut dyn ServerHost, player: PlayerRef) {
     let Some(stack) = held(&*host, player, Hand::Main) else {
         return;
@@ -1097,6 +1106,7 @@ fn refresh(
 
 /// A click on an open filter menu (`GhostItemMenu.clicked`), done on the server's copy of the
 /// menu and written back in place of the default: the inventory, the cursor and the ghost slots.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 pub(super) fn menu_clicked(
     host: &mut dyn ServerHost,
     event: &mod_api::MenuClickedEvent<'_>,
@@ -1331,9 +1341,9 @@ impl mod_api::ServerReloadListener for ItemTagNames {
     fn prepare(
         &self,
         context: &mod_api::ServerReloadContext,
-    ) -> Result<Box<dyn FnOnce() + Send + 'static>, mod_api::ReloadResourceError> {
+    ) -> Result<Box<dyn mod_api::ReloadApply>, mod_api::ReloadResourceError> {
         let names: Vec<String> = context.list().map(ToString::to_string).collect();
-        Ok(Box::new(move || {
+        Ok(<dyn mod_api::ReloadApply>::new(move || {
             if let Ok(mut tags) = ITEM_TAGS.lock() {
                 *tags = names;
             }
@@ -1353,7 +1363,7 @@ impl mod_api::ServerReloadListener for EnchantmentLevels {
     fn prepare(
         &self,
         context: &mod_api::ServerReloadContext,
-    ) -> Result<Box<dyn FnOnce() + Send + 'static>, mod_api::ReloadResourceError> {
+    ) -> Result<Box<dyn mod_api::ReloadApply>, mod_api::ReloadResourceError> {
         let levels: BTreeMap<String, i32> = context
             .list()
             .filter_map(|id| {
@@ -1361,7 +1371,7 @@ impl mod_api::ServerReloadListener for EnchantmentLevels {
                 Some((id.to_string(), max_level(text)?))
             })
             .collect();
-        Ok(Box::new(move || {
+        Ok(<dyn mod_api::ReloadApply>::new(move || {
             if let Ok(mut m) = ENCHANTMENT_MAX.lock() {
                 *m = levels;
             }

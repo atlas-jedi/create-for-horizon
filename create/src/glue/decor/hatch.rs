@@ -28,10 +28,10 @@ pub(super) fn register(r: &mut dyn Registrar) {
 
 struct HatchEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for HatchEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for HatchEntity {
     fn block_entity_update_tag(
         &self,

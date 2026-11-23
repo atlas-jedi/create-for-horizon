@@ -151,13 +151,15 @@ pub fn wood_of(data: &Compound) -> &'static str {
 /// axis, and be beside it along that axis.
 struct Spaced;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Spaced {
     fn can_survive(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut CanSurviveEvent,
     ) -> Option<bool> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let facing_of = |state: BlockState| match states::level_info(level, state)? {
             (Block::WaterWheel, info) => info.facing,
@@ -182,7 +184,7 @@ impl BlockPart for Spaced {
 /// of another wood become the wheel's material (`applyMaterialIfValid`).
 struct Wheel;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Wheel {
     fn use_item_on(
         &self,
@@ -254,10 +256,10 @@ fn large_facing(axis: Axis) -> Dir {
 /// `WaterWheelRenderer`: the wheel in its material, turning on its axis.
 struct Drawn;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Drawn {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for Drawn {
     fn block_entity_submit(
         &self,

@@ -1703,7 +1703,7 @@ fn update_nixie_power(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
 /// The nixie tubes' clicks (`NixieTubeBlock.useItemOn`).
 struct NixieBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for NixieBlock {
     fn use_item_on(
         &self,
@@ -1837,7 +1837,7 @@ fn use_nixie(
 /// (facing the player, or as the board it was placed against unless sneaking).
 struct DisplayBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for DisplayBlock {
     /// `DisplayLinkBlock.useWithoutItem` takes any hand (the item's own use passes to it); a
     /// display board takes a click on one of its lines (`FlapDisplayBlock.useItemOn`).
@@ -1877,9 +1877,11 @@ impl BlockPart for DisplayBlock {
 
     fn state_for_placement(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let block = states::level_block(level, event.state)?;
         let c = event.context;
@@ -2299,7 +2301,6 @@ fn display_command(host: &mut dyn ServerHost, event: &mut CommandCall<'_>) -> Fl
     let Some(dimension) = c
         .dimension
         .id(&*host)
-        .map(str::to_owned)
         .map(|d| d.to_string())
     else {
         return Flow::Cancel;

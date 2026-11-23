@@ -3,6 +3,7 @@
 
 pub(crate) mod advancements;
 pub mod blocks;
+pub mod compat;
 pub mod contraptions;
 pub mod copycat;
 pub mod decor;
@@ -190,24 +191,23 @@ pub fn connection_group(
 
 /// Registers one of Create's particle types (`ICustomParticleData.createType`, which does not
 /// override the limiter). Each particle keeps its own state, so the options carry nothing.
-pub fn particle_type(r: &mut dyn mod_api::Registrar, id: &str) -> mod_api::ParticleType<()> {
-    r.register_particle_type(
-        id,
-        false,
-        mod_api::ParticleMapCodec::unit(),
-        mod_api::ParticleStreamCodec::wire(),
-    )
+pub fn particle_type(
+    r: &mut dyn mod_api::Registrar,
+    id: &'static str,
+) -> compat::ParticleType<()> {
+    // Horizon: a custom particle is a sprite provider's key, registered by name.
+    compat::ParticleType::new(r.particle_key(id), id)
 }
 
 /// The server's block entity of a `block_entity_on_load`, and the host to reach it with.
 pub fn loaded_entity<'a>(
-    subject: &'a mut mod_api::BlockEntitySideScope<'_>,
+    side: mod_api::HostSide<'a>,
+    event: &mod_api::BlockEntityOnLoadEvent,
 ) -> Option<(mod_api::BlockEntityRef, &'a mut dyn mod_api::ServerHost)> {
-    let mod_api::BlockEntitySideScope::Server(scope) = subject else {
+    let mod_api::HostSide::Server(host) = side else {
         return None;
     };
-    let entity = scope.with_view(|v| v.handle())?;
-    Some((entity, scope.host()))
+    Some((event.entity, host))
 }
 
 /// Gives the subsystems column `chunk`'s saved data, once while it is loaded: when the column

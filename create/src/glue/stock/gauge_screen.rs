@@ -238,7 +238,6 @@ pub(super) fn client_message(host: &mut dyn ServerHost, player: PlayerRef, data:
                         mod_api::SoundSource::Blocks,
                         1.0,
                         1.0,
-                        None,
                     );
                 }
                 Ok(()) => {
@@ -348,7 +347,6 @@ fn connect(lv: &mut ServerLevel<'_>, player: PlayerRef, from: PanelPos, to: Pane
             mod_api::SoundSource::Blocks,
             1.0,
             1.0,
-            None,
         );
         return;
     }

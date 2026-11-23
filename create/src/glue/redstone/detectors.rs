@@ -424,7 +424,7 @@ fn capability_tanks(
         // `drain(fluidInTank, SIMULATE)`: taken in a transaction that is then dropped.
         let drained = lv
             .host
-            .transaction(|host, tx| Err::<(), u32>(handler.extract_at(host, tx, i, &r, amount)))
+            .transaction(|host, tx| Err::<(), u32>(handler.extract(host, tx, i, &r, amount)))
             .err()
             .unwrap_or(0);
         tanks.push(create_engine::observe::TankSlot {
@@ -743,7 +743,6 @@ pub(super) fn run_command(host: &mut dyn ServerHost, event: &mut CommandCall<'_>
     let Some(dimension) = c
         .dimension
         .id(&*host)
-        .map(str::to_owned)
         .map(|d| d.to_string())
     else {
         return Flow::Cancel;

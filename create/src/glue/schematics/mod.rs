@@ -519,7 +519,7 @@ impl Subsystem for Schematics {
             return Flow::Continue;
         };
         let player = packages::command_player(event.source);
-        let Some(dimension) = event.command.dimension.id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.command.dimension.id(&*host) else {
             return Flow::Cancel;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -535,7 +535,7 @@ impl Subsystem for Schematics {
             _ => None,
         };
         let name = player
-            .and_then(|p| p.name(&*lv.host).map(str::to_owned))
+            .and_then(|p| p.name(&*lv.host))
             .unwrap_or_default();
         let lines = match (verb, cmd.literals.get(2).map(String::as_str)) {
             ("schematicannon", _) => match pos("pos") {
@@ -990,7 +990,6 @@ impl CannonWorld for World<'_, '_> {
             SoundSource::Blocks,
             0.1,
             1.1,
-            None,
         );
     }
     fn dinged(&mut self) {
@@ -1002,7 +1001,6 @@ impl CannonWorld for World<'_, '_> {
             SoundSource::Blocks,
             1.0,
             0.7,
-            None,
         );
     }
 }
@@ -1486,19 +1484,19 @@ fn level_tick(lv: &mut ServerLevel<'_>) {
 /// (`SchematicannonRenderer`), their server-side menu actions, and column data once they load.
 struct SchematicEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for SchematicEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for SchematicEntity {
-    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
-        let Some((entity, host)) = crate::glue::loaded_entity(&mut event.subject) else {
+    fn block_entity_on_load(&self, side: mod_api::HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+        let Some((entity, host)) = crate::glue::loaded_entity(side, event) else {
             return;
         };
         let (Some(level), Some(pos)) = (entity.level(&*host), entity.position(&*host)) else {
             return;
         };
-        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = level.dimension().id(&*host) else {
             return;
         };
         super::ensure_column(host, &dimension, [pos[0] >> 4, pos[2] >> 4]);
@@ -1636,7 +1634,7 @@ fn table_screen(_host: &dyn ClientHost, open: mod_api::MenuScreenOpen<'_>) -> Op
 /// The cannon's and the table's menu buttons.
 struct SchematicMenus;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl MenuPart for SchematicMenus {
     fn menu_button(&self, event: &mut mod_api::MenuButtonEvent<'_>) {
         let context = event.context;
@@ -1655,7 +1653,7 @@ impl MenuPart for SchematicMenus {
 /// A cannon's slots changed (a player's click in its menu): it looks at them again.
 struct CannonBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for CannonBlock {
     fn contents_changed(&self, host: &mut dyn ServerHost, event: &mut ContentsChangedEvent) {
         if OWN_WRITE.get() {
@@ -1665,7 +1663,6 @@ impl BlockPart for CannonBlock {
             .level
             .dimension()
             .id(&*host)
-            .map(str::to_owned)
             .and_then(|d| level_index(&d))
         else {
             return;
@@ -1686,17 +1683,14 @@ impl BlockPart for CannonBlock {
 /// `applyImplicitComponents`' default).
 struct CannonItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for CannonItem {
     fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
         let Some(player) = event.placer else {
             return;
         };
-        let Some(dim) = event
-            .level
-            .dimension()
-            .id(&*host)
-            .map(str::to_owned)
+        let Some(dim) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host))
             .and_then(|d| level_index(&d.to_string()))
         else {
             return;

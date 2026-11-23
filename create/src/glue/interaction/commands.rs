@@ -23,7 +23,6 @@ pub(super) fn run(host: &mut dyn ServerHost, event: &mut CommandCall<'_>) -> Flo
     let dim = command
         .dimension
         .id(&*host)
-        .map(str::to_owned)
         .and_then(|d| level_index(&d))
         .unwrap_or(0);
     let found = with_world(|w| {

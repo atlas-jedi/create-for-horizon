@@ -53,7 +53,7 @@ fn polished(host: &dyn mod_api::Host, item: &ItemStack) -> Option<ItemStack> {
     crate::glue::packages::body::new_stack(host, &out, u32::from(n.max(1)))
 }
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for SandPaper {
     /// `getUseDuration`: 32.
     fn use_duration(&self, _host: &dyn mod_api::Host, event: &mut UseDurationEvent<'_>) {
@@ -191,7 +191,6 @@ pub(super) fn use_tick(
             mod_api::SoundSource::Players,
             0.9 + 0.2 * r[4],
             r[5] * 0.2 + 0.9,
-            None,
         );
     }
 }
@@ -370,7 +369,6 @@ fn scrape(host: &mut dyn ServerHost, event: &UseOnEvent<'_>) -> Option<Interacti
         mod_api::SoundSource::Players,
         1.0,
         pitch,
-        None,
     );
     let _ = lv
         .level

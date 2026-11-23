@@ -376,8 +376,9 @@ impl ResourceHandler<ItemResource> for ToolboxItems {
         &self,
         host: &mut dyn ServerHost,
         index: usize,
-        resource: Option<&ItemResource>,
+        resource: &ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         match (self.level(host), resource) {
             (Some(lv), Some(r)) if index < tb::STORED => max_stack(&lv, r.as_stack()).min(64),
             (Some(_), None) if index < tb::STORED => 64,
@@ -389,7 +390,7 @@ impl ResourceHandler<ItemResource> for ToolboxItems {
             .is_some_and(|lv| self.accepts(&lv, index, resource.as_stack()))
     }
     /// `ToolboxInventory.insertItem` (`ItemStackHandler.insertItem`).
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         _tx: &Transaction,
@@ -423,7 +424,7 @@ impl ResourceHandler<ItemResource> for ToolboxItems {
         }
     }
     /// `ItemStackHandler.extractItem`.
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         _tx: &Transaction,
@@ -1215,7 +1216,7 @@ pub(super) fn loaded(host: &mut dyn ServerHost, entity: mod_api::BlockEntityRef)
     let (Some(level), Some(pos)) = (entity.level(&*host), entity.position(&*host)) else {
         return;
     };
-    let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+    let Some(dimension) = level.dimension().id(&*host) else {
         return;
     };
     if let Some(mut lv) = ServerLevel::new(host, &dimension) {
@@ -1903,7 +1904,7 @@ pub(crate) fn render_gui_post(host: &dyn ClientHost, event: &mut mod_api::Render
 /// prediction knows).
 struct CompartmentRules;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::MenuPart for CompartmentRules {
     fn menu_slot_rules(
         &self,

@@ -28,7 +28,7 @@ pub(super) fn register(r: &mut dyn Registrar) {
 
 struct Scaffolding;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for Scaffolding {
     /// `MetalScaffoldingBlock.tick`: nothing (the template would fall or break).
     fn tick_block(&self, _level: &mut dyn LevelWriteHost, _event: &mut TickBlockEvent) -> Flow {
@@ -38,7 +38,7 @@ impl mod_api::BlockPart for Scaffolding {
     /// `MetalScaffoldingBlock.canSurvive`: anywhere.
     fn can_survive(
         &self,
-        _level: mod_api::LevelSide<'_>,
+        _level: &dyn mod_api::LevelHost,
         _event: &mut CanSurviveEvent,
     ) -> Option<bool> {
         Some(true)

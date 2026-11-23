@@ -233,7 +233,7 @@ pub(crate) fn set_custom(stack: &mut ItemStack, entries: &[(&str, Option<Tag>)])
 
 /// [`set_custom`] on a stack being edited in place.
 pub(crate) fn edit_custom(
-    stack: &mut mod_api::ItemComponentEditor<'_>,
+    stack: &mut ItemStack,
     entries: &[(&str, Option<Tag>)],
 ) {
     let mut c = stack.get(&CustomData).unwrap_or_default();
@@ -280,11 +280,7 @@ impl Subsystem for Items {
         }
         for menu in [filter_screen::FILTER_MENU, filter_screen::ATTRIBUTE_MENU] {
             r.menu_part(menu, filter_screen::FilterScreen);
-            if let Err(e) =
-                r.register_menu_screen(menu, std::sync::Arc::new(filter_screen::open_screen))
-            {
-                crate::create_log!("[create] the {menu} screen was refused: {e}");
-            }
+            // Horizon: no menu screen API; the filter screens are off.
         }
         for id in sandpaper::IDS {
             let key = r.item_key(id);
@@ -354,7 +350,7 @@ impl Subsystem for Items {
         symmetry::world_closed();
     }
 
-    fn tags_updated(&self, _cx: &dyn mod_api::ReloadContext) {
+    fn tags_updated(&self, _cx: &dyn mod_api::Host) {
         // Keep the last catalog while the next server tick builds the new generation.
         filters::invalidate_item_groups();
     }

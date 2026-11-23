@@ -129,7 +129,6 @@ pub fn use_chute(lv: &mut ServerLevel<'_>, pos: [i32; 3], click: &BlockClick<'_>
                 mod_api::SoundSource::Blocks,
                 0.5,
                 1.05,
-                None,
             );
             true
         }

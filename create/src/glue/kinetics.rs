@@ -861,19 +861,19 @@ pub fn shown_speeds(host: &dyn mod_api::Host, level: mod_api::LevelRef, pos: [i3
 /// The kinetic block entity: found by the world when it loads, drawn by its parts.
 struct KineticEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for KineticEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for KineticEntity {
-    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
-        let Some((entity, host)) = crate::glue::loaded_entity(&mut event.subject) else {
+    fn block_entity_on_load(&self, side: mod_api::HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+        let Some((entity, host)) = crate::glue::loaded_entity(side, event) else {
             return;
         };
         let (Some(level), Some(pos)) = (entity.level(&*host), entity.position(&*host)) else {
             return;
         };
-        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = level.dimension().id(&*host) else {
             return;
         };
         let Some(dim) = level_index(&dimension) else {

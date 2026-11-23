@@ -46,13 +46,13 @@ pub fn register(r: &mut dyn Registrar) {
 /// (the lid and drawers stay closed: the port keeps no count of players looking in).
 struct ToolboxDraw;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for ToolboxDraw {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockEntityPart for ToolboxDraw {
-    fn block_entity_on_load(&self, event: &mut mod_api::BlockEntityOnLoadEvent<'_>) {
-        if let Some((entity, host)) = crate::glue::loaded_entity(&mut event.subject) {
+    fn block_entity_on_load(&self, side: mod_api::HostSide<'_>, event: &mut mod_api::BlockEntityOnLoadEvent) {
+        if let Some((entity, host)) = crate::glue::loaded_entity(side, event) {
             super::toolbelt::loaded(host, entity);
         }
     }
@@ -190,10 +190,10 @@ fn containers() -> Vec<(Block, ModContainer)> {
 /// container) put into or took from its slots.
 struct ContentsChanged;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for ContentsChanged {
     fn contents_changed(&self, host: &mut dyn ServerHost, event: &mut ContentsChangedEvent) {
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.level.dimension().id(&*host) else {
             return;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {

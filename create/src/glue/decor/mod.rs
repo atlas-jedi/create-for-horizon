@@ -258,7 +258,6 @@ impl ServerLevel<'_> {
             SoundSource::Blocks,
             volume,
             pitch,
-            None,
         );
     }
 
@@ -308,7 +307,7 @@ fn give(host: &mut dyn ServerHost, player: PlayerRef, id: &str) {
 
 /// The id of the level `player` is in.
 fn player_dimension(host: &dyn Host, player: PlayerRef) -> Option<String> {
-    player.level(host)?.dimension().id(host).map(str::to_owned)
+    player.level(host)?.dimension().id(host)
 }
 
 pub struct Decor;
@@ -415,8 +414,8 @@ impl Subsystem for Decor {
 
     fn particle_providers(&self, providers: &mut dyn mod_api::ParticleProviders) {
         if let Some(&[soul, base]) = souls::TYPES.get() {
-            providers.register_sprite_set(soul, std::sync::Arc::new(souls::Soul));
-            providers.register_sprite_set(base, std::sync::Arc::new(souls::SoulBase));
+            crate::glue::compat::register_sprite_set(providers, soul, souls::Soul);
+            crate::glue::compat::register_sprite_set(providers, base, souls::SoulBase);
         }
     }
 

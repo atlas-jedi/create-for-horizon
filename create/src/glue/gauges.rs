@@ -214,10 +214,10 @@ fn client_block(host: &dyn ClientHost, state: mod_api::BlockState) -> Option<(Bl
 /// Draws gauges' dials and flywheels' wheels; ticks their needles and wheels on the client.
 struct Animated;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Animated {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for Animated {
     fn block_entity_client_ticks(
         &self,
@@ -232,7 +232,8 @@ impl BlockEntityPart for Animated {
         }
     }
 
-    fn block_entity_client_tick(&self, event: &mut BlockEntityClientTickEvent<'_>) {
+    fn block_entity_client_tick(&self, host: &mut dyn mod_api::ClientHost, event: &mut BlockEntityClientTickEvent<'_>) {
+        let event = &mut crate::glue::compat::ClientTick::new(host, &*event);
         let Some((state, pos, level, shown, target)) = event.subject.with_view(|v| {
             let nbt = v.nbt();
             (

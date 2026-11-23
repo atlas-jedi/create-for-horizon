@@ -170,7 +170,7 @@ impl Subsystem for Sources {
 
     fn particle_providers(&self, providers: &mut dyn ParticleProviders) {
         if let Some(&ty) = indicators::TYPE.get() {
-            providers.register_sprite_set(ty, Arc::new(indicators::Indicator));
+            crate::glue::compat::register_sprite_set(providers, ty, indicators::Indicator);
         }
     }
 
@@ -181,7 +181,7 @@ impl Subsystem for Sources {
         };
         let Some(dim) = placer
             .level(&*host)
-            .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+            .and_then(|l| l.dimension().id(&*host))
             .and_then(|d| super::world::level_index(&d))
         else {
             return Flow::Continue;

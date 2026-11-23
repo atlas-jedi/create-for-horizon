@@ -101,7 +101,7 @@ pub(super) fn right_click_block(host: &HostSide, event: &mut RightClickBlockEven
 
 struct LinkItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for LinkItem {
     fn use_on(&self, host: HostSide, event: &mut UseOnEvent<'_>) -> Option<InteractionResult> {
         match host {

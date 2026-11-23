@@ -178,7 +178,8 @@ impl Subsystem for Processing {
             .copied()
             .filter(|b| toolbelt::toolbox_block(*b))
         {
-            r.block_part(super::states::key(b), ToolboxPart);
+            let item = r.item_key(&format!("create:{}", b.name()));
+            r.item_part(item, ToolboxPart);
         }
     }
 
@@ -192,7 +193,7 @@ impl Subsystem for Processing {
         fist::clear();
     }
 
-    fn tags_updated(&self, cx: &dyn mod_api::ReloadContext) {
+    fn tags_updated(&self, cx: &dyn mod_api::Host) {
         recipes::publish(cx);
         basin::recipes_changed();
     }
@@ -349,7 +350,7 @@ impl Subsystem for Processing {
 
     fn particle_providers(&self, providers: &mut dyn mod_api::ParticleProviders) {
         if let Some(&ty) = air::AIR_FLOW_TYPE.get() {
-            providers.register_sprite_set(ty, std::sync::Arc::new(air::AirFlow));
+            crate::glue::compat::register_sprite_set(providers, ty, air::AirFlow);
         }
     }
 
@@ -482,13 +483,18 @@ impl Subsystem for Processing {
 /// A toolbox placed from its item takes the contents the item keeps.
 struct ToolboxPart;
 
-#[mod_api::sunrise_part]
-impl BlockPart for ToolboxPart {
-    fn set_placed_by(&self, host: &mut dyn ServerHost, event: &mut mod_api::SetPlacedByEvent<'_>) {
+#[mod_api::horizon_part]
+impl mod_api::ItemPart for ToolboxPart {
+    fn on_block_placed_by(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::OnBlockPlacedByEvent<'_>,
+    ) {
+        let event = &mut crate::glue::compat::SetPlacedByEvent::new(&*host, event);
         let Some(stack) = event.stack else {
             return;
         };
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.level.dimension().id(&*host) else {
             return;
         };
         if let Some(mut lv) = ServerLevel::new(host, &dimension) {
@@ -582,7 +588,7 @@ fn provide_items(
 /// progress with it).
 struct Landing;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Landing {
     fn item_after_vertical_collision(
         &self,
@@ -620,7 +626,7 @@ impl BlockPart for Landing {
 /// a captured blaze, smouldering, facing the player.
 struct BurnerPlacement;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for BurnerPlacement {
     fn state_for_placement(
         &self,

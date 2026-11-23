@@ -38,11 +38,7 @@ impl Subsystem for Blocks {
                 r.block_part(states::key(block), TemplateBlock);
             }
         }
-        let menu = create_engine::toolbox::MENU;
-        if let Err(e) = r.register_menu_screen(menu, std::sync::Arc::new(toolbox_screen)) {
-            crate::create_log!("[create] the toolbox screen was refused: {e}");
-        }
-        r.menu_part(menu, ToolboxButtons);
+        // Horizon: no menu screen API; the toolbox's own screen and buttons are off.
     }
 
     fn level_tick(&self, lv: &mut ServerLevel<'_>) {
@@ -132,7 +128,6 @@ fn play(lv: &mut ServerLevel<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch
         SoundSource::Blocks,
         volume,
         pitch,
-        None,
     );
 }
 
@@ -146,7 +141,7 @@ fn door_pitch(lv: &mut ServerLevel<'_>) -> f32 {
 /// The valve handles, sliding doors, toolboxes, postboxes and Create's trapdoors.
 struct TemplateBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for TemplateBlock {
     fn use_item_on(
         &self,
@@ -510,6 +505,7 @@ fn tick_doors(lv: &mut ServerLevel<'_>) {
 /// A toolbox's screen (`ToolboxScreen`) shows each compartment by its first stack round the
 /// toolbox's picture; the other stacks and the container's four slots past Create's 32 are
 /// hidden (the server's menu leaves them out too).
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn toolbox_screen(
     _host: &dyn mod_api::ClientHost,
     open: mod_api::MenuScreenOpen<'_>,
@@ -567,6 +563,7 @@ fn toolbox_screen(
 
 /// `ToolboxScreen.renderBg`: the toolbox's background with its name, the player's inventory
 /// under it, the deposit button and the confirm button.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn toolbox_draw(
     host: &dyn mod_api::ClientHost,
     name: &str,
@@ -631,9 +628,11 @@ fn toolbox_draw(
 }
 
 /// Server-side buttons for a toolbox's menu.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 struct ToolboxButtons;
 
-#[mod_api::sunrise_part]
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
+#[mod_api::horizon_part]
 impl MenuPart for ToolboxButtons {
     fn menu_button(&self, event: &mut mod_api::MenuButtonEvent<'_>) {
         if event.block.and_then(toolbox_block).is_none()
@@ -740,6 +739,7 @@ fn toolbox_confirm() -> [f32; 2] {
 /// `ToolboxDisposeAllPacket`: each of the player's 36 stacks goes into the compartment that
 /// already holds its kind (`inLimitedMode`), onto its stacks and then its empty stacks
 /// (`insertItemStacked`).
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn deposit_all(event: &mut mod_api::MenuButtonEvent<'_>) {
     use create_engine::toolbox::{STACKS_PER_COMPARTMENT, STORED};
     let player = event.context.player;

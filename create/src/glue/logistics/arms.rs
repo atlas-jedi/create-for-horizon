@@ -252,7 +252,7 @@ impl Subsystem for Arms {
         let Some(level) = player.level(&*host) else {
             return;
         };
-        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = level.dimension().id(&*host) else {
             return;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -875,7 +875,6 @@ impl arm::World for ArmWorld<'_, '_> {
                         mod_api::SoundSource::Blocks,
                         1.0,
                         1.0,
-                        None,
                     );
                 }
                 count - 1
@@ -2188,7 +2187,7 @@ pub fn arm_placed(host: &mut dyn ServerHost, event: &crate::glue::subsystem::Pla
     }
     let Some(dim) = placer
         .level(&*host)
-        .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+        .and_then(|l| l.dimension().id(&*host))
         .and_then(|d| super::super::world::level_index(&d))
     else {
         return;
@@ -2365,7 +2364,7 @@ pub fn ejector_placed(host: &mut dyn ServerHost, event: &crate::glue::subsystem:
     let _ = player.action_bar(host, line);
     let Some(dim) = placer
         .level(&*host)
-        .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+        .and_then(|l| l.dimension().id(&*host))
         .and_then(|d| super::super::world::level_index(&d))
     else {
         return;

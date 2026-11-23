@@ -441,7 +441,7 @@ fn turn_local_player(host: &mut dyn ClientHost) {
 
 struct SeatPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for SeatPart {
     /// `SeatBlock.useItemOn` on the server: sneaking passes; a dye of another colour recolours
     /// the seat (`BlockHelper.copyProperties`); a seat a player sits on passes; otherwise the

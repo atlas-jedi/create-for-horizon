@@ -67,13 +67,15 @@ pub(crate) fn in_water(level: &dyn LevelHost, event: &StateForPlacementEvent<'_>
 
 struct Placement;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Placement {
     fn state_for_placement(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let block = states::level_block(level, event.state)?;
         let info_at = |p| states::level_info_at(level, p);
@@ -366,7 +368,7 @@ thread_local! {
     static LAYERS: std::cell::RefCell<Vec<Layer>> = const { std::cell::RefCell::new(Vec::new()) };
 }
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::ItemPart for VaultItem {
     fn on_block_placed_by(
         &self,
@@ -380,11 +382,8 @@ impl mod_api::ItemPart for VaultItem {
         if player_items::sneaking(&*host, player) {
             return;
         }
-        let Some(dim) = event
-            .level
-            .dimension()
-            .id(&*host)
-            .map(str::to_owned)
+        let Some(dim) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host))
             .and_then(|d| level_index(&d.to_string()))
         else {
             return;
@@ -430,7 +429,9 @@ impl mod_api::ItemPart for VaultItem {
         {
             return;
         }
-        let level = event.level;
+        let Some(level) = crate::glue::compat::placed_level(&*host, event) else {
+            return;
+        };
         let mut free = Vec::new();
         for x in 0..width {
             for z in 0..width {

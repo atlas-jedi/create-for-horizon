@@ -380,7 +380,7 @@ impl Subsystem for Trains {
     fn player_joined(&self, host: &mut dyn ServerHost, player: PlayerRef) {
         let Some(dimension) = player
             .level(&*host)
-            .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+            .and_then(|l| l.dimension().id(&*host))
         else {
             return;
         };
@@ -779,7 +779,7 @@ fn observer_powered(state: u32) -> Option<bool> {
 /// A track observer's part: the click on its filter slot.
 struct Observer;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Observer {
     fn use_item_on(
         &self,

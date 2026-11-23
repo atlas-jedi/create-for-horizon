@@ -271,7 +271,6 @@ fn dowse_fire(lv: &mut ServerLevel<'_>, p: [i32; 3]) {
             SoundSource::Blocks,
             1.0,
             1.0,
-            None,
         );
         lv.set_state(p, out, all());
     } else if in_tag("minecraft:campfires") {
@@ -471,7 +470,6 @@ impl create_engine::open_end::Space for Front<'_, '_> {
             SoundSource::Blocks,
             0.5,
             pitch,
-            None,
         );
     }
 

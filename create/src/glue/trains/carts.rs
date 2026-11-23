@@ -879,7 +879,7 @@ fn use_one(host: &mut dyn ServerHost, player: mod_api::PlayerRef) {
 /// The assembler's part: the carts that pass it, and clicks on it.
 struct AssemblerBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for AssemblerBlock {
     /// `onMinecartPass`: a cart Create may load (`canAssembleTo`) is handled at its next tick
     /// (`assembleNextTick`: the first cart to pass since then).
@@ -893,7 +893,7 @@ impl BlockPart for AssemblerBlock {
         let Some(dim) = event
             .entity
             .level(&*host)
-            .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+            .and_then(|l| l.dimension().id(&*host))
             .and_then(|d| level_index(&d))
         else {
             return;
@@ -942,7 +942,6 @@ impl BlockPart for AssemblerBlock {
             SoundSource::Players,
             1.0,
             1.0,
-            None,
         );
         lv.set_state(click.pos, next, update_all());
         if player.is_creative(&*lv.host) != Some(true) {
@@ -1000,7 +999,7 @@ fn wrench_assembler(
 /// rail becomes an assembler holding it.
 struct AssemblerItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for AssemblerItem {
     fn use_on(&self, host: HostSide, event: &mut UseOnEvent<'_>) -> Option<InteractionResult> {
         let HostSide::Server(host) = host else {
@@ -1010,8 +1009,7 @@ impl ItemPart for AssemblerItem {
         let dimension = player
             .level(&*host)?
             .dimension()
-            .id(&*host)
-            .map(str::to_owned)?;
+            .id(&*host)?;
         let mut lv = ServerLevel::new(host, &dimension)?;
         place_assembler(&mut lv, player, event.pos);
         Some(InteractionResult::SuccessServer)
@@ -1074,7 +1072,6 @@ fn place_assembler(lv: &mut ServerLevel<'_>, player: mod_api::PlayerRef, pos: [i
         SoundSource::Blocks,
         1.0,
         1.0,
-        None,
     );
     use_one(lv.host, player);
 }
@@ -1527,18 +1524,15 @@ fn board_contraption(lv: &mut ServerLevel<'_>, cart: &Cart) -> Option<EntityRef>
 
 struct ContraptionRider;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl EntityPart for ContraptionRider {
-    fn general_entity_tick(&self, event: &mut GeneralEntityTickEvent<'_>) {
-        let Some(rider) = event.subject.with_view(|v| v.handle()) else {
-            return;
-        };
-        let host = event.subject.host();
+    fn general_entity_tick(&self, host: &mut dyn mod_api::ServerHost, event: &mut GeneralEntityTickEvent<'_>) {
+        let rider = event.entity;
 
         colliders::apply_to(host, rider);
         let Some(dimension) = rider
             .level(host)
-            .and_then(|level| level.dimension().id(host).map(str::to_owned))
+            .and_then(|level| level.dimension().id(host))
         else {
             return;
         };
@@ -2012,7 +2006,7 @@ fn item_contraption(stack: &ItemStack) -> Option<Compound> {
 /// facing the player's way (`createAtYaw`); elsewhere nothing (`FAIL`).
 struct ContraptionItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for ContraptionItem {
     fn use_on(&self, host: HostSide, event: &mut UseOnEvent<'_>) -> Option<InteractionResult> {
         let HostSide::Server(host) = host else {
@@ -2022,8 +2016,7 @@ impl ItemPart for ContraptionItem {
         let dimension = player
             .level(&*host)?
             .dimension()
-            .id(&*host)
-            .map(str::to_owned)?;
+            .id(&*host)?;
         let mut lv = ServerLevel::new(host, &dimension)?;
         let item = event.stack.item().name(&*lv.host);
         let kind = cart::item_cart(&item)?;
@@ -2114,8 +2107,7 @@ fn interact_entity(
     let dimension = player
         .level(&*host)?
         .dimension()
-        .id(&*host)
-        .map(str::to_owned)?;
+        .id(&*host)?;
     let mut lv = ServerLevel::new(host, &dimension)?;
     let entity = lv.host.entity(event.entity as u32)?;
     let nc = Cart::read(lv.host, entity)?;

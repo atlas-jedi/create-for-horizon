@@ -91,18 +91,18 @@ pub(super) fn client_tick(host: &mut dyn ClientHost) {
 /// Hears each block's network turning overstressed or recovering.
 struct Effects;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Effects {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for Effects {
     /// `KineticBlockEntity.read` on the client: an update that turns the overstress on or off
     /// while the block should turn (`speed != 0`) triggers its effect.
-    fn block_entity_data_received(&self, event: &mut BlockEntityDataReceivedEvent<'_>) {
+    fn block_entity_data_received(&self, host: &dyn mod_api::ClientHost, event: &mut BlockEntityDataReceivedEvent<'_>) {
         let Some(Tag::Byte(over)) = event.tag.get(&kinetics::OVER.into()) else {
             return;
         };
-        let Some(pos) = event.subject.with_view(|v| v.position()) else {
+        let Some(pos) = event.entity.position(host) else {
             return;
         };
         let over = *over != 0;

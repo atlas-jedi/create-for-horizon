@@ -26,7 +26,7 @@ struct Bottomless(BlockSide);
 impl Bottomless {
     /// The supply, as one item, and the most of it a stack holds.
     fn supply(&self, host: &mut dyn ServerHost) -> Option<(ItemResource, u32)> {
-        let dimension = self.0.level.dimension().id(&*host).map(str::to_owned)?;
+        let dimension = self.0.level.dimension().id(&*host)?;
         let lv = ServerLevel::new(host, &dimension)?;
         let id = crate_supply(&lv, self.0.pos)??;
         let one = stack_of(&*lv.host, &id, 1)?;
@@ -58,13 +58,14 @@ impl ResourceHandler<ItemResource> for Bottomless {
         &self,
         host: &mut dyn ServerHost,
         _index: usize,
-        resource: Option<&ItemResource>,
+        resource: &ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         resource.map_or(64, |r| host.max_stack_size(r.item()).unwrap_or(64))
     }
 
     /// `insertItem`: everything is taken (and gone).
-    fn insert_at(
+    fn insert(
         &self,
         _host: &mut dyn ServerHost,
         _tx: &Transaction,
@@ -76,7 +77,7 @@ impl ResourceHandler<ItemResource> for Bottomless {
     }
 
     /// `extractItem`: the supply, up to a stack.
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         _tx: &Transaction,

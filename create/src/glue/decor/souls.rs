@@ -29,7 +29,7 @@ pub(super) const SOUL: &str = "create:soul";
 pub(super) const SOUL_BASE: &str = "create:soul_base";
 
 static VANILLA_SOUL: OnceLock<ParticleKey> = OnceLock::new();
-pub(super) static TYPES: OnceLock<[mod_api::ParticleType<()>; 2]> = OnceLock::new();
+pub(super) static TYPES: OnceLock<[crate::glue::compat::ParticleType<()>; 2]> = OnceLock::new();
 
 pub(super) fn register(r: &mut dyn Registrar) {
     let soul = crate::glue::particle_type(r, SOUL);
@@ -218,7 +218,6 @@ pub(super) fn tick(lv: &mut ServerLevel<'_>) {
             SoundSource::Blocks,
             volume,
             0.6 + r[7] as f32 * 0.4,
-            None,
         );
     }
     // The pulses.
@@ -275,7 +274,7 @@ fn random(p: &ModParticle, salt: u64) -> f32 {
 }
 
 /// `SoulPulseEffect.isDark`: no block light where the particle is.
-fn dark_at(level: &dyn mod_api::ParticleLevelView, p: &mod_api::ModParticle) -> bool {
+fn dark_at(level: &dyn crate::glue::compat::ParticleLevelView, p: &mod_api::ModParticle) -> bool {
     let at = p.position.map(|v| v.floor() as i32);
     level.brightness(mod_api::LightLayer::Block, at) < 1
 }
@@ -285,14 +284,14 @@ fn dark_at(level: &dyn mod_api::ParticleLevelView, p: &mod_api::ModParticle) -> 
 /// once lit.
 pub(super) struct Soul;
 
-impl ParticleProvider for Soul {
-    fn tick(&self, particles: &mut mod_api::ParticleBatch, level: &dyn mod_api::ParticleLevelView) {
+impl crate::glue::compat::ParticleProvider for Soul {
+    fn tick(&self, particles: &mut crate::glue::compat::ParticleBatch<'_>, level: &dyn crate::glue::compat::ParticleLevelView) {
         let one = |p: &mut mod_api::ModParticle| {
             let mut a = if p.state[0] == 0.0 {
                 p.size = 0.5;
                 p.lifetime = i32::MAX;
                 p.velocity = [0.0; 3];
-                p.facing = mod_api::ParticleFacing::AroundY;
+                // Horizon: particles have no facing of their own.
                 SoulAnimation {
                     stage: 1,
                     ticks: 0,
@@ -338,12 +337,12 @@ impl ParticleProvider for Soul {
 /// turned 90° about x (`getCustomRotation`), gone once lit.
 pub(super) struct SoulBase;
 
-impl ParticleProvider for SoulBase {
-    fn tick(&self, particles: &mut mod_api::ParticleBatch, level: &dyn mod_api::ParticleLevelView) {
+impl crate::glue::compat::ParticleProvider for SoulBase {
+    fn tick(&self, particles: &mut crate::glue::compat::ParticleBatch<'_>, level: &dyn crate::glue::compat::ParticleLevelView) {
         let one = |p: &mut mod_api::ModParticle| {
             if p.state[0] == 0.0 {
                 let half = std::f32::consts::FRAC_PI_4;
-                p.facing = mod_api::ParticleFacing::Fixed([half.sin(), 0.0, 0.0, half.cos()]);
+                // Horizon: particles have no facing of their own.
                 p.size = 0.5;
                 p.velocity = [0.0; 3];
                 p.lifetime = (90.0 / (random(p, 4) * 0.36 + 0.64)) as i32;

@@ -13,7 +13,7 @@ macro_rules! named {
     ($($key:ty),*) => {$(
         impl Named for $key {
             fn name(self, host: &dyn Host) -> String {
-                self.id(host).map(str::to_owned).unwrap_or_default()
+                self.id(host).unwrap_or_default()
             }
         }
     )*};

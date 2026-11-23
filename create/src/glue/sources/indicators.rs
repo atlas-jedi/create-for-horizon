@@ -31,7 +31,7 @@ thread_local! {
 static TICKS: AtomicI64 = AtomicI64::new(0);
 static GOGGLES: AtomicBool = AtomicBool::new(false);
 
-pub(super) static TYPE: std::sync::OnceLock<mod_api::ParticleType<()>> = std::sync::OnceLock::new();
+pub(super) static TYPE: std::sync::OnceLock<crate::glue::compat::ParticleType<()>> = std::sync::OnceLock::new();
 
 pub(super) fn register(r: &mut dyn Registrar) {
     let ty = crate::glue::particle_type(r, NAME);
@@ -207,11 +207,11 @@ fn rotate(v: [f64; 3], deg: f64, axis: Axis) -> [f64; 3] {
 /// (`SimpleAnimatedParticle`).
 pub struct Indicator;
 
-impl ParticleProvider for Indicator {
+impl crate::glue::compat::ParticleProvider for Indicator {
     fn tick(
         &self,
-        particles: &mut mod_api::ParticleBatch,
-        _level: &dyn mod_api::ParticleLevelView,
+        particles: &mut crate::glue::compat::ParticleBatch<'_>,
+        _level: &dyn crate::glue::compat::ParticleLevelView,
     ) {
         let one = |p: &mut mod_api::ModParticle| {
             if p.state[3] == 0.0 {

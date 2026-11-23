@@ -77,7 +77,7 @@ const VANILLA_CONTAINERS: [&str; 12] = [
 /// The part on vanilla's containers: their changes reach the detectors watching them.
 struct WatchedContainer;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for WatchedContainer {
     fn contents_changed(&self, host: &mut dyn ServerHost, event: &mut ContentsChangedEvent) {
         // Most containers have no detector on them: nothing more than this look.
@@ -89,7 +89,6 @@ impl BlockPart for WatchedContainer {
             .level
             .dimension()
             .id(&*host)
-            .map(str::to_owned)
             .and_then(|d| dim_of(&d))
         else {
             return;
@@ -101,7 +100,7 @@ impl BlockPart for WatchedContainer {
 
 struct RedstoneBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for RedstoneBlock {
     /// `BlockState.getSignal` / `getDirectSignal`. The hook names the face touching the reader;
     /// vanilla's direction points from the reader to the block.
@@ -236,9 +235,11 @@ impl BlockPart for RedstoneBlock {
     /// what it will watch once placed (`place_detectors`).
     fn state_for_placement(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, server) = states::level_view(level);
         let block = states::level_block(level, event.state)?;
         let c = event.context;

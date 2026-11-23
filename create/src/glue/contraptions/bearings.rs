@@ -98,7 +98,7 @@ pub fn chassis_group(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Vec<[i32; 3]> {
 
 struct ChassisPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for ChassisPart {
     /// `AbstractChassisBlock.useItemOn`: a slime ball on a glueable side glues it (on a glued
     /// side: every side that may be glued); sneaking with an empty hand unglues it. A linear
@@ -190,7 +190,7 @@ fn use_chassis(
 
 struct WindmillPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for WindmillPart {
     /// `WindmillBearingBlock.useItemOn` with an empty hand, not sneaking: assembled sails come
     /// apart now; otherwise they assemble on the next tick (`assembleNextTick`).
@@ -230,7 +230,7 @@ impl BlockPart for WindmillPart {
 
 struct MechanicalBearingPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for MechanicalBearingPart {
     /// `MechanicalBearingBlock.useItemOn` with an empty hand, not sneaking, for a player who
     /// may build: a turning structure comes apart now (`disassemble`, turned to the nearest

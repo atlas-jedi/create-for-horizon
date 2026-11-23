@@ -105,10 +105,10 @@ pub(super) fn animated(pos: [i32; 3], entity: &mod_api::ModBlockEntity) -> bool 
 
 pub(super) struct BulbDraw;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for BulbDraw {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for BulbDraw {
     fn block_entity_submit(
         &self,

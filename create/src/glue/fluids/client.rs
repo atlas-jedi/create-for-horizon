@@ -109,10 +109,10 @@ fn client_block(host: &dyn ClientHost, state: mod_api::BlockState) -> Option<(Bl
 
 struct FluidEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for FluidEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for FluidEntity {
     fn block_entity_client_ticks(
         &self,
@@ -137,7 +137,8 @@ impl BlockEntityPart for FluidEntity {
 
     /// Each client tick: a valve's pointer sets off at a new speed and takes a step
     /// (`tickChaser`).
-    fn block_entity_client_tick(&self, event: &mut BlockEntityClientTickEvent<'_>) {
+    fn block_entity_client_tick(&self, host: &mut dyn mod_api::ClientHost, event: &mut BlockEntityClientTickEvent<'_>) {
+        let event = &mut crate::glue::compat::ClientTick::new(host, &*event);
         let Some((state, pos, level)) = event
             .subject
             .with_view(|v| (v.state(), v.position(), v.level()))

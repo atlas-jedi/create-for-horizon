@@ -164,15 +164,15 @@ fn marked_for_swap(stack: &ItemStack) -> bool {
 /// The air particle (`AirParticle` with `AirParticleData(1, 1/4)`): from where it spawns to its
 /// velocity's end, twirling, 4 ticks a block (at most 60), a quarter visible.
 const AIR: &str = "create:air";
-static AIR_TYPE: std::sync::OnceLock<mod_api::ParticleType<()>> = std::sync::OnceLock::new();
+static AIR_TYPE: std::sync::OnceLock<crate::glue::compat::ParticleType<()>> = std::sync::OnceLock::new();
 
 struct Air;
 
-impl mod_api::ParticleProvider for Air {
+impl crate::glue::compat::ParticleProvider for Air {
     fn tick(
         &self,
-        particles: &mut mod_api::ParticleBatch,
-        _level: &dyn mod_api::ParticleLevelView,
+        particles: &mut crate::glue::compat::ParticleBatch<'_>,
+        _level: &dyn crate::glue::compat::ParticleLevelView,
     ) {
         let one = |p: &mut mod_api::ModParticle| {
             let velocity = p.velocity;
@@ -308,20 +308,17 @@ impl Subsystem for PotatoCannon {
 
     fn particle_providers(&self, providers: &mut dyn mod_api::ParticleProviders) {
         if let Some(&ty) = AIR_TYPE.get() {
-            providers.register_sprite_set(ty, std::sync::Arc::new(Air));
+            crate::glue::compat::register_sprite_set(providers, ty, Air);
         }
     }
 }
 
 struct Projectile;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl EntityPart for Projectile {
-    fn general_entity_tick(&self, event: &mut GeneralEntityTickEvent<'_>) {
-        let Some(e) = event.subject.with_view(|v| v.handle()) else {
-            return;
-        };
-        let host = event.subject.host();
+    fn general_entity_tick(&self, host: &mut dyn mod_api::ServerHost, event: &mut GeneralEntityTickEvent<'_>) {
+        let e = event.entity;
 
         if let Some(level) = e.level(host) {
             fly(host, level, e);
@@ -353,7 +350,7 @@ impl EntityRenderer for Projectile {
 
 struct CannonPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for CannonPart {
     /// `PotatoCannonItem.use`: passes without ammunition.
     fn use_item(&self, host: HostSide, event: &mut UseItemEvent<'_>) -> Option<InteractionResult> {
@@ -593,15 +590,13 @@ fn fire(host: &mut dyn ServerHost, event: &UseItemEvent<'_>) -> bool {
                 slot,
             };
             let mut matched = false;
-            place
-                .edit(host, tx, |stack| {
-                    if stack.original().project().as_ref() == Some(expected) {
-                        matched = true;
-                        super::edit_custom(stack, &[(SWAP, value)]);
-                    }
-                })
-                .map_err(|_| ())?;
-            matched.then_some(()).ok_or(())
+            let edited = place.edit(host, tx, |stack| {
+                if &*stack == expected {
+                    matched = true;
+                    super::edit_custom(stack, &[(SWAP, value)]);
+                }
+            });
+            (edited && matched).then_some(()).ok_or(())
         };
         if main && other_cannon.is_some() {
             marker(host, selected_slot as i32, cannon, Some(Tag::Byte(1)))?;
@@ -667,7 +662,6 @@ fn fire(host: &mut dyn ServerHost, event: &UseItemEvent<'_>) -> bool {
         SoundSource::Players,
         1.0,
         pitch_shift,
-        None,
     );
     true
 }
@@ -831,7 +825,6 @@ fn pop(host: &mut dyn ServerHost, level: LevelRef, ammo: &Ammo, at: [f64; 3]) {
         SoundSource::Neutral,
         1.0,
         1.0,
-        None,
     );
 }
 
@@ -1082,7 +1075,7 @@ fn chorus(host: &mut dyn ServerHost, level: LevelRef, target: EntityRef, diamete
             at[2] + (rz - 0.5) * diameter,
         ];
         if living.random_teleport(host, to, None) {
-            level.play_sound(host, sound, at, SoundSource::Players, 1.0, 1.0, None);
+            level.play_sound(host, sound, at, SoundSource::Players, 1.0, 1.0);
             target.set_velocity(host, [0.0; 3]);
             return true;
         }
@@ -1160,7 +1153,7 @@ fn block_hit(host: &mut dyn ServerHost, level: LevelRef, ammo: &Ammo, hit: ClipH
                     ("Time".into(), Tag::Int(1)),
                 ]);
                 let at = [f64::from(place[0]) + 0.5, y, f64::from(place[2]) + 0.5];
-                if let Some(dimension) = level.dimension().id(host).map(str::to_owned) {
+                if let Some(dimension) = level.dimension().id(host) {
                     host.summon(&dimension, "minecraft:falling_block", at, nbt);
                 }
             }

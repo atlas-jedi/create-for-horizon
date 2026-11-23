@@ -42,7 +42,7 @@ use mod_api::{
     AttributeModifier, AttributeOperation, BlockDropsEvent, BlockPart, BreakBlockEvent, Compound,
     EntityRef, EquipmentSlot, Flow, GameMode, Hand, HostSide, HostTransaction, Identifier, ItemKey,
     ItemPart, ItemPlace, ItemStack, LevelHost, LivingRef, ModifierLifetime, PlayerRef,
-    PlayerTickPostEvent, Registrar, RegistrationContext, ServerHost, SetPlacedByEvent, SoundSource,
+    PlayerTickPostEvent, Registrar, RegistrationContext, ServerHost, SoundSource,
     StackError, Tag, Transaction,
 };
 use std::cell::RefCell;
@@ -117,14 +117,8 @@ thread_local! {
 }
 
 /// Share the final sampled movement input with the diving boots and belt travel.
-pub(crate) fn sample_movement(input: &mod_api::MovementInput) {
-    let keys = &input.key_presses;
-    INPUT.set((
-        input.move_vector[1],
-        input.move_vector[0],
-        keys.jump,
-        keys.sneak,
-    ));
+pub(crate) fn sample_movement(input: &mod_api::MovementInputEvent) {
+    INPUT.set((input.forward, input.strafe, input.jump, input.sneak));
 }
 
 /// The applied horizontal axes observed by the movement input hook this travel tick.
@@ -243,7 +237,6 @@ impl Subsystem for Equipment {
             SoundSource::Players,
             0.75,
             1.0,
-            None,
         );
         let _ = living.set_equipment(lv.host, EquipmentSlot::Chest, Some(stack));
         lv.destroy_block(pos, false);
@@ -260,7 +253,8 @@ impl Subsystem for Equipment {
             r.item_part(key, BacktankBar);
         }
         for block in [Block::CopperBacktank, Block::NetheriteBacktank] {
-            r.block_part(states::key(block), BacktankPlacement);
+            let item = r.item_key(&format!("create:{}", block.name()));
+            r.item_part(item, BacktankPlacement);
         }
         let _ = BACKTANK_ITEMS.set(keys);
         let _ = GRIP_ITEM.set(r.item_key("create:extendo_grip"));
@@ -425,7 +419,6 @@ impl Subsystem for Equipment {
                     SoundSource::Players,
                     0.2,
                     0.8,
-                    None,
                 );
             }
         }
@@ -502,7 +495,7 @@ impl Subsystem for Equipment {
     /// `bufferLivingAttackEvent`: damage a player caused wears the grip they hold.
     fn living_incoming_damage(
         &self,
-        _level: &mut dyn mod_api::HitHost,
+        _level: &mut dyn mod_api::LevelRandomHost,
         event: &mut mod_api::LivingIncomingDamageEvent<'_>,
     ) -> Flow {
         if event.source.causing != 0 {
@@ -532,16 +525,8 @@ impl Subsystem for Equipment {
         }
     }
 
-    fn special_model_renderers(&self, renderers: &mut dyn mod_api::SpecialModelRenderers) {
-        let id = mod_api::Identifier::parse("create:extendo_grip").expect("valid identifier");
-        renderers.register(
-            id,
-            mod_api::SpecialModelFactory::new(
-                |config| config.decode::<mod_api::serde_json::Value>(),
-                GripModel::bake,
-            ),
-        );
-    }
+    // Horizon: special model renderers answer resource models, not baked geometry; the
+    // grip's posed model is off (see HORIZON_GAPS.md).
 
     /// `ClientEvents.getFogDensity`: under water a diving helmet sees 6.25 times as far; in lava
     /// the netherite one sees 20 blocks.
@@ -647,7 +632,7 @@ struct BacktankBar;
 /// `BacktankItem.BAR_COLOR`.
 const BAR_COLOR: u32 = 0xEFEFEF;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for BacktankBar {
     fn item_bar(&self, _host: &dyn mod_api::ClientHost, event: &mut mod_api::ItemBarEvent<'_>) {
         let max = eq::max_air(capacity(event.stack));
@@ -660,9 +645,14 @@ impl ItemPart for BacktankBar {
 /// `BacktankBlock.setPlacedBy`: a placed backtank takes the stack's air and Capacity level.
 struct BacktankPlacement;
 
-#[mod_api::sunrise_part]
-impl BlockPart for BacktankPlacement {
-    fn set_placed_by(&self, host: &mut dyn ServerHost, event: &mut SetPlacedByEvent<'_>) {
+#[mod_api::horizon_part]
+impl mod_api::ItemPart for BacktankPlacement {
+    fn on_block_placed_by(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::OnBlockPlacedByEvent<'_>,
+    ) {
+        let event = &mut crate::glue::compat::SetPlacedByEvent::new(&*host, event);
         let Some(stack) = event.stack else {
             return;
         };
@@ -670,7 +660,6 @@ impl BlockPart for BacktankPlacement {
             .level
             .dimension()
             .id(&*host)
-            .map(str::to_owned)
             .and_then(|d| level_index(&d))
         else {
             return;
@@ -975,7 +964,7 @@ pub(crate) fn warn_air(host: &mut dyn ServerHost, player: PlayerRef, warnings: V
     if warnings.is_empty() {
         return;
     }
-    let Some(name) = player.name(&*host).map(str::to_owned) else {
+    let Some(name) = player.name(&*host) else {
         return;
     };
     for w in warnings {
@@ -988,7 +977,6 @@ pub(crate) fn warn_air(host: &mut dyn ServerHost, player: PlayerRef, warnings: V
                 SoundSource::Players,
                 1.0,
                 0.625,
-                None,
             );
             level.play_sound(
                 host,
@@ -997,7 +985,6 @@ pub(crate) fn warn_air(host: &mut dyn ServerHost, player: PlayerRef, warnings: V
                 SoundSource::Neutral,
                 0.5,
                 0.5,
-                None,
             );
         }
         let color = if w == eq::Warning::Depleted {
@@ -1056,6 +1043,7 @@ fn hands(host: &dyn ServerHost, living: LivingRef) -> (Gear, Gear) {
 
 /// `dontMissEntitiesWhenYouHaveHighReachDistance`: keep the ordinary block hit when only the
 /// grip made the entity reachable.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 pub(crate) fn grip_pick(host: &dyn mod_api::ClientHost, event: &mut mod_api::ClientPickEvent<'_>) {
     use mod_api::CrosshairTarget;
 
@@ -1230,10 +1218,10 @@ pub(crate) fn register_cogs(r: &mut dyn Registrar, kind: &mod_api::BlockEntityTy
 /// speed in degrees a tick.
 struct BacktankCogs;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for BacktankCogs {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockEntityPart for BacktankCogs {
     fn block_entity_submit(
         &self,
@@ -1305,6 +1293,7 @@ pub(crate) fn backtank_bar(host: &dyn mod_api::ClientHost) -> Option<(i32, u32)>
 
 /// `ExtendoGripItemRenderer` for one pose its node names: the grip, its scissor arms folded to
 /// their angle, the deployer hand at their end and the cog, each baked with its transform.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 struct GripModel(Vec<(mod_api::SpecialModelGeometry, [f32; 12])>);
 
 /// A 4×4 pose, row-major, multiplied on the right as `PoseStack` does.
@@ -1430,6 +1419,7 @@ impl GripRender {
 }
 
 /// The grip's item model node: its posed children, picked per stack by [`grip_pose`].
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 pub(crate) fn register_grip_pose(event: &mut mod_api::RegisterItemModelsEvent<'_>) {
     let id = mod_api::Identifier::parse(GRIP_POSE).expect("valid identifier");
     event.register(id, |_config, children| {
@@ -1440,6 +1430,7 @@ pub(crate) fn register_grip_pose(event: &mut mod_api::RegisterItemModelsEvent<'_
 
 /// The grip's node: in a first-person hand, the swing's pose and the cog turned on by it;
 /// elsewhere at rest (`animation` 0.25); the cog at `renderTime * -2`.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn grip_pose(
     _host: &dyn mod_api::ClientHost,
     input: &mod_api::ItemModelUpdateInput<'_>,
@@ -1467,6 +1458,7 @@ fn grip_pose(
     }));
 }
 
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 impl GripModel {
     /// `ExtendoGripItemRenderer.render` for the pose its node names: `animation` (before it is
     /// cubed), the cog's turn `cog` and the hand.
@@ -1527,6 +1519,7 @@ impl GripModel {
     }
 }
 
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 impl mod_api::SpecialModelRenderer for GripModel {
     type Argument = ();
 

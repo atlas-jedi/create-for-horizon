@@ -49,7 +49,6 @@ fn play(lv: &mut ServerLevel<'_>, sound: &str, pos: [i32; 3], volume: f32, pitch
         SoundSource::Blocks,
         volume,
         pitch,
-        None,
     );
 }
 
@@ -156,7 +155,7 @@ fn add(p: [i32; 3], d: Dir) -> [i32; 3] {
 /// The copycat panel's and step's block moments.
 pub(super) struct CopycatBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for CopycatBlock {
     /// `CopycatBlock.useItemOn`: a block it takes becomes its material (one consumed, none in
     /// creative), the same block again turns it (`cycleMaterial`); anything else passes to the
@@ -246,9 +245,11 @@ impl BlockPart for CopycatBlock {
     /// (upper half under a block or high on a side).
     fn state_for_placement(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let block = copycat_block(event.state.block())?;
         let c = event.context;
@@ -401,7 +402,7 @@ pub(super) fn wrench(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: PlayerRef)
 /// The copycat items: `CopycatBlock.setPlacedBy`.
 pub(super) struct CopycatItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for CopycatItem {
     /// `setPlacedBy`: a block in the placer's off hand becomes the material, turned to the side
     /// nearest their view.
@@ -409,7 +410,8 @@ impl ItemPart for CopycatItem {
         let Some(player) = event.placer else {
             return;
         };
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host)) else {
             return;
         };
         let Some(living) = host.living(player.entity()) else {
@@ -448,13 +450,13 @@ impl ItemPart for CopycatItem {
 /// The copycat's block entity: what it shows reaches its clients, which draw it.
 pub(super) struct CopycatEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for CopycatEntity {}
 
 /// How far the material is drawn outside the copycat's box, over the copycat's own model.
 const OVER: f32 = 1.0 / 512.0;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for CopycatEntity {
     fn block_entity_update_tag(
         &self,

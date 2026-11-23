@@ -276,7 +276,7 @@ pub fn send_presses(
 pub fn player_joined(host: &mut dyn ServerHost, player: PlayerRef) {
     let Some(dim) = player
         .level(&*host)
-        .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+        .and_then(|l| l.dimension().id(&*host))
         .and_then(|d| crate::glue::world::level_index(&d))
     else {
         return;

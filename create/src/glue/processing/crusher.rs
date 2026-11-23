@@ -266,8 +266,9 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for CrusherItems {
         &self,
         host: &mut dyn mod_api::ServerHost,
         _index: usize,
-        resource: Option<&mod_api::ItemResource>,
+        resource: &mod_api::ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         resource.map_or(64, |r| {
             u32::from(stacks::limit(&*host, &stacks::id(&*host, r.as_stack())))
         })
@@ -287,7 +288,7 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for CrusherItems {
             })
             .unwrap_or(false)
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn mod_api::ServerHost,
         _tx: &mod_api::Transaction,
@@ -318,7 +319,7 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for CrusherItems {
         .flatten()
         .unwrap_or(0)
     }
-    fn extract_at(
+    fn extract(
         &self,
         _host: &mut dyn mod_api::ServerHost,
         _tx: &mod_api::Transaction,

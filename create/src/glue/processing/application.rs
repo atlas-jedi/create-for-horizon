@@ -121,6 +121,5 @@ fn sound(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
         mod_api::SoundSource::Players,
         1.0,
         1.45,
-        None,
     );
 }

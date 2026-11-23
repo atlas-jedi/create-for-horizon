@@ -61,13 +61,15 @@ fn props_on(
 
 struct Placement;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for Placement {
     fn state_for_placement(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut StateForPlacementEvent<'_>,
     ) -> Option<Option<BlockState>> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let block = states::level_block(level, event.state)?;
         let c = event.context;
@@ -141,7 +143,7 @@ fn dir_of(face: BlockFace) -> Dir {
 /// The items of the blocks whose placement Create finishes after the template's.
 struct Placed;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for Placed {
     fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
         let Some(id) = states::id(event.state) else {
@@ -150,7 +152,8 @@ impl ItemPart for Placed {
         let Some((block, info)) = block_of(id) else {
             return;
         };
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host)) else {
             return;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -253,7 +256,7 @@ fn refuse(lv: &mut ServerLevel<'_>, pos: [i32; 3], placer: Option<PlayerRef>, st
 /// FactoryPanelBlock and PlacardBlock.canAttachLenient: any collision behind the face.
 struct LenientSupport;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for LenientSupport {
     fn can_survive(
         &self,

@@ -132,19 +132,19 @@ impl Subsystem for TrainControls {
         interaction(host, event)
     }
 
-    fn movement_input_update(&self, _host: &dyn ClientHost, input: &mut mod_api::MovementInput) {
+    fn movement_input_update(&self, _host: &dyn ClientHost, input: &mut mod_api::MovementInputEvent) {
         // Keep this tick's already sampled input from moving the player between clears.
         if !DRIVING.get() {
             return;
         }
-        input.move_vector = [0.0, 0.0];
-        let keys = &mut input.key_presses;
-        keys.jump = false;
-        keys.sneak = false;
-        keys.forward = false;
-        keys.backward = false;
-        keys.left = false;
-        keys.right = false;
+        input.forward = 0.0;
+        input.strafe = 0.0;
+        input.jump = false;
+        input.sneak = false;
+        input.forward_key = false;
+        input.backward_key = false;
+        input.left_key = false;
+        input.right_key = false;
     }
 
     fn mouse_scrolling(&self, _host: &mut dyn ClientHost, event: &mut MouseScrollingEvent) -> Flow {
@@ -446,7 +446,7 @@ fn carriage_block(dim: usize, at: Target) -> Option<(u32, f64)> {
 /// or in creative.
 fn server_player(host: &dyn ServerHost, uuid: u128) -> Option<(usize, [f64; 3], bool, bool)> {
     let p = host.player(uuid)?;
-    let dimension = p.level(host)?.dimension().id(host).map(str::to_owned)?;
+    let dimension = p.level(host)?.dimension().id(host)?;
     let dim = super::super::world::level_index(&dimension)?;
     let at = p.entity().position(host)?;
     let (spectator, creative) = super::player_mode(host, p);

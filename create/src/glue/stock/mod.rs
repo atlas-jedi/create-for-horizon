@@ -49,7 +49,7 @@ use mod_api::{
     AnalogOutputEvent, AttachmentCodec, AttachmentType, BlockPart, Command, CommandArgumentValue,
     Compound, Flow, HasAnalogOutputEvent, Holder, HostBlockStates, InteractionResult, ItemPart,
     ItemStack, LevelHost, OnBlockPlacedByEvent, PlayerRef, Registrar, RegistrationContext,
-    ServerHost, SetPlacedByEvent, Tag, UseItemOnEvent,
+    ServerHost, Tag, UseItemOnEvent,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -522,7 +522,8 @@ impl Subsystem for Stock {
             r.block_part(states::key(b), StockBlock);
         }
         r.block_part(states::key(Block::FactoryGauge), gauge::Collision);
-        r.block_part(states::key(Block::RedstoneRequester), RequesterPlacement);
+        let requester = r.item_key("create:redstone_requester");
+        r.item_part(requester, RequesterPlacement);
         for item in [
             "create:stock_link",
             "create:stock_ticker",
@@ -775,8 +776,7 @@ impl Subsystem for Stock {
         let dimension = player
             .level(&*host)?
             .dimension()
-            .id(&*host)
-            .map(str::to_owned)?;
+            .id(&*host)?;
         let mut lv = ServerLevel::new(host, &dimension)?;
         let entity = lv.host.entity(event.entity as u32)?;
         let ticker = keeper::ticker_beside(&lv, entity)?;
@@ -1000,7 +1000,7 @@ impl Subsystem for Stock {
         };
         let here = event.command.position;
         let player = command_player(event.source).map(|p| p.uuid());
-        let Some(dimension) = event.command.dimension.id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.command.dimension.id(&*host) else {
             return Flow::Cancel;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -1457,7 +1457,7 @@ fn requester_succeeded(dim: usize, pos: [i32; 3]) -> Option<bool> {
 /// Links', gauges' and requesters' own moments.
 struct StockBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for StockBlock {
     /// A right click on a stock link or a gauge does nothing here (their screens are
     /// commands): the click is used, so the block's template does nothing either. A linking
@@ -1508,7 +1508,7 @@ impl BlockPart for StockBlock {
 
     fn analog_output(
         &self,
-        _level: &mut dyn mod_api::LevelRandomHost,
+        _level: &dyn mod_api::LevelHost,
         event: &mut AnalogOutputEvent,
     ) {
         if states::id(event.state).and_then(block_of) != Some(Block::RedstoneRequester) {
@@ -1578,7 +1578,6 @@ fn own_use(
                 mod_api::SoundSource::Players,
                 0.2,
                 pitch,
-                None,
             );
             return Some(InteractionResult::Success);
         }
@@ -1722,17 +1721,18 @@ fn programmed(host: &dyn mod_api::Host, stack: &ItemStack) -> Option<Requester<K
 /// `RedstoneRequesterBlock.setPlacedBy`: restore the order from a programmed stack.
 struct RequesterPlacement;
 
-#[mod_api::sunrise_part]
-impl BlockPart for RequesterPlacement {
-    fn set_placed_by(&self, host: &mut dyn ServerHost, event: &mut SetPlacedByEvent<'_>) {
+#[mod_api::horizon_part]
+impl mod_api::ItemPart for RequesterPlacement {
+    fn on_block_placed_by(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::OnBlockPlacedByEvent<'_>,
+    ) {
+        let event = &mut crate::glue::compat::SetPlacedByEvent::new(&*host, event);
         let Some(request) = event.stack.and_then(|stack| programmed(&*host, stack)) else {
             return;
         };
-        let Some(dim) = event
-            .level
-            .dimension()
-            .id(&*host)
-            .map(str::to_owned)
+        let Some(dim) = event.level.dimension().id(&*host)
             .and_then(|d| level_index(&d))
         else {
             return;
@@ -1792,14 +1792,11 @@ fn linked_block(b: Block) -> bool {
     )
 }
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for StockItem {
     fn on_block_placed_by(&self, host: &mut dyn ServerHost, event: &mut OnBlockPlacedByEvent<'_>) {
-        let Some(dimension) = event
-            .level
-            .dimension()
-            .id(&*host)
-            .map(str::to_owned)
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host))
             .map(|d| d.to_string())
         else {
             return;

@@ -359,7 +359,7 @@ impl ResourceHandler<ItemResource> for PortItems {
         &self,
         _host: &mut dyn ServerHost,
         _index: usize,
-        _r: Option<&ItemResource>,
+        _r: &ItemResource,
     ) -> u32 {
         1
     }
@@ -367,7 +367,7 @@ impl ResourceHandler<ItemResource> for PortItems {
         r.to_stack(1)
             .is_some_and(|s| package::is_package(&body::item_id(&*host, &s)))
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -402,7 +402,7 @@ impl ResourceHandler<ItemResource> for PortItems {
         }
         u32::from(ok)
     }
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -473,7 +473,7 @@ impl ResourceHandler<ItemResource> for PackagerItems {
         &self,
         _host: &mut dyn ServerHost,
         _index: usize,
-        _r: Option<&ItemResource>,
+        _r: &ItemResource,
     ) -> u32 {
         1
     }
@@ -482,7 +482,7 @@ impl ResourceHandler<ItemResource> for PackagerItems {
             .is_some_and(|s| package::is_package(&body::item_id(&*host, &s)))
     }
     /// `insertItem`: one package, while nothing is held or queued, its contents fitting behind.
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -510,7 +510,6 @@ impl ResourceHandler<ItemResource> for PackagerItems {
             .level
             .dimension()
             .id(&*host)
-            .map(str::to_owned)
             .map(|d| d.to_string())
         else {
             return 0;
@@ -530,7 +529,7 @@ impl ResourceHandler<ItemResource> for PackagerItems {
         }
     }
     /// `extractItem`: the held box, not while the tray moves.
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,

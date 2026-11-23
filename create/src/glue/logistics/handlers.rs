@@ -15,7 +15,7 @@ use mod_api::{
 
 /// The engine's index of `level`.
 fn dim_of(host: &dyn mod_api::Host, level: LevelRef) -> Option<usize> {
-    level_index(&level.dimension().id(host).map(str::to_owned)?)
+    level_index(&level.dimension().id(host)?)
 }
 
 /// The Create block at `pos` and its state's facts.
@@ -194,7 +194,7 @@ impl DepotItems {
         else {
             return 0;
         };
-        let Some(dimension) = self.0.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = self.0.level.dimension().id(&*host) else {
             return 0;
         };
         let Some(mut lv) = super::super::server::ServerLevel::new(host, &dimension) else {
@@ -220,7 +220,7 @@ impl DepotItems {
     /// `DepotBehaviour.insert` onto an empty depot: the stack put into its held slot is its held
     /// stack, arriving from above (`handler_motion`).
     fn arrived(&self, host: &mut dyn ServerHost, e: BlockEntityRef) {
-        let Some(dimension) = self.0.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = self.0.level.dimension().id(&*host) else {
             return;
         };
         let Some(lv) = super::super::server::ServerLevel::new(host, &dimension) else {
@@ -251,8 +251,9 @@ impl ResourceHandler<ItemResource> for DepotItems {
         &self,
         host: &mut dyn ServerHost,
         index: usize,
-        resource: Option<&ItemResource>,
+        resource: &ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         if let Some(resource) = resource {
             return limit(&*host, resource);
         }
@@ -271,7 +272,7 @@ impl ResourceHandler<ItemResource> for DepotItems {
     fn is_valid(&self, _host: &mut dyn ServerHost, index: usize, _: &ItemResource) -> bool {
         index == 0
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -301,7 +302,7 @@ impl ResourceHandler<ItemResource> for DepotItems {
         }
         n
     }
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -358,7 +359,7 @@ impl ResourceHandler<ItemResource> for BeltItems {
             return None;
         }
         let (_, _, item) = self.stack_at(&*host)?;
-        let dimension = self.0.level.dimension().id(&*host).map(str::to_owned)?;
+        let dimension = self.0.level.dimension().id(&*host)?;
         let lv = super::super::server::ServerLevel::new(host, &dimension)?;
         super::belt::belt_stack(&lv, &item).map(|s| ItemResource::of(&s))
     }
@@ -374,8 +375,9 @@ impl ResourceHandler<ItemResource> for BeltItems {
         &self,
         host: &mut dyn ServerHost,
         index: usize,
-        resource: Option<&ItemResource>,
+        resource: &ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         match resource {
             Some(resource) => limit(&*host, resource),
             None => self
@@ -383,7 +385,7 @@ impl ResourceHandler<ItemResource> for BeltItems {
                 .map_or(64, |r| host.max_stack_size(r.item()).unwrap_or(64)),
         }
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         _tx: &Transaction,
@@ -397,7 +399,7 @@ impl ResourceHandler<ItemResource> for BeltItems {
         let Some(stack) = resource.to_stack(amount.min(u32::from(u8::MAX))) else {
             return 0;
         };
-        let Some(dimension) = self.0.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = self.0.level.dimension().id(&*host) else {
             return 0;
         };
         let Some(mut lv) = super::super::server::ServerLevel::new(host, &dimension) else {
@@ -411,7 +413,7 @@ impl ResourceHandler<ItemResource> for BeltItems {
             None => 0,
         }
     }
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         _tx: &Transaction,
@@ -425,7 +427,7 @@ impl ResourceHandler<ItemResource> for BeltItems {
         let Some((c, segment, item)) = self.stack_at(&*host) else {
             return 0;
         };
-        let Some(dimension) = self.0.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = self.0.level.dimension().id(&*host) else {
             return 0;
         };
         let Some(lv) = super::super::server::ServerLevel::new(host, &dimension) else {
@@ -483,11 +485,12 @@ impl ResourceHandler<ItemResource> for VaultItems {
         &self,
         host: &mut dyn ServerHost,
         _index: usize,
-        resource: Option<&ItemResource>,
+        resource: &ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         resource.map_or(64, |r| limit(&*host, r))
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -504,7 +507,7 @@ impl ResourceHandler<ItemResource> for VaultItems {
         let room = limit(&*host, resource);
         put(host, tx, e, slot, resource, amount, room)
     }
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -539,8 +542,9 @@ impl ResourceHandler<ItemResource> for ChuteItems {
         &self,
         host: &mut dyn ServerHost,
         index: usize,
-        resource: Option<&ItemResource>,
+        resource: &ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         match resource {
             Some(resource) => limit(&*host, resource),
             None => held_limit(&*host, self.0.entity(&*host, self.0.pos), index),
@@ -549,7 +553,7 @@ impl ResourceHandler<ItemResource> for ChuteItems {
     fn is_valid(&self, host: &mut dyn ServerHost, index: usize, resource: &ItemResource) -> bool {
         index == 0 && accepts(&*host, self.0, resource.as_stack())
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -573,7 +577,7 @@ impl ResourceHandler<ItemResource> for ChuteItems {
         }
         n
     }
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -591,7 +595,7 @@ impl ResourceHandler<ItemResource> for ChuteItems {
 /// the chute at no commit it hears of (no `contents_changed`), so it is told here; should the
 /// transaction abort, the chute's next tick finds it empty and lets it go again.
 fn chute_given(host: &mut dyn ServerHost, at: At) {
-    let Some(dimension) = at.level.dimension().id(&*host).map(str::to_owned) else {
+    let Some(dimension) = at.level.dimension().id(&*host) else {
         return;
     };
     let Some(lv) = super::super::server::ServerLevel::new(host, &dimension) else {
@@ -639,7 +643,7 @@ impl TunnelItems {
     }
 
     fn target(&self, host: &mut dyn ServerHost) -> Option<create_engine::tunnel::HandlerTarget> {
-        let dimension = self.0.level.dimension().id(&*host).map(str::to_owned)?;
+        let dimension = self.0.level.dimension().id(&*host)?;
         let lv = super::super::server::ServerLevel::new(host, &dimension)?;
         let pos = self.0.pos;
         let target = super::tunnel::handler_target(&lv, pos)?;
@@ -667,14 +671,15 @@ impl ResourceHandler<ItemResource> for TunnelItems {
         &self,
         host: &mut dyn ServerHost,
         index: usize,
-        resource: Option<&ItemResource>,
+        resource: &ItemResource,
     ) -> u32 {
+        let resource = Some(resource);
         match resource {
             Some(resource) => limit(&*host, resource),
             None => held_limit(&*host, self.0.entity(&*host, self.0.pos), index),
         }
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -696,7 +701,7 @@ impl ResourceHandler<ItemResource> for TunnelItems {
             _ => 0,
         }
     }
-    fn extract_at(
+    fn extract(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,

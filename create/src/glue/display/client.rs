@@ -286,10 +286,10 @@ fn draw_text(
 /// The tubes' and boards' renderers, on the kinetic block entity type.
 struct DisplayEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for DisplayEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for DisplayEntity {
     fn block_entity_submit(
         &self,

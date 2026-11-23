@@ -878,10 +878,10 @@ fn draw_item(
 /// The gauge's drawing on the shared block entity type.
 pub(super) struct GaugeDraw;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for GaugeDraw {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for GaugeDraw {
     fn block_entity_submit(
         &self,

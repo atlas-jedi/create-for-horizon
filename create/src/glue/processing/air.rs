@@ -44,7 +44,7 @@ pub(super) struct Keys {
 }
 
 pub(super) static KEYS: OnceLock<Keys> = OnceLock::new();
-pub(super) static AIR_FLOW_TYPE: OnceLock<mod_api::ParticleType<()>> = OnceLock::new();
+pub(super) static AIR_FLOW_TYPE: OnceLock<crate::glue::compat::ParticleType<()>> = OnceLock::new();
 
 pub(super) fn register(r: &mut dyn Registrar) {
     let air_flow = crate::glue::particle_type(r, AIR_FLOW);
@@ -327,11 +327,11 @@ fn plain(p: &mut ModParticle) {
 /// particle (`morphAirFlow`).
 pub(super) struct AirFlow;
 
-impl ParticleProvider for AirFlow {
+impl crate::glue::compat::ParticleProvider for AirFlow {
     fn tick(
         &self,
-        particles: &mut mod_api::ParticleBatch,
-        _level: &dyn mod_api::ParticleLevelView,
+        particles: &mut crate::glue::compat::ParticleBatch<'_>,
+        _level: &dyn crate::glue::compat::ParticleLevelView,
     ) {
         let one = |p: &mut mod_api::ModParticle| {
             if p.state[3] == 0.0 {

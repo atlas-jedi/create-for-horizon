@@ -342,7 +342,6 @@ impl Subsystem for Copycats {
         let dim = c
             .dimension
             .id(&*host)
-            .map(str::to_owned)
             .and_then(|d| level_index(&d));
         let line = match dim.and_then(|dim| with(dim, |d| d.copycats.get(&pos).cloned())) {
             Some(cat) => format!(

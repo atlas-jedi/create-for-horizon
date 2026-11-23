@@ -289,7 +289,7 @@ pub(super) fn register(r: &mut dyn Registrar) {
 
 struct GlueItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for GlueItem {
     fn use_on(&self, host: HostSide, event: &mut UseOnEvent<'_>) -> Option<InteractionResult> {
         // `onMouseInput` reads the main hand only.
@@ -436,7 +436,6 @@ fn slime_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3], pitch: f32) {
             SoundSource::Blocks,
             volume,
             pitch,
-            None,
         );
     }
 }
@@ -476,7 +475,6 @@ pub(super) fn left_click(host: &mut dyn ServerHost, event: &LeftClickBlockEvent)
         SoundSource::Blocks,
         0.5,
         0.5,
-        None,
     );
     send_glue(&mut lv, player);
     true

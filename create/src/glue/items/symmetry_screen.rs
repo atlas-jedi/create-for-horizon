@@ -210,13 +210,8 @@ fn draw(host: &dyn ClientHost, draw: &mut dyn mod_api::DrawContext, o: &Open, mo
         o.pressed,
     );
     // The wand, four times its size, right of the window, turned (`rotate(-70, 20, 20)`).
-    let view = mod_api::Gui3dView::new([x + 210.0, y + 77.0], 64.0, wand_turn());
-    if draw
-        .model_3d(mod_api::Gui3dSubject::Item(&o.wand), view)
-        .is_err()
-    {
-        draw.item_stack(&o.wand, [x + 178.0, y + 45.0], 64.0);
-    }
+    // Horizon: no 3D item view in GUIs (`Gui3dView`); the flat item, as Sunrise's fallback.
+    draw.item_stack(&o.wand, [x + 178.0, y + 45.0], 64.0);
     // The hovered input's tooltip.
     let tip = if inside(at(TYPE_INPUT, x, y), mouse) {
         Some(selection_tooltip(

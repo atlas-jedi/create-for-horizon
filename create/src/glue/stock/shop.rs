@@ -166,7 +166,6 @@ fn sound(lv: &mut ServerLevel<'_>, id: &str, at: [f64; 3], volume: f32, pitch: f
         SoundSource::Blocks,
         volume,
         pitch,
-        None,
     );
 }
 
@@ -1279,10 +1278,10 @@ pub(crate) fn client_price_count(host: &dyn ClientHost, pos: [i32; 3]) -> Option
 /// The cloths' block entity: its data to clients, and `TableClothRenderer`.
 pub(super) struct ClothEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for ClothEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for ClothEntity {
     fn block_entity_update_tag(
         &self,
@@ -1436,7 +1435,7 @@ pub(super) fn register(r: &mut dyn mod_api::Registrar) {
 /// The cloth items: a programmed one placed becomes a shop (`setPlacedBy`); its tooltip.
 struct ClothItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::ItemPart for ClothItem {
     fn on_block_placed_by(
         &self,
@@ -1444,11 +1443,8 @@ impl mod_api::ItemPart for ClothItem {
         event: &mut mod_api::OnBlockPlacedByEvent<'_>,
     ) {
         let Some(player) = event.placer else { return };
-        let Some(dimension) = event
-            .level
-            .dimension()
-            .id(&*host)
-            .map(str::to_owned)
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host))
             .map(|d| d.to_string())
         else {
             return;
@@ -1485,7 +1481,7 @@ impl mod_api::ItemPart for ClothItem {
 /// costs.
 struct ShoppingListPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::ItemPart for ShoppingListPart {
     fn use_item(
         &self,

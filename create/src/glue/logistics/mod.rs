@@ -394,7 +394,7 @@ impl Subsystem for Logistics {
         let Some(level) = player.level(&*host) else {
             return;
         };
-        let Some(dimension) = level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = level.dimension().id(&*host) else {
             return;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -725,7 +725,7 @@ fn use_block(
     used.then_some(InteractionResult::Success)
 }
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for LogisticsBlock {
     /// Hot: an entity on the ground over a belt or ejector, each tick it moves.
     fn step_on(&self, level: mod_api::LevelRandomSide<'_>, event: &mut mod_api::StepOnEvent<'_>) {
@@ -838,7 +838,7 @@ impl BlockPart for LogisticsBlock {
     }
 
     fn contents_changed(&self, host: &mut dyn ServerHost, event: &mut ContentsChangedEvent) {
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.level.dimension().id(&*host) else {
             return;
         };
         let Some(lv) = level_of(host, &dimension) else {

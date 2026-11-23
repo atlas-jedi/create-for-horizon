@@ -50,7 +50,7 @@ fn as_block_on(level: &dyn LevelHost, state: BlockState, to: Block) -> Option<Bl
 
 struct Copper;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for Copper {
     /// `ChangeOverTimeBlock.changeOverTime`: vanilla's chance and neighbour rule, into Create's
     /// next age. Vanilla's own random tick (which would look for vanilla's next copper) is
@@ -145,7 +145,7 @@ fn neighbour_chance(level: &dyn LevelHost, pos: [i32; 3], own: WeatheringAge) ->
 /// Honeycomb on Create's copper: `HoneycombItem.useOn`.
 struct Honeycomb;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl ItemPart for Honeycomb {
     /// Into Create's waxed twin: the `item_used_on_block` trigger, one honeycomb used (not in
     /// creative), the block changed, the `block_change` game event and the wax-on level event

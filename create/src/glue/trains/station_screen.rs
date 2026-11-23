@@ -402,7 +402,7 @@ pub fn client_message(host: &mut dyn ServerHost, player: PlayerRef, data: &[u8])
     }
     let Some(dimension) = player
         .level(&*host)
-        .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+        .and_then(|l| l.dimension().id(&*host))
     else {
         return;
     };
@@ -1393,7 +1393,6 @@ pub fn debug_command(
     let dimension = cmd
         .dimension
         .id(&*host)
-        .map(str::to_owned)
         .map(|d| d.to_string())
         .unwrap_or_else(|| "minecraft:overworld".to_owned());
     let line = (|| {

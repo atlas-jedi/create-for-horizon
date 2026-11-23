@@ -1147,10 +1147,10 @@ fn speeds_of(data: &Compound) -> [f32; 2] {
 /// The kinetic block entity's second renderer: what logistics draws.
 pub struct LogisticsEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for LogisticsEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for LogisticsEntity {
     fn block_entity_submit(
         &self,

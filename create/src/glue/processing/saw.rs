@@ -316,7 +316,7 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for SawItems {
         &self,
         _host: &mut dyn mod_api::ServerHost,
         _index: usize,
-        _resource: Option<&mod_api::ItemResource>,
+        _resource: &mod_api::ItemResource,
     ) -> u32 {
         1
     }
@@ -328,7 +328,7 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for SawItems {
     ) -> bool {
         index == 0 && self.empty()
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn mod_api::ServerHost,
         _tx: &mod_api::Transaction,
@@ -351,7 +351,7 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for SawItems {
         };
         u32::from(saw_put(&mut lv, self.pos, &item, progress))
     }
-    fn extract_at(
+    fn extract(
         &self,
         _host: &mut dyn mod_api::ServerHost,
         _tx: &mod_api::Transaction,
@@ -806,7 +806,7 @@ pub(super) fn load_saw(dim: usize, pos: [i32; 3], tag: &Compound) {
 /// The saw and the drill as blocks: what walks into their blades.
 pub struct Blades;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for Blades {
     /// `SawBlock.entityInside` and `DrillBlock.entityInside`: the entity (not an item), for the
     /// level's tick (its box can't be read inside its move).

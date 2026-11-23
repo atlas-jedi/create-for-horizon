@@ -211,13 +211,15 @@ pub(super) fn level_tick(lv: &mut ServerLevel<'_>) {
 /// `HandCrankBlock.canSurvive`, inherited by ValveHandleBlock: any collision shape behind it.
 struct Supported;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Supported {
     fn can_survive(
         &self,
-        level: mod_api::LevelSide<'_>,
+        level: &dyn mod_api::LevelHost,
         event: &mut CanSurviveEvent,
     ) -> Option<bool> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
         let (level, _) = states::level_view(level);
         let facing = states::level_info(level, event.state)?.1.facing?;
         let o = facing.opposite().offset();
@@ -229,10 +231,10 @@ impl BlockPart for Supported {
 /// Draws the handles; ticks the cranks' on the client.
 struct Handles;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for Handles {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for Handles {
     fn block_entity_client_ticks(
         &self,
@@ -246,7 +248,8 @@ impl BlockEntityPart for Handles {
 
     /// `HandCrankBlockEntity.tick`: the handle's speed moves a quarter of the way to the
     /// crank's (`convertToAngular(getSpeed())`), and its angle by that speed.
-    fn block_entity_client_tick(&self, event: &mut BlockEntityClientTickEvent<'_>) {
+    fn block_entity_client_tick(&self, host: &mut dyn mod_api::ClientHost, event: &mut BlockEntityClientTickEvent<'_>) {
+        let event = &mut crate::glue::compat::ClientTick::new(host, &*event);
         let Some((state, pos, target, generating)) = event.subject.with_view(|v| {
             let nbt = v.nbt();
             let generating = super::generated_of(nbt).is_some_and(|g| g != 0.0);

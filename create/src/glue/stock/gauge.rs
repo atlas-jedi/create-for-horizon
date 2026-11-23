@@ -269,7 +269,6 @@ pub(super) fn look(lv: &mut ServerLevel<'_>, dim: usize, pp: PanelPos, now: u64)
             SoundSource::Blocks,
             0.075,
             1.0,
-            None,
         );
         let _ = lv.level.play_sound(
             &mut *lv.host,
@@ -278,7 +277,6 @@ pub(super) fn look(lv: &mut ServerLevel<'_>, dim: usize, pp: PanelPos, now: u64)
             SoundSource::Blocks,
             0.125,
             0.575,
-            None,
         );
     }
     // `tickRequests`' timer (`getConfigRequestIntervalInTicks`).
@@ -546,7 +544,7 @@ fn panel_tag(host: &dyn mod_api::Host, n: &Net, pp: PanelPos, g: &Panel<Key>) ->
 /// block entity's published collision shape, which the game answers with), nothing for an entity.
 pub(super) struct Collision;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::BlockPart for Collision {
     fn collision_shape(
         &self,
@@ -612,7 +610,6 @@ fn deny(lv: &mut ServerLevel<'_>, at: [i32; 3]) {
         SoundSource::Blocks,
         1.0,
         1.0,
-        None,
     );
 }
 
@@ -684,7 +681,6 @@ pub(super) fn use_item_on(
         SoundSource::Blocks,
         1.0,
         0.8,
-        None,
     );
     if !items::creative(&*lv.host, player) {
         let mut s = stack;
@@ -862,7 +858,6 @@ pub(super) fn set_filter(lv: &mut ServerLevel<'_>, pp: PanelPos, filter: Option<
         SoundSource::Blocks,
         0.25,
         0.1,
-        None,
     );
 }
 
@@ -917,7 +912,6 @@ pub(super) fn set_amount(lv: &mut ServerLevel<'_>, pp: PanelPos, row: i32, value
             SoundSource::Blocks,
             0.25,
             2.0,
-            None,
         );
     }
 }
@@ -1138,7 +1132,6 @@ pub(super) fn sneak_wrenched(
             SoundSource::Blocks,
             0.25,
             0.75,
-            None,
         );
     }
     if with(dim, |n| panels_at(n, pos).is_empty()) {
@@ -1263,7 +1256,6 @@ pub(super) fn relocate(lv: &mut ServerLevel<'_>, player: PlayerRef, from: PanelP
         SoundSource::Blocks,
         1.0,
         1.0,
-        None,
     );
     if with(dim, |n| panels_at(n, from.0).is_empty()) {
         lv.destroy_block(from.0, false);
@@ -1313,7 +1305,6 @@ pub(super) fn break_sub_panel(host: &mut dyn ServerHost, pos: [i32; 3]) -> bool 
         SoundSource::Blocks,
         1.0,
         0.8,
-        None,
     );
     true
 }

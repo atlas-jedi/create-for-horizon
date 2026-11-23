@@ -328,7 +328,7 @@ fn insert_stacked(
         .collect();
     let mut went = 0;
     for (i, n) in create_engine::vault::insert_stacked(&view, count, limit) {
-        went += to.insert_at(host, tx, i, resource, n);
+        went += to.insert(host, tx, i, resource, n);
     }
     // An index the plan counted on refused: the rest goes wherever it goes.
     if went < count {
@@ -450,7 +450,7 @@ pub fn extract_matching(
         .transaction(|host, tx| {
             let mut n = 0;
             for &(i, want) in &plan {
-                n += from.extract_at(host, tx, i, &resource, want);
+                n += from.extract(host, tx, i, &resource, want);
             }
             if n == 0 { Err(()) } else { Ok(n) }
         })

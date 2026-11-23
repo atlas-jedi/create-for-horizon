@@ -1759,14 +1759,14 @@ pub(super) fn elevator_turn(facing: Dir) -> f32 {
 /// The part every Create block entity carries that draws a structure its block anchors.
 struct StructurePart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for StructurePart {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for StructurePart {
     /// An anchor came back with a structure in its data: the level tick looks whether it runs.
-    fn block_entity_on_load(&self, event: &mut BlockEntityOnLoadEvent<'_>) {
-        let Some((entity, host)) = crate::glue::loaded_entity(&mut event.subject) else {
+    fn block_entity_on_load(&self, side: mod_api::HostSide<'_>, event: &mut BlockEntityOnLoadEvent) {
+        let Some((entity, host)) = crate::glue::loaded_entity(side, event) else {
             return;
         };
         let Some(data) = entity.data(&*host) else {
@@ -1781,7 +1781,6 @@ impl BlockEntityPart for StructurePart {
         let Some(dim) = level
             .dimension()
             .id(&*host)
-            .map(str::to_owned)
             .and_then(|d| level_index(&d))
         else {
             return;

@@ -823,7 +823,6 @@ fn finish_using(
             SoundSource::Players,
             volume,
             pitch,
-            None,
         );
     }
     // `FoodProperties.onConsume`.
@@ -842,7 +841,6 @@ fn finish_using(
                 SoundSource::Neutral,
                 1.0,
                 pitch,
-                None,
             );
         }
         // `FoodData.eat(nutrition, saturation)`, given as its modifier
@@ -864,7 +862,6 @@ fn finish_using(
             SoundSource::Players,
             0.5,
             pitch,
-            None,
         );
     }
     // `PotionContents.onConsume`.
@@ -1064,7 +1061,6 @@ fn punch(
             mod_api::SoundSource::Neutral,
             0.25,
             1.0,
-            None,
         );
     }
     match d.punch(at, per_hit) {
@@ -1213,7 +1209,7 @@ fn send_deployers(lv: &mut ServerLevel<'_>, players: &[PlayerRef], list: &[[i32;
 pub fn player_joined(host: &mut dyn ServerHost, player: PlayerRef) {
     let Some(dimension) = player
         .level(&*host)
-        .and_then(|l| l.dimension().id(&*host).map(str::to_owned))
+        .and_then(|l| l.dimension().id(&*host))
     else {
         return;
     };

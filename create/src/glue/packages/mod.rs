@@ -679,7 +679,7 @@ impl Subsystem for Packages {
             return Flow::Continue;
         };
         let here = event.command.position;
-        let Some(dimension) = event.command.dimension.id(&*host).map(str::to_owned) else {
+        let Some(dimension) = event.command.dimension.id(&*host) else {
             return Flow::Cancel;
         };
         let Some(mut lv) = ServerLevel::new(host, &dimension) else {
@@ -1697,7 +1697,6 @@ fn use_packager(
             SoundSource::Blocks,
             1.0,
             1.0,
-            None,
         );
         return Some(InteractionResult::Success);
     }
@@ -1838,7 +1837,7 @@ fn address_to_clipboard(clip: &ItemStack, address: &str) -> Option<(ItemStack, S
 /// read of each.
 struct PackageBlock;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for PackageBlock {
     /// A packager's slots changed: automation took its box or put a package in (`automation`).
     fn contents_changed(
@@ -1850,7 +1849,6 @@ impl BlockPart for PackageBlock {
             .level
             .dimension()
             .id(&*host)
-            .map(str::to_owned)
             .map(|d| d.to_string())
         else {
             return;
@@ -1912,7 +1910,7 @@ impl BlockPart for PackageBlock {
 
     fn analog_output(
         &self,
-        _level: &mut dyn mod_api::LevelRandomHost,
+        _level: &dyn mod_api::LevelHost,
         event: &mut AnalogOutputEvent,
     ) {
         let Some(dim) = level_index(event.dimension.key().id()) else {
@@ -2085,7 +2083,6 @@ fn chain_clicked(lv: &mut ServerLevel<'_>, player: PlayerRef, pos: [i32; 3]) {
             SoundSource::Blocks,
             1.0,
             1.0,
-            None,
         );
     };
     if d2 >= MAX_CHAIN_LENGTH * MAX_CHAIN_LENGTH {
@@ -2140,7 +2137,6 @@ fn chain_clicked(lv: &mut ServerLevel<'_>, player: PlayerRef, pos: [i32; 3]) {
         SoundSource::Blocks,
         1.0,
         0.8,
-        None,
     );
 }
 
@@ -2504,7 +2500,7 @@ const CHAIN_MODELS: [&str; 15] = [
 /// (`ChainConveyorInteractionHandler.onUse`).
 struct FrogportItem;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl mod_api::ItemPart for FrogportItem {
     fn use_item(
         &self,
@@ -2524,10 +2520,10 @@ impl mod_api::ItemPart for FrogportItem {
 /// wheel turning about the conveyor at its speed, along a chain gliding at the chain's.
 struct ConveyorDraw;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for ConveyorDraw {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for ConveyorDraw {
     fn block_entity_submit(
         &self,

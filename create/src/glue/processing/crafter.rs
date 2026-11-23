@@ -202,10 +202,10 @@ impl ResourceHandler<ItemResource> for CrafterItems {
         self.held(host, index).map_or(0, |s| s.count())
     }
     /// `Inventory`'s slot limit: one item.
-    fn capacity(&self, _host: &mut dyn ServerHost, _index: usize, _: Option<&ItemResource>) -> u32 {
+    fn capacity(&self, _host: &mut dyn ServerHost, _index: usize, _: &ItemResource) -> u32 {
         1
     }
-    fn insert_at(
+    fn insert(
         &self,
         host: &mut dyn ServerHost,
         tx: &Transaction,
@@ -239,7 +239,7 @@ impl ResourceHandler<ItemResource> for CrafterItems {
             Err(_) => 0,
         }
     }
-    fn extract_at(
+    fn extract(
         &self,
         _host: &mut dyn ServerHost,
         _tx: &Transaction,

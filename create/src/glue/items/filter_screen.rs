@@ -407,6 +407,7 @@ pub(crate) fn tick(host: &mut dyn ClientHost) {
 /// `AbstractFilterScreen.init`: the window (`setWindowSize`, moved by `setWindowOffset`,
 /// which a centred screen gets by growing twice the offset), the ghost slots and the
 /// player's inventory where the menu puts them.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 pub(crate) fn open_screen(
     _host: &dyn ClientHost,
     open: mod_api::MenuScreenOpen<'_>,
@@ -449,6 +450,7 @@ pub(crate) fn open_screen(
     )
 }
 
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn screen_draw(
     host: &dyn ClientHost,
     attribute: bool,
@@ -468,6 +470,7 @@ fn screen_draw(
 }
 
 /// The buttons (`IconButton.onClick`): an active one takes the press.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn screen_click(
     host: &dyn ClientHost,
     attribute: bool,
@@ -490,6 +493,7 @@ fn screen_click(
 
 /// The buttons' tooltips (`handleTooltips`), the selector's, and the selected attributes
 /// over their slot (`AttributeFilterScreen.renderTooltip`).
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 fn screen_tooltip(
     host: &dyn ClientHost,
     attribute: bool,
@@ -526,7 +530,7 @@ fn screen_tooltip(
 /// The filters' menus: their ghost slots.
 pub(crate) struct FilterScreen;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl MenuPart for FilterScreen {
     /// `HeldItemGhostItemMenu.stillValid`: the filter it opened from is still in that hand
     /// (the selected slot is checked each tick, `filters::player_tick`).
@@ -538,14 +542,6 @@ impl MenuPart for FilterScreen {
         if let Some(opened) = &event.opening_item {
             event.valid &= opened.stack_matches;
         }
-    }
-
-    fn menu_clicked(
-        &self,
-        host: &mut dyn mod_api::ServerHost,
-        event: &mut mod_api::MenuClickedEvent<'_>,
-    ) -> mod_api::Flow {
-        super::filters::menu_clicked(host, event)
     }
 
     /// The ghost slots take nothing from the cursor and give nothing up: the server's clicks

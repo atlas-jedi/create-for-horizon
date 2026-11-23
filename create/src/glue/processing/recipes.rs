@@ -8,7 +8,7 @@ use create_engine::processing::{Book, Output, Recipe};
 use create_engine::{basin, deployer, drain, fan, runtime_data, sequenced, spout, tank};
 use mod_api::prelude::RecipesHost;
 use mod_api::serde_json::Value;
-use mod_api::{Identifier, ItemStack, RecipeInput, RecipeRule, ReloadContext};
+use mod_api::{Identifier, ItemStack, RecipeInput, RecipeRule, Host as ReloadContext};
 use std::cell::RefCell;
 
 /// Create's recipe books, by the machine that runs them.

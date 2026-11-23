@@ -240,7 +240,7 @@ fn tick_clock(host: &mut dyn ClientHost, pos: [i32; 3], turning: bool) {
         return;
     };
     let natural =
-        level.dimension().id(&*host).map(str::to_owned).as_deref() == Some("minecraft:overworld");
+        level.dimension().id(&*host).as_deref() == Some("minecraft:overworld");
     let Some(day_time) = level.day_time(&*host) else {
         return;
     };
@@ -282,10 +282,10 @@ fn tick_clock(host: &mut dyn ClientHost, pos: [i32; 3], turning: bool) {
 /// The redstone blocks' renderers, on the kinetic block entity type.
 struct RedstoneEntity;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for RedstoneEntity {}
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockEntityPart for RedstoneEntity {
     fn block_entity_client_ticks(
         &self,
@@ -300,7 +300,8 @@ impl BlockEntityPart for RedstoneEntity {
         }
     }
 
-    fn block_entity_client_tick(&self, event: &mut mod_api::BlockEntityClientTickEvent<'_>) {
+    fn block_entity_client_tick(&self, host: &mut dyn mod_api::ClientHost, event: &mut mod_api::BlockEntityClientTickEvent<'_>) {
+        let event = &mut crate::glue::compat::ClientTick::new(host, &*event);
         let Some((state, pos, speed)) = event
             .subject
             .with_view(|v| (v.state(), v.position(), speed_of(v.nbt())))

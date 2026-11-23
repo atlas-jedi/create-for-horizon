@@ -25,8 +25,7 @@ use create_engine::kinetics::Dir;
 use mod_api::{
     BlockHit, BlockPart, BlockShapeKind, Command, CommandArgumentValue, CommandSource, Compound,
     Flow, Hand, Host, HostBlockStates, HostTransaction, Identifier, InteractionResult, ItemKey,
-    ItemStack, PlayerAction, PlayerActionSetup, Registrar, ServerHost, SetPlacedByEvent,
-    SoundSource, Tag, UseItemOnEvent,
+    ItemStack, PlayerAction, PlayerActionSetup, Registrar, ServerHost, SoundSource, Tag, UseItemOnEvent,
 };
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -136,7 +135,8 @@ pub(super) fn register(r: &mut dyn Registrar) {
     r.block_part(key(Block::ContraptionControls), MountedPart);
     let roller = key(Block::MechanicalRoller);
     r.block_part(roller, MountedPart);
-    r.block_part(roller, RollerPlacement);
+    let roller_item = r.item_key("create:mechanical_roller");
+    r.item_part(roller_item, RollerPlacement);
 }
 
 fn next_breaker() -> i32 {
@@ -288,7 +288,7 @@ fn take_storage(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Stored> {
         let mut out: Stored = Vec::with_capacity(size);
         for (i, slot) in view.iter().enumerate() {
             out.push(slot.as_ref().and_then(|(r, n)| {
-                let got = items.extract_at(host, tx, i, r, *n);
+                let got = items.extract(host, tx, i, r, *n);
                 r.to_stack(got)
             }));
         }
@@ -328,7 +328,7 @@ pub(crate) fn restore_storage(
                 };
                 let resource = mod_api::ItemResource::of(stack);
                 let n = stack.count();
-                let mut went = items.insert_at(host, tx, i, &resource, n);
+                let mut went = items.insert(host, tx, i, &resource, n);
                 if went < n {
                     went += items.insert(host, tx, &resource, n - went).unwrap_or(0);
                 }
@@ -2151,7 +2151,6 @@ fn apply(lv: &mut ServerLevel<'_>, key: [i32; 3], a: &Actor, e: Effect) -> Optio
                     SoundSource::Neutral,
                     0.25,
                     1.0,
-                    None,
                 );
             }
         }
@@ -3269,10 +3268,15 @@ pub(super) fn tick_mounted(lv: &mut ServerLevel<'_>) {
 /// including when a schematic places the roller without a player or block item.
 struct RollerPlacement;
 
-#[mod_api::sunrise_part]
-impl BlockPart for RollerPlacement {
-    fn set_placed_by(&self, host: &mut dyn ServerHost, event: &mut SetPlacedByEvent<'_>) {
-        let Some(dimension) = event.level.dimension().id(&*host).map(str::to_owned) else {
+#[mod_api::horizon_part]
+impl mod_api::ItemPart for RollerPlacement {
+    fn on_block_placed_by(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::OnBlockPlacedByEvent<'_>,
+    ) {
+        let event = &mut crate::glue::compat::SetPlacedByEvent::new(&*host, event);
+        let Some(dimension) = event.level.dimension().id(&*host) else {
             return;
         };
         if let Some(dim) = super::super::world::level_index(&dimension) {
@@ -3283,7 +3287,7 @@ impl BlockPart for RollerPlacement {
 
 struct MountedPart;
 
-#[mod_api::sunrise_part]
+#[mod_api::horizon_part]
 impl BlockPart for MountedPart {
     /// A click on contraption controls or a roller (`useWithoutItem`, `FilteringBehaviour`).
     /// Controls: on the filter slot the held item becomes the kind of actor it switches
@@ -3367,7 +3371,6 @@ fn use_mounted(
             SoundSource::Blocks,
             0.25,
             0.1,
-            None,
         );
         return Some(InteractionResult::Success);
     }
@@ -3422,7 +3425,6 @@ fn controls_status(
         SoundSource::Blocks,
         1.0,
         if on { 1.5 } else { 0.8 },
-        None,
     );
 }
 
@@ -3708,7 +3710,7 @@ pub(super) fn run_command(host: &mut dyn ServerHost, event: &mut CommandCall<'_>
         CommandSource::Player { player, .. } => Some(*player),
         _ => None,
     };
-    let Some(dimension) = cmd.dimension.id(&*host).map(str::to_owned) else {
+    let Some(dimension) = cmd.dimension.id(&*host) else {
         return Flow::Cancel;
     };
     let line = {
