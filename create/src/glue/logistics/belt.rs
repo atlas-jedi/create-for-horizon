@@ -1321,82 +1321,158 @@ pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
 
 /// Ground friction a walking entity's motion keeps each tick (a block's 0.6 times 0.91).
 const GROUND_FRICTION: f64 = 0.6 * 0.91;
+/// The drag an airborne entity's horizontal motion keeps each tick.
+const AIR_DRAG: f64 = 0.91;
 
-type BeltContact = ([i32; 3], belt::Segment);
-
-/// The legacy slope path looks first in the feet cell and below it, then at the footprint edge.
-fn legacy_belt_contact(
-    host: &dyn mod_api::Host,
-    level: mod_api::LevelRef,
-    entity: mod_api::EntityRef,
-    at: [i32; 3],
-) -> Option<BeltContact> {
-    let segment = |p| client_segment(host, level, p);
-    let below = [at[0], at[1] - 1, at[2]];
-    // `entityInside` of the blocks its box is in (Create's `checkInsideBlocks` asks every block
-    // the box reaches, whatever its shape): off the end of a belt, the segment still under the
-    // box's edge carries it until it falls.
-    let under_box = || {
-        let [lo, hi] = entity.bounding_box(host)?;
-        let (x0, x1) = (
-            (lo[0] + 1.0e-7).floor() as i32,
-            (hi[0] - 1.0e-7).floor() as i32,
-        );
-        let (z0, z1) = (
-            (lo[2] + 1.0e-7).floor() as i32,
-            (hi[2] - 1.0e-7).floor() as i32,
-        );
-        (x0..=x1)
-            .flat_map(|x| (z0..=z1).map(move |z| [x, at[1], z]))
-            .find_map(|p| segment(p).map(|s| (p, s)))
-    };
-    segment(at)
-        .map(|s| (at, s))
-        .or_else(|| segment(below).map(|s| (below, s)))
-        .or_else(under_box)
+/// `BeltMovementHandler.TransportedEntityInfo` of the window's own player: the belt segment it
+/// last touched (`lastCollidedPos`, `lastCollidedState`), the ticks since
+/// (`ticksSinceLastCollision`), and the level it is in.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Rider {
+    level: Option<mod_api::LevelRef>,
+    pos: [i32; 3],
+    seg: belt::Segment,
+    ticks: u8,
 }
 
-/// One contact owns the whole tick: prefer confirmed flat support, unless a separate belt in
-/// the feet cell owns the handoff. The footprint fallback never moves a player on a flat belt.
-fn player_belt_contact(
-    at: [i32; 3],
-    flat: Option<BeltContact>,
-    belt_in_feet_cell: bool,
-    legacy: impl FnOnce() -> Option<BeltContact>,
-) -> Option<BeltContact> {
-    flat.filter(|(pos, _)| *pos == at || !belt_in_feet_cell)
-        .or_else(|| legacy().filter(|(_, seg)| seg.slope != belt::Slope::Horizontal))
+thread_local! {
+    /// The local player as a belt's passenger (`BeltBlockEntity.passengers`), on its client.
+    static RIDER: std::cell::Cell<Option<Rider>> = const { std::cell::Cell::new(None) };
+}
+
+/// The client left its world: the player rides nothing.
+pub fn forget_local_rider() {
+    RIDER.set(None);
+}
+
+/// `BeltBlock.entityInside` for the local player at the belt segment `seg` at `pos`, its feet in
+/// `feet_cell`: a belt that moves things takes it as a passenger, or refreshes it, which only
+/// the first touch of a tick does unless the segment holds the feet (`ticksSinceLastCollision
+/// != 0 || pos.equals(blockPosition())`).
+fn touch(
+    rider: &mut Option<Rider>,
+    level: Option<mod_api::LevelRef>,
+    pos: [i32; 3],
+    seg: belt::Segment,
+    feet_cell: [i32; 3],
+) {
+    if !seg.transports() {
+        return;
+    }
+    let fresh = Rider {
+        level,
+        pos,
+        seg,
+        ticks: 0,
+    };
+    match rider {
+        Some(r) if r.level == level => {
+            if r.ticks != 0 || pos == feet_cell {
+                *r = fresh;
+            }
+        }
+        _ => *rider = Some(fresh),
+    }
+}
+
+/// `BeltBlockEntity.tick`'s passenger step: a rider that has not touched the belt for more than
+/// one tick (three on a slope) has left it and is forgotten; else the tick is counted and the
+/// rider is carried by the segment it last touched.
+fn count_tick(rider: &mut Option<Rider>) -> Option<Rider> {
+    let r = rider.as_mut()?;
+    let limit = if r.seg.slope == belt::Slope::Horizontal {
+        1
+    } else {
+        3
+    };
+    if r.ticks > limit {
+        *rider = None;
+        return None;
+    }
+    r.ticks += 1;
+    Some(*r)
+}
+
+/// `Entity.checkInsideBlocks`: the blocks a box `[lo, hi]` is in, in the order Create's belts
+/// hear them (x, then y, then z), whatever their shapes.
+fn blocks_inside([lo, hi]: [[f64; 3]; 2]) -> Vec<[i32; 3]> {
+    let from = lo.map(|v| (v + 1.0e-7).floor() as i32);
+    let to = hi.map(|v| (v - 1.0e-7).floor() as i32);
+    let mut out = Vec::new();
+    for x in from[0]..=to[0] {
+        for y in from[1]..=to[1] {
+            for z in from[2]..=to[2] {
+                out.push([x, y, z]);
+            }
+        }
+    }
+    out
+}
+
+/// `Level.findSupportingBlock`'s choice: of the blocks holding the player up, the one whose
+/// centre is nearest its feet, the greatest (`BlockPos.compareTo`: y, then z, then x) on a tie.
+fn nearest_support(
+    feet: [f64; 3],
+    holding: impl IntoIterator<Item = [i32; 3]>,
+) -> Option<[i32; 3]> {
+    let order = |q: [i32; 3]| (q[1], q[2], q[0]);
+    let mut best: Option<([i32; 3], f64)> = None;
+    for p in holding {
+        let d = (0..3)
+            .map(|i| (f64::from(p[i]) + 0.5 - feet[i]).powi(2))
+            .sum::<f64>();
+        if best.is_none_or(|(b, bd)| d < bd || d == bd && order(b) < order(p)) {
+            best = Some((p, d));
+        }
+    }
+    best.map(|(p, _)| p)
+}
+
+/// The sliver under the feet of a box `[lo, hi]` (`Entity.checkSupportingBlock`).
+fn sliver_under([lo, hi]: [[f64; 3]; 2]) -> [f64; 6] {
+    [lo[0], lo[1] - 1.0e-6, lo[2], hi[0], lo[1], hi[2]]
+}
+
+/// `Entity.mainSupportingBlockPos` on the client, which Horizon doesn't expose: of the blocks
+/// whose collision meets the `sliver` under the player's feet, the one nearest its feet.
+fn supporting_block(
+    host: &dyn mod_api::Host,
+    feet: [f64; 3],
+    sliver: [f64; 6],
+) -> Option<[i32; 3]> {
+    let meets = |p: [i32; 3]| {
+        host.block_collision(p).iter().any(|b| {
+            (0..3).all(|i| {
+                let o = f64::from(p[i]);
+                b[i] + o < sliver[i + 3] && b[i + 3] + o > sliver[i]
+            })
+        })
+    };
+    // A shape reaches at most a block above its own (a slope's top, a fence).
+    let row = sliver[1].floor() as i32;
+    let cells = (sliver[0].floor() as i32..=sliver[3].floor() as i32).flat_map(|x| {
+        (sliver[2].floor() as i32..=sliver[5].floor() as i32)
+            .flat_map(move |z| [[x, row - 1, z], [x, row, z]])
+    });
+    nearest_support(feet, cells.filter(|p| meets(*p)))
 }
 
 /// Horizon: the push a tick (`ClientHost::push_player`) that carries the local player by the
 /// belt's motion `m` a tick. Create moves the player by `m` itself (`move(SELF, movement)`), on
-/// top of its own walking; Horizon's client can only add to its velocity. Ground friction keeps
-/// `GROUND_FRICTION` of that velocity each tick, so a push of `m` times `1 - GROUND_FRICTION`
-/// settles at moving `m` a tick within a few ticks, and the walking input, which adds to the
-/// same velocity, still moves the player on top of it. Never upward, which would lift it off
-/// the ground: up a slope the player steps up the belt's stairs as it is pushed along; down one
-/// it is pushed down at the belt's speed. A flat belt's motion has no height.
-fn belt_push(m: [f64; 3]) -> [f32; 3] {
-    let keep = 1.0 - GROUND_FRICTION;
+/// top of its own walking; Horizon's client can only add to its velocity. The tick's friction
+/// keeps part of that velocity (`GROUND_FRICTION` on a block, `AIR_DRAG` in the air), so a push
+/// of `m` times what it takes away holds the player at moving `m` a tick, and the walking input,
+/// which adds to the same velocity, still moves the player on top of it. Never upward, which
+/// would lift it off the ground: up a slope the player steps up the belt's stairs as it is
+/// pushed along; down one it is pushed down at the belt's speed. A flat belt's motion has no
+/// height.
+fn belt_push(m: [f64; 3], supported: bool) -> [f32; 3] {
+    let keep = 1.0 - if supported { GROUND_FRICTION } else { AIR_DRAG };
     [
         (m[0] * keep) as f32,
         (m[1].min(0.0) * keep) as f32,
         (m[2] * keep) as f32,
     ]
-}
-
-/// Keep the pre-existing sloped-belt push until the pin exposes footprint contact on slopes.
-fn push_on_slope(
-    host: &mut dyn mod_api::ClientHost,
-    level: mod_api::LevelRef,
-    feet: [f64; 3],
-    (pos, seg): BeltContact,
-) {
-    let rpm = super::super::kinetics::shown_speeds(&*host, level, pos)[0];
-    let Some(m) = belt::passenger_motion(&seg, pos, feet, rpm, false) else {
-        return;
-    };
-    host.push_player(belt_push(m));
 }
 
 fn client_segment(
@@ -1407,35 +1483,6 @@ fn client_segment(
     let id = states::id(level.block_state(host, pos)?)?;
     super::super::client_table(host, |table| table.get(id).and_then(|(_, info)| info.belt))
         .flatten()
-}
-
-/// A belt face at the player's exact foot-centre contact. A client cannot read its
-/// supporting block or receive the contact sweep; do not register overhangs or proximity.
-fn belt_support(
-    host: &dyn mod_api::Host,
-    level: mod_api::LevelRef,
-    feet: [f64; 3],
-) -> Option<BeltContact> {
-    let [x, y, z] = feet;
-    let hit = level.clip(
-        host,
-        [x, y + 1.0, z],
-        [x, y - 1.0, z],
-        mod_api::ClipBlock::Collider,
-        mod_api::ClipFluid::None,
-    )?;
-    // The feet rest on the face (a millionth of a block allowed for the engine's rounding):
-    // this is also the client's ground check, as Horizon's `on_ground` may be server-only.
-    if hit.miss
-        || hit.inside
-        || hit.world_border
-        || hit.face != BlockFace::Up
-        || (hit.location[1] - y).abs() > 1.0e-6
-    {
-        return None;
-    }
-    let segment = client_segment(host, level, hit.block)?;
-    (segment.slope == belt::Slope::Horizontal).then_some((hit.block, segment))
 }
 
 /// `BeltMovementHandler.shouldIgnoreBlocking`: a hanging entity, one pistons ignore, or one
@@ -1454,61 +1501,128 @@ fn ignores_blocking(
     Some(other.vehicle(host).is_some() && other.root_vehicle(host) == Some(me))
 }
 
-/// `BeltMovementHandler.transportEntity` for the local player after travel, before its position
-/// report. Use one contact for either the flat push or the legacy slope push. As in Create, the
-/// player's own client carries it (the server leaves players to it, `transport_passengers`).
+/// The belt contacts of the local player's move this tick, as Create's `BeltBlock` hears them:
+/// first `updateEntityAfterFallOn` of the block it stands on (`getOnPosLegacy`), when that is a
+/// belt (the segment at its feet, else the one below them: a slope's top reaches above its
+/// block), then `entityInside` of each block its box is in.
+fn touches(
+    host: &dyn mod_api::Host,
+    level: mod_api::LevelRef,
+    feet: [f64; 3],
+    bounds: [[f64; 3]; 2],
+    support: Option<[i32; 3]>,
+) -> Vec<([i32; 3], belt::Segment)> {
+    let segment = |p| client_segment(host, level, p).map(|s| (p, s));
+    let feet_cell = feet.map(|v| v.floor() as i32);
+    let below = [feet_cell[0], feet_cell[1] - 1, feet_cell[2]];
+    let fell_on = support
+        .map(|s| [s[0], (feet[1] - 0.2).floor() as i32, s[2]])
+        .and_then(segment)
+        .and_then(|_| segment(feet_cell).or_else(|| segment(below)));
+    fell_on
+        .into_iter()
+        .chain(blocks_inside(bounds).into_iter().filter_map(segment))
+        .collect()
+}
+
+/// `BeltMovementHandler.transportEntity` for the window's own player, after its move: as in
+/// Create, its own client carries it (the server leaves players to it, `transport_passengers`).
+/// The player becomes a passenger of the belt segments its move touched (`touches`, `touch`);
+/// the belt then carries it from the segment it last touched (`carry`), and goes on for a tick
+/// or two after it stops touching the belt (`count_tick`): off the end of a belt it is carried
+/// until its whole box is past the end, and over the edge.
 /// Horizon: Create moves the player by the belt's motion; here the belt pushes it each tick
-/// (`belt_push`), which settles at the same motion on top of its walking. Sideways only on a
-/// flat belt, and only while the feet rest on the belt's face, so a jump keeps its own height.
+/// (`belt_push`), which holds it at the same motion on top of its walking.
 pub fn carry_local_player(host: &mut dyn mod_api::ClientHost, player: PlayerRef) {
     if host.local_player() != Some(player) {
         return;
     }
     let e = player.entity();
-    let (Some(feet), Some(level)) = (e.position(&*host), player.level(&*host)) else {
-        return;
-    };
-    if player.abilities(&*host).is_some_and(|a| a.flying) {
-        return;
-    }
-    let at = feet.map(|v| v.floor() as i32);
-    // Horizon: `on_ground` may answer None on a client; the feet on the belt's face are then
-    // the ground check (`belt_support`).
-    let flat = (e.on_ground(&*host) != Some(false))
-        .then(|| belt_support(&*host, level, feet))
-        .flatten();
-    let belt_in_feet_cell = flat.is_some_and(|(pos, _)| pos != at)
-        && level
-            .block_state(&*host, at)
-            .is_some_and(|state| state.block() == states::key(create_engine::Block::Belt));
-    let Some(contact @ (pos, seg)) = player_belt_contact(at, flat, belt_in_feet_cell, || {
-        legacy_belt_contact(&*host, level, e, at)
-    }) else {
+    let (Some(feet), Some(level), Some(bounds)) = (
+        e.position(&*host),
+        player.level(&*host),
+        e.bounding_box(&*host),
+    ) else {
         return;
     };
     let boots = host
         .living(e)
         .and_then(|living| living.equipment(&*host, mod_api::EquipmentSlot::Feet));
-    if boots
+    // `canBeTransported`: alive, and not sneaking unless hidden in cardboard.
+    let alive = host
+        .living(e)
+        .and_then(|living| living.health(&*host))
+        .is_none_or(|health| health > 0.0);
+    let sneaking = e.is_shift_key_down(&*host) == Some(true);
+    if !alive || sneaking && !super::super::advancements::hiding_in_cardboard(&*host, player) {
+        RIDER.set(None);
+        return;
+    }
+    // `entityInside` leaves a player flying (or sneaking without cardboard boots) and one in
+    // diving boots alone.
+    let cardboard_boots = boots
         .as_ref()
-        .is_some_and(|s| super::super::equipment::wears_diving_boots(&*host, s))
-    {
+        .is_some_and(|s| s.item().name(&*host) == "create:cardboard_boots");
+    let diving_boots = boots
+        .as_ref()
+        .is_some_and(|s| super::super::equipment::wears_diving_boots(&*host, s));
+    let flying = player.abilities(&*host).is_some_and(|a| a.flying);
+    let hears = !flying && !(sneaking && !cardboard_boots) && !diving_boots;
+    // Held up by a block (the client's own ground check: Horizon's `on_ground` is the
+    // server's), and by which one.
+    let sliver = sliver_under(bounds);
+    let supported = level.has_collisions(&*host, sliver) == Some(true);
+    let support = supported
+        .then(|| supporting_block(&*host, feet, sliver))
+        .flatten();
+    let mut rider = RIDER.get();
+    if hears {
+        let feet_cell = feet.map(|v| v.floor() as i32);
+        for (pos, seg) in touches(&*host, level, feet, bounds, support) {
+            touch(&mut rider, Some(level), pos, seg, feet_cell);
+        }
+    }
+    carry(host, e, level, (feet, bounds), supported, hears, &mut rider);
+    RIDER.set(rider);
+}
+
+/// The belt's part of the local player's tick (`BeltBlockEntity.tick`, then `transportEntity`)
+/// for `rider`: the player's feet and box where its move left them, held up by a block or not
+/// (`supported`), hearing belts or not (`hears`).
+fn carry(
+    host: &mut dyn mod_api::ClientHost,
+    e: mod_api::EntityRef,
+    level: mod_api::LevelRef,
+    (feet, bounds): ([f64; 3], [[f64; 3]; 2]),
+    supported: bool,
+    hears: bool,
+    rider: &mut Option<Rider>,
+) {
+    let Some(r) = *rider else {
+        return;
+    };
+    // Its passengers go with the belt: another level, or the segment it last touched gone
+    // (broken, or no longer held by this client).
+    if r.level != Some(level) || client_segment(&*host, level, r.pos).is_none() {
+        *rider = None;
         return;
     }
-    if e.is_shift_key_down(&*host) == Some(true)
-        && (!boots.is_some_and(|s| s.item().name(&*host) == "create:cardboard_boots")
-            || !super::super::advancements::hiding_in_cardboard(&*host, player))
-    {
+    // A belt standing still ticks none of its passengers.
+    let rpm = super::super::kinetics::shown_speeds(&*host, level, r.pos)[0];
+    if rpm == 0.0 {
         return;
     }
-    if seg.slope != belt::Slope::Horizontal {
-        push_on_slope(host, level, feet, contact);
+    let Some(r) = count_tick(rider) else {
+        return;
+    };
+    // Don't fight other belts: another segment holds its feet.
+    let feet_cell = feet.map(|v| v.floor() as i32);
+    if feet_cell != r.pos && client_segment(&*host, level, feet_cell).is_some() {
         return;
     }
-    let rpm = super::super::kinetics::shown_speeds(&*host, level, pos)[0];
     let Some(motion) = belt::passenger_motion(
-        &seg,
-        pos,
+        &r.seg,
+        r.pos,
         feet,
         rpm,
         super::super::equipment::player_steering(),
@@ -1516,9 +1630,7 @@ pub fn carry_local_player(host: &mut dyn mod_api::ClientHost, player: PlayerRef)
         return;
     };
     if belt::movement_speed(rpm).abs() < 0.5 {
-        let Some([lo, hi]) = e.bounding_box(&*host) else {
-            return;
-        };
+        let [lo, hi] = bounds;
         let length = (motion[0] * motion[0] + motion[1] * motion[1] + motion[2] * motion[2]).sqrt();
         let ahead = motion.map(|v| v / length * 0.5);
         let from = std::array::from_fn(|i| lo[i] + ahead[i] + ahead[i].abs());
@@ -1530,79 +1642,158 @@ pub fn carry_local_player(host: &mut dyn mod_api::ClientHost, player: PlayerRef)
                 .map(|other| ignores_blocking(&*host, e, other).map(|ignored| !ignored))
                 .try_fold(false, |any, blocks| Some(any || blocks?))
         });
-        // Blocked, Create stops the player (`setDeltaMovement(0)`); Horizon's client can only
-        // add to its velocity, so the belt just stops pushing it. A body the client cannot
-        // read neither moves the player nor stops it.
+        // Blocked, Create stops the player (`setDeltaMovement(0)`) and keeps it on the belt
+        // (`ticksSinceLastCollision--`); Horizon's client can only add to its velocity, so the
+        // belt just stops pushing it. A body the client cannot read neither moves the player
+        // nor stops it.
         if blocked != Some(false) {
+            if blocked == Some(true)
+                && let Some(r) = rider.as_mut()
+            {
+                r.ticks -= 1;
+            }
             return;
         }
     }
-    // Create then sets it on the ground; the push leaves the player on the belt's face.
-    host.push_player(belt_push(motion));
+    host.push_player(belt_push(motion, supported));
+    // Create's `move(SELF, movement)` hears the blocks the moved box is in (`entityInside`):
+    // the player stays a passenger while its box is still over the belt.
+    if hears {
+        let moved = bounds.map(|c| std::array::from_fn(|i| c[i] + motion[i]));
+        let moved_cell: [i32; 3] = std::array::from_fn(|i| (feet[i] + motion[i]).floor() as i32);
+        for pos in blocks_inside(moved) {
+            if let Some(seg) = client_segment(&*host, level, pos) {
+                touch(rider, Some(level), pos, seg, moved_cell);
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    const FLAT: belt::Segment = belt::Segment {
+        facing: Dir::East,
+        slope: belt::Slope::Horizontal,
+        part: belt::Part::Middle,
+    };
+
     #[test]
-    fn adjacent_flat_and_sloped_belts_cannot_both_carry_a_player() {
-        let at = [0, 1, 0];
-        let horizontal = belt::Segment {
-            facing: Dir::East,
-            slope: belt::Slope::Horizontal,
-            part: belt::Part::Middle,
-        };
-        let flat = ([0, 0, 0], horizontal);
+    fn the_feet_segment_wins_a_tick_s_touches_and_others_only_refresh() {
         let slope = belt::Segment {
             slope: belt::Slope::Upward,
-            ..horizontal
+            ..FLAT
         };
-
-        // A slope crossing the footprint's edge must not add a push to confirmed flat carry.
-        assert_eq!(
-            player_belt_contact(at, Some(flat), false, || panic!(
-                "flat already owns the tick"
-            )),
-            Some(flat),
-        );
-        // When the slope enters the feet cell it takes over, with no SELF move from below it.
-        assert_eq!(
-            player_belt_contact(at, Some(flat), true, || Some((at, slope))),
-            Some((at, slope)),
-        );
-        // Keep the legacy slope fallback, but never use its coarse footprint to carry on a flat.
-        assert_eq!(
-            player_belt_contact(at, None, false, || Some(([1, 1, 0], slope))),
-            Some(([1, 1, 0], slope)),
-        );
-        assert_eq!(player_belt_contact(at, None, false, || Some(flat)), None);
+        let feet_cell = [0, 64, 0];
+        let mut rider = None;
+        // The first touch takes the player on.
+        touch(&mut rider, None, [1, 64, 0], FLAT, feet_cell);
+        assert_eq!(rider.map(|r| (r.pos, r.ticks)), Some(([1, 64, 0], 0)));
+        // Later touches of the same tick move it only to the segment holding the feet.
+        touch(&mut rider, None, [-1, 64, 0], slope, feet_cell);
+        assert_eq!(rider.map(|r| r.pos), Some([1, 64, 0]));
+        touch(&mut rider, None, feet_cell, slope, feet_cell);
+        assert_eq!(rider.map(|r| (r.pos, r.seg)), Some((feet_cell, slope)));
+        // A tick later, any touch refreshes it.
+        let _ = count_tick(&mut rider);
+        touch(&mut rider, None, [1, 64, 0], FLAT, feet_cell);
+        assert_eq!(rider.map(|r| (r.pos, r.ticks)), Some(([1, 64, 0], 0)));
+        // Vertical and sideways belts carry nothing.
+        let mut none = None;
+        let vertical = belt::Segment {
+            slope: belt::Slope::Vertical,
+            ..FLAT
+        };
+        touch(&mut none, None, feet_cell, vertical, feet_cell);
+        assert_eq!(none, None);
     }
 
     #[test]
-    fn a_belt_push_settles_at_the_belts_motion_on_top_of_walking() {
-        let belt_motion = [0.2, 0.0, -0.1];
-        let push = belt_push(belt_motion);
-        // A flat belt never pushes up or down, so a jump keeps its own height.
-        assert_eq!(push[1], 0.0);
-        // The client's ground travel each tick: the walking input adds to the velocity, the
-        // player moves by it, friction keeps part of it; then the belt's push after travel.
-        let walk = 0.1;
-        let mut velocity = [0.0f64; 3];
-        let mut moved = [0.0f64; 3];
-        for _ in 0..60 {
-            velocity[0] += walk;
-            moved = velocity;
-            velocity = velocity.map(|v| v * GROUND_FRICTION);
-            for axis in [0, 2] {
-                velocity[axis] += f64::from(push[axis]);
+    fn a_touch_carries_a_rider_two_ticks_on_a_flat_belt_and_four_on_a_slope() {
+        let carried = |seg| {
+            let mut rider = None;
+            touch(&mut rider, None, [0, 64, 0], seg, [0, 64, 0]);
+            let mut ticks = 0;
+            while count_tick(&mut rider).is_some() {
+                ticks += 1;
             }
+            ticks
+        };
+        assert_eq!(carried(FLAT), 2);
+        let slope = belt::Segment {
+            slope: belt::Slope::Downward,
+            ..FLAT
+        };
+        assert_eq!(carried(slope), 4);
+    }
+
+    #[test]
+    fn the_box_is_in_every_block_it_reaches() {
+        // A player's box half over the end of a belt at y 64 (feet on its 13/16 top).
+        let feet = [10.2, 64.8125, 0.5];
+        let bounds = [
+            [feet[0] - 0.3, feet[1], feet[2] - 0.3],
+            [feet[0] + 0.3, feet[1] + 1.8, feet[2] + 0.3],
+        ];
+        assert_eq!(
+            blocks_inside(bounds),
+            vec![
+                [9, 64, 0],
+                [9, 65, 0],
+                [9, 66, 0],
+                [10, 64, 0],
+                [10, 65, 0],
+                [10, 66, 0]
+            ]
+        );
+        // Standing exactly on a block's top, the block below is not one it is in.
+        let on_top = [[0.2, 65.0, 0.2], [0.8, 66.8, 0.8]];
+        assert!(blocks_inside(on_top).iter().all(|p| p[1] >= 65));
+    }
+
+    #[test]
+    fn the_nearest_support_holds_the_player_up() {
+        let feet = [10.2, 64.8125, 0.5];
+        assert_eq!(nearest_support(feet, []), None);
+        assert_eq!(
+            nearest_support(feet, [[9, 64, 0], [10, 64, 0]]),
+            Some([10, 64, 0])
+        );
+        // A tie goes to the greater position.
+        let middle = [10.0, 64.8125, 0.5];
+        assert_eq!(
+            nearest_support(middle, [[10, 64, 0], [9, 64, 0]]),
+            Some([10, 64, 0])
+        );
+    }
+
+    #[test]
+    fn a_belt_push_holds_the_belt_s_motion_on_the_ground_and_in_the_air() {
+        let belt_motion = [0.2, 0.0, -0.1];
+        // A flat belt never pushes up or down, so a jump keeps its own height.
+        assert_eq!(belt_push(belt_motion, true)[1], 0.0);
+        for (supported, drag) in [(true, GROUND_FRICTION), (false, AIR_DRAG)] {
+            let push = belt_push(belt_motion, supported);
+            // The client's travel each tick: the walking input adds to the velocity, the
+            // player moves by it, friction keeps part of it; then the belt's push after travel.
+            let walk = 0.1;
+            let mut velocity = [0.0f64; 3];
+            let mut moved = [0.0f64; 3];
+            for _ in 0..200 {
+                velocity[0] += walk;
+                moved = velocity;
+                velocity = velocity.map(|v| v * drag);
+                for axis in [0, 2] {
+                    velocity[axis] += f64::from(push[axis]);
+                }
+            }
+            let walking = walk / (1.0 - drag);
+            assert!((moved[0] - (walking + belt_motion[0])).abs() < 1.0e-6);
+            assert!((moved[2] - belt_motion[2]).abs() < 1.0e-6);
         }
-        let walking = walk / (1.0 - GROUND_FRICTION);
-        assert!((moved[0] - (walking + belt_motion[0])).abs() < 1.0e-6);
-        assert!((moved[2] - belt_motion[2]).abs() < 1.0e-6);
         // Down a slope it is pushed down; up one, never lifted.
-        assert!(belt_push([0.1, -0.1, 0.0])[1] < 0.0);
-        assert_eq!(belt_push([0.1, 0.13, 0.0])[1], 0.0);
+        assert!(belt_push([0.1, -0.1, 0.0], true)[1] < 0.0);
+        assert_eq!(belt_push([0.1, 0.13, 0.0], true)[1], 0.0);
     }
 }

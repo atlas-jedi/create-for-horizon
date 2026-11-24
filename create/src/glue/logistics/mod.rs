@@ -459,6 +459,7 @@ impl Subsystem for Logistics {
 
     fn client_reset(&self) {
         client::reset_logistics();
+        belt::forget_local_rider();
     }
 
     /// The belt partials, drawn with their texture scrolling, and the model naming the
