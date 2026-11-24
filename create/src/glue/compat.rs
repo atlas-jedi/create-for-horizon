@@ -478,9 +478,6 @@ pub mod ext {
     pub trait LocalPlayerExt {
         fn set_local_player_on_ground(&mut self, _on: bool) {}
         fn set_local_player_velocity(&mut self, _v: [f64; 3]) {}
-        fn move_local_player_by(&mut self, _by: [f64; 3]) -> Result<Option<[f64; 3]>, ()> {
-            Ok(None)
-        }
     }
 
     impl LocalPlayerExt for dyn ClientHost + '_ {}

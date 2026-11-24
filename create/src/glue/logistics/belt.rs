@@ -1267,7 +1267,7 @@ pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
             continue;
         };
         // Items land on the belt; players are carried by their own clients
-        // (`carry_local_player`), which move them.
+        // (`carry_local_player`), which push them.
         let kind = e
             .kind(&*lv.host)
             .map(|k| k.name(&*lv.host))
@@ -1368,6 +1368,23 @@ fn player_belt_contact(
         .or_else(|| legacy().filter(|(_, seg)| seg.slope != belt::Slope::Horizontal))
 }
 
+/// Horizon: the push a tick (`ClientHost::push_player`) that carries the local player by the
+/// belt's motion `m` a tick. Create moves the player by `m` itself (`move(SELF, movement)`), on
+/// top of its own walking; Horizon's client can only add to its velocity. Ground friction keeps
+/// `GROUND_FRICTION` of that velocity each tick, so a push of `m` times `1 - GROUND_FRICTION`
+/// settles at moving `m` a tick within a few ticks, and the walking input, which adds to the
+/// same velocity, still moves the player on top of it. Never upward, which would lift it off
+/// the ground: up a slope the player steps up the belt's stairs as it is pushed along; down one
+/// it is pushed down at the belt's speed. A flat belt's motion has no height.
+fn belt_push(m: [f64; 3]) -> [f32; 3] {
+    let keep = 1.0 - GROUND_FRICTION;
+    [
+        (m[0] * keep) as f32,
+        (m[1].min(0.0) * keep) as f32,
+        (m[2] * keep) as f32,
+    ]
+}
+
 /// Keep the pre-existing sloped-belt push until the pin exposes footprint contact on slopes.
 fn push_on_slope(
     host: &mut dyn mod_api::ClientHost,
@@ -1379,18 +1396,7 @@ fn push_on_slope(
     let Some(m) = belt::passenger_motion(&seg, pos, feet, rpm, false) else {
         return;
     };
-    let keep = 1.0 - GROUND_FRICTION;
-    // Up a slope the player steps up the belt's stairs as it is pushed along; down one it is
-    // pushed down at the belt's speed.
-    host.push_player([
-        (m[0] * keep) as f32,
-        if m[1] < 0.0 {
-            (m[1] * keep) as f32
-        } else {
-            0.0
-        },
-        (m[2] * keep) as f32,
-    ]);
+    host.push_player(belt_push(m));
 }
 
 fn client_segment(
@@ -1418,11 +1424,13 @@ fn belt_support(
         mod_api::ClipBlock::Collider,
         mod_api::ClipFluid::None,
     )?;
+    // The feet rest on the face (a millionth of a block allowed for the engine's rounding):
+    // this is also the client's ground check, as Horizon's `on_ground` may be server-only.
     if hit.miss
         || hit.inside
         || hit.world_border
         || hit.face != BlockFace::Up
-        || hit.location[1] != y
+        || (hit.location[1] - y).abs() > 1.0e-6
     {
         return None;
     }
@@ -1447,7 +1455,11 @@ fn ignores_blocking(
 }
 
 /// `BeltMovementHandler.transportEntity` for the local player after travel, before its position
-/// report. Use one contact for either flat SELF movement or the legacy slope push.
+/// report. Use one contact for either the flat push or the legacy slope push. As in Create, the
+/// player's own client carries it (the server leaves players to it, `transport_passengers`).
+/// Horizon: Create moves the player by the belt's motion; here the belt pushes it each tick
+/// (`belt_push`), which settles at the same motion on top of its walking. Sideways only on a
+/// flat belt, and only while the feet rest on the belt's face, so a jump keeps its own height.
 pub fn carry_local_player(host: &mut dyn mod_api::ClientHost, player: PlayerRef) {
     if host.local_player() != Some(player) {
         return;
@@ -1460,7 +1472,9 @@ pub fn carry_local_player(host: &mut dyn mod_api::ClientHost, player: PlayerRef)
         return;
     }
     let at = feet.map(|v| v.floor() as i32);
-    let flat = (e.on_ground(&*host) == Some(true))
+    // Horizon: `on_ground` may answer None on a client; the feet on the belt's face are then
+    // the ground check (`belt_support`).
+    let flat = (e.on_ground(&*host) != Some(false))
         .then(|| belt_support(&*host, level, feet))
         .flatten();
     let belt_in_feet_cell = flat.is_some_and(|(pos, _)| pos != at)
@@ -1516,24 +1530,15 @@ pub fn carry_local_player(host: &mut dyn mod_api::ClientHost, player: PlayerRef)
                 .map(|other| ignores_blocking(&*host, e, other).map(|ignored| !ignored))
                 .try_fold(false, |any, blocks| Some(any || blocks?))
         });
-        match blocked {
-            // A body the client cannot read: neither move the player nor stop it.
-            None => return,
-            Some(true) => {
-                host.set_local_player_velocity([0.0; 3]);
-                return;
-            }
-            Some(false) => {}
+        // Blocked, Create stops the player (`setDeltaMovement(0)`); Horizon's client can only
+        // add to its velocity, so the belt just stops pushing it. A body the client cannot
+        // read neither moves the player nor stops it.
+        if blocked != Some(false) {
+            return;
         }
     }
-    if !matches!(host.move_local_player_by(motion), Ok(Some(_))) {
-        return;
-    }
-    if e.position(&*host)
-        .is_some_and(|after| belt_support(&*host, level, after).is_some())
-    {
-        host.set_local_player_on_ground(true);
-    }
+    // Create then sets it on the ground; the push leaves the player on the belt's face.
+    host.push_player(belt_push(motion));
 }
 
 #[cfg(test)]
@@ -1572,5 +1577,32 @@ mod tests {
             Some(([1, 1, 0], slope)),
         );
         assert_eq!(player_belt_contact(at, None, false, || Some(flat)), None);
+    }
+
+    #[test]
+    fn a_belt_push_settles_at_the_belts_motion_on_top_of_walking() {
+        let belt_motion = [0.2, 0.0, -0.1];
+        let push = belt_push(belt_motion);
+        // A flat belt never pushes up or down, so a jump keeps its own height.
+        assert_eq!(push[1], 0.0);
+        // The client's ground travel each tick: the walking input adds to the velocity, the
+        // player moves by it, friction keeps part of it; then the belt's push after travel.
+        let walk = 0.1;
+        let mut velocity = [0.0f64; 3];
+        let mut moved = [0.0f64; 3];
+        for _ in 0..60 {
+            velocity[0] += walk;
+            moved = velocity;
+            velocity = velocity.map(|v| v * GROUND_FRICTION);
+            for axis in [0, 2] {
+                velocity[axis] += f64::from(push[axis]);
+            }
+        }
+        let walking = walk / (1.0 - GROUND_FRICTION);
+        assert!((moved[0] - (walking + belt_motion[0])).abs() < 1.0e-6);
+        assert!((moved[2] - belt_motion[2]).abs() < 1.0e-6);
+        // Down a slope it is pushed down; up one, never lifted.
+        assert!(belt_push([0.1, -0.1, 0.0])[1] < 0.0);
+        assert_eq!(belt_push([0.1, 0.13, 0.0])[1], 0.0);
     }
 }
