@@ -14,6 +14,30 @@
   <a href="https://playsunrise.net"><img src="https://img.shields.io/badge/runs%20on-Sunrise%20(Minecraft%2026.3)-F0795A" alt="Runs on Sunrise, Minecraft 26.3"></a>
 </p>
 
+> [!IMPORTANT]
+> **This is a fork that runs Create on [Horizon](https://github.com/horizon-rust/horizon).** It is
+> [OlaHulleberg/create-sunrise](https://github.com/OlaHulleberg/create-sunrise), built for Sunrise, adapted to
+> Horizon's mod SDK (`horizon-mod-api`, Horizon Nightly `f1bb66f`, Minecraft 26.3). All the porting work is Ola's;
+> this branch only swaps the SDK and adapts the glue. Create's engine (`create/src/engine`) is unchanged.
+>
+> **What works on Horizon:** Create's blocks and items, kinetics (shafts, cogs, water wheels), belts and depots,
+> pressing, milling, mixing, fans, crafters, deployers and saws, played in a creative world on Windows.
+> **What is off:** what needs API Horizon lacks, such as the filter, toolbox and schematic screens, contraption
+> collision and some animations. The full list: **[create/HORIZON_GAPS.md](create/HORIZON_GAPS.md)**.
+>
+> **Install on Horizon** (Rust and the [Horizon launcher](https://playhorizon.dev) installed):
+>
+> ```sh
+> git clone -b horizon https://github.com/atlas-jedi/create-for-horizon
+> cd create-for-horizon/create
+> horizon-launcher native-build . --instance "My Instance" --trust-native-code
+> ```
+>
+> The launcher compiles the mod against your instance's Horizon and downloads Create's official jar for its
+> textures, models and sounds. Try it in a new world first. Issues about running on Horizon belong
+> [here](https://github.com/atlas-jedi/create-for-horizon/issues), not upstream. The rest of this README is
+> upstream's and talks about Sunrise.
+
 # Create for Sunrise
 
 **[Create](https://github.com/Creators-of-Create/Create) 6.0.11, ported to native Rust.** A native mod for

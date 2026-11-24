@@ -235,7 +235,7 @@ fn kept_asset(path: &str) -> bool {
 
 /// The mod folder's (`create/`) files that make up its crate, besides `src/`, `data/` and
 /// `assets/`.
-const CRATE_FILES: &[&str] = &["sunrise-mod.toml", "Cargo.toml", "LICENSE", "NOTICE.md"];
+const CRATE_FILES: &[&str] = &["horizon-mod.toml", "Cargo.toml", "LICENSE", "NOTICE.md"];
 
 /// How Horizon moves Create's particles that the glue spawns by name. Create's particle files
 /// (`assets/create/particles/*.json`, its sprite lists) are All Rights Reserved: they come from
@@ -258,7 +258,7 @@ fn particle_behaviour(path: &str) -> Option<Value> {
     }
 }
 
-/// Whether the sources are exactly the jar `create/sunrise-mod.toml` names, which the launcher
+/// Whether the sources are exactly the jar `create/horizon-mod.toml` names, which the launcher
 /// layers under the mod: then what would be copied from it unchanged is left to that layer.
 fn layered(sources: &[PathBuf]) -> Result<bool, String> {
     let [source] = sources else {
@@ -270,7 +270,7 @@ fn layered(sources: &[PathBuf]) -> Result<bool, String> {
     let hash = crate::jar::sha512_of(source).map_err(|e| format!("{}: {e}", source.display()))?;
     if hash != crate::jar::CREATE.sha512 {
         eprintln!(
-            "{}: not the jar create/sunrise-mod.toml names (Create {}, {}); copying all of it",
+            "{}: not the jar create/horizon-mod.toml names (Create {}, {}); copying all of it",
             source.display(),
             crate::jar::CREATE.version,
             crate::jar::CREATE.file
