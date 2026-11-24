@@ -124,7 +124,10 @@ impl bc::Ground for Sight<'_> {
     }
 
     fn shaft(&self, pos: [i32; 3]) -> Option<Axis> {
-        let id = self.level.block_state(self.host, pos).and_then(states::id)?;
+        let id = self
+            .level
+            .block_state(self.host, pos)
+            .and_then(states::id)?;
         super::super::client_table(self.host, |t| match t.get(id) {
             Some((Block::Shaft, info)) => info.axis,
             _ => None,
