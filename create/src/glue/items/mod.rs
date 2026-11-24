@@ -260,6 +260,7 @@ impl Subsystem for Items {
     fn register(&self, r: &mut dyn Registrar, _cx: &RegistrationContext) {
         symmetry::register(r);
         let _ = sandpaper::ITEM_PARTICLE.set(r.particle_key("minecraft:item"));
+        belt_connector::register(r);
         let keys: Vec<ItemKey> = IDS.iter().map(|id| r.item_key(id)).collect();
         let _ = KEYS.set(keys);
         let Some(k) = KEYS.get() else {
@@ -383,6 +384,7 @@ impl Subsystem for Items {
 
     fn client_tick(&self, host: &mut dyn ClientHost) {
         symmetry::tick(host);
+        belt_connector::tick(host);
         symmetry_screen::tick(host);
         worldshaper::tick(&*host);
         worldshaper_screen::tick(host);
