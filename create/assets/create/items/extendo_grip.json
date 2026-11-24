@@ -1,0 +1,9 @@
+{
+  "model": {
+    "type": "minecraft:special",
+    "base": "create:item/extendo_grip",
+    "model": {
+      "type": "create:extendo_grip"
+    }
+  }
+}

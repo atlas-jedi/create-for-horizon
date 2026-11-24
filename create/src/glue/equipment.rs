@@ -526,8 +526,10 @@ impl Subsystem for Equipment {
         }
     }
 
-    // Horizon: special model renderers answer resource models, not baked geometry; the
-    // grip's posed model is off (see HORIZON_GAPS.md).
+    /// `ExtendoGripItemRenderer`, at rest: Horizon's special models answer posed resource models.
+    fn special_model_renderers(&self, renderers: &mut dyn mod_api::SpecialModelRenderers) {
+        renderers.register("create:extendo_grip".to_owned(), std::sync::Arc::new(GripRest));
+    }
 
     /// `ClientEvents.getFogDensity`: under water a diving helmet sees 6.25 times as far; in lava
     /// the netherite one sees 20 blocks.
@@ -1456,6 +1458,74 @@ fn grip_pose(
     }));
 }
 
+/// `ExtendoGripItemRenderer.render`'s models for one pose: `animation` (before it is cubed),
+/// the cog's turn `cog` and the hand. Each is a model id and its 3×4 transform from the item's
+/// corner, the shape Horizon's special model answer takes.
+fn grip_parts(animation: f32, cog: f32, hand: &str) -> Vec<(String, [f32; 12])> {
+    const ROT: [f32; 3] = [0.0, 0.5, 0.5];
+    const BACK: [f32; 3] = [0.0, -0.5, -0.5];
+    let item = |m: &str| format!("create:item/extendo_grip/{m}");
+    let animation: f32 = animation.powi(3);
+    let extension = 24.0 + (156.0 - 24.0) * animation;
+    let half = extension / 2.0;
+    let opposite = 180.0 - extension;
+    let mut parts = vec![Pose::IDENTITY.part(&item("item"))];
+    let base = Pose::IDENTITY
+        .translate([0.0, 1.0 / 16.0, -7.0 / 16.0])
+        .scale([1.0, 1.0, 1.0 + animation]);
+    // One scissor arm.
+    let mut ms = base.rotate(0, -half).translate(ROT);
+    parts.push(ms.part(&item("thin_short")));
+    ms = ms.translate(BACK).translate([0.0, 5.5 / 16.0, 0.0]);
+    ms = ms.rotate(0, -opposite).translate(ROT);
+    parts.push(ms.part(&item("wide_long")));
+    ms = ms.translate(BACK).translate([0.0, 11.0 / 16.0, 0.0]);
+    ms = ms.rotate(0, opposite).translate(ROT);
+    ms = ms.translate([0.0, 0.5 / 16.0, 0.0]);
+    parts.push(ms.part(&item("thin_short")));
+    // The other, and the hand at its end.
+    let mut ms = base.rotate(0, -180.0 + half).translate(ROT);
+    parts.push(ms.part(&item("wide_short")));
+    ms = ms.translate(BACK).translate([0.0, 5.5 / 16.0, 0.0]);
+    ms = ms.rotate(0, opposite).translate(ROT);
+    parts.push(ms.part(&item("thin_long")));
+    ms = ms.translate(BACK).translate([0.0, 11.0 / 16.0, 0.0]);
+    ms = ms.rotate(0, -opposite).translate(ROT);
+    ms = ms.translate([0.0, 0.5 / 16.0, 0.0]);
+    parts.push(ms.part(&item("wide_short")));
+    ms = ms.translate(BACK).translate([0.0, 5.5 / 16.0, 0.0]);
+    ms = ms.rotate(0, 180.0 - half).rotate(1, 180.0);
+    ms = ms.translate([0.0, 0.0, -4.0 / 16.0]);
+    ms = ms.scale([1.0, 1.0, 1.0 / (1.0 + animation)]);
+    parts.push(ms.part(&format!("create:block/deployer/hand_{hand}")));
+    // The cog, turned about its middle (`COG_ROTATION_OFFSET`).
+    let cog_pose = Pose::IDENTITY
+        .translate([0.0, 1.0 / 16.0, 0.0])
+        .rotate(2, cog)
+        .translate([0.0, -1.0 / 16.0, 0.0]);
+    parts.push(cog_pose.part(&item("cog")));
+    parts
+}
+
+/// The grip's special model on Horizon: the parts at rest (`animation` .25, the cog unturned,
+/// the hand pointing). Horizon asks a special model once per stack, not per frame, so the swing
+/// and the turning cog aren't drawn.
+struct GripRest;
+
+impl mod_api::SpecialModelRenderer for GripRest {
+    fn extract(
+        &self,
+        _host: &dyn mod_api::ClientHost,
+        _stack: &ItemStack,
+        _config: &mod_api::Tag,
+    ) -> Result<Vec<mod_api::SpecialModelPart>, String> {
+        Ok(grip_parts(0.25, 0.0, "pointing")
+            .into_iter()
+            .map(|(model, pose)| mod_api::SpecialModelPart::new(model).with_transform(pose))
+            .collect())
+    }
+}
+
 #[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
 impl GripModel {
     /// `ExtendoGripItemRenderer.render` for the pose its node names: `animation` (before it is
@@ -1464,51 +1534,12 @@ impl GripModel {
         config: mod_api::serde_json::Value,
         bake: &dyn mod_api::SpecialModelBakeContext,
     ) -> Result<GripModel, String> {
-        const ROT: [f32; 3] = [0.0, 0.5, 0.5];
-        const BACK: [f32; 3] = [0.0, -0.5, -0.5];
-        let item = |m: &str| format!("create:item/extendo_grip/{m}");
         let number = |key: &str| config[key].as_f64().map(|v| v as f32);
-        let animation: f32 = number("animation").unwrap_or(0.25).powi(3);
-        let cog = number("cog").unwrap_or(0.0);
-        let hand = config["hand"].as_str().unwrap_or("pointing");
-        let extension = 24.0 + (156.0 - 24.0) * animation;
-        let half = extension / 2.0;
-        let opposite = 180.0 - extension;
-        let mut parts = vec![Pose::IDENTITY.part(&item("item"))];
-        let base = Pose::IDENTITY
-            .translate([0.0, 1.0 / 16.0, -7.0 / 16.0])
-            .scale([1.0, 1.0, 1.0 + animation]);
-        // One scissor arm.
-        let mut ms = base.rotate(0, -half).translate(ROT);
-        parts.push(ms.part(&item("thin_short")));
-        ms = ms.translate(BACK).translate([0.0, 5.5 / 16.0, 0.0]);
-        ms = ms.rotate(0, -opposite).translate(ROT);
-        parts.push(ms.part(&item("wide_long")));
-        ms = ms.translate(BACK).translate([0.0, 11.0 / 16.0, 0.0]);
-        ms = ms.rotate(0, opposite).translate(ROT);
-        ms = ms.translate([0.0, 0.5 / 16.0, 0.0]);
-        parts.push(ms.part(&item("thin_short")));
-        // The other, and the hand at its end.
-        let mut ms = base.rotate(0, -180.0 + half).translate(ROT);
-        parts.push(ms.part(&item("wide_short")));
-        ms = ms.translate(BACK).translate([0.0, 5.5 / 16.0, 0.0]);
-        ms = ms.rotate(0, opposite).translate(ROT);
-        parts.push(ms.part(&item("thin_long")));
-        ms = ms.translate(BACK).translate([0.0, 11.0 / 16.0, 0.0]);
-        ms = ms.rotate(0, -opposite).translate(ROT);
-        ms = ms.translate([0.0, 0.5 / 16.0, 0.0]);
-        parts.push(ms.part(&item("wide_short")));
-        ms = ms.translate(BACK).translate([0.0, 5.5 / 16.0, 0.0]);
-        ms = ms.rotate(0, 180.0 - half).rotate(1, 180.0);
-        ms = ms.translate([0.0, 0.0, -4.0 / 16.0]);
-        ms = ms.scale([1.0, 1.0, 1.0 / (1.0 + animation)]);
-        parts.push(ms.part(&format!("create:block/deployer/hand_{hand}")));
-        // The cog, turned about its middle (`COG_ROTATION_OFFSET`).
-        let cog_pose = Pose::IDENTITY
-            .translate([0.0, 1.0 / 16.0, 0.0])
-            .rotate(2, cog)
-            .translate([0.0, -1.0 / 16.0, 0.0]);
-        parts.push(cog_pose.part(&item("cog")));
+        let parts = grip_parts(
+            number("animation").unwrap_or(0.25),
+            number("cog").unwrap_or(0.0),
+            config["hand"].as_str().unwrap_or("pointing"),
+        );
         let parts = parts
             .into_iter()
             .map(|(model, pose)| Ok((bake.bake_model(&model)?, pose)))

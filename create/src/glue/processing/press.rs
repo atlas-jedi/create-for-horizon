@@ -241,13 +241,54 @@ pub(crate) fn tick_press(lv: &mut ServerLevel<'_>, at: [i32; 3]) {
     if !recipes::ready() {
         return;
     }
-    match with_world(|w| w.tick_press(dim, at)).flatten() {
+    let tick = with_world(|w| w.tick_press(dim, at)).flatten();
+    if matches!(tick, Some((_, Tick::Down))) {
+        activation_sound(lv, at);
+    }
+    match tick {
         Some((Mode::World, Tick::Down)) => press_in_world(lv, at),
         Some((Mode::Basin, Tick::Down)) => super::basin::compact_in_basin(lv, at),
         Some((Mode::Basin, Tick::Done)) => {
             with_world(|w| w.dims[dim].mixer_checks.push(at));
         }
         _ => {}
+    }
+}
+
+/// `PressingBehaviour.tick` at the head's lowest point: `AllSoundEvents`
+/// `MECHANICAL_PRESS_ACTIVATION_ON_BELT` over a belt (a wool-sounding block two below),
+/// else `MECHANICAL_PRESS_ACTIVATION` at volume .5 and pitch `.75 + |speed| / 1024`. Both are
+/// Create's compounds of vanilla sounds (`playExisting`; the jar's `sounds.json` names them:
+/// anvil land or wool hit, then item break), played here as those vanilla sounds so they need
+/// nothing from Create's jar.
+fn activation_sound(lv: &mut ServerLevel<'_>, at: [i32; 3]) {
+    let below = [at[0], at[1] - 2, at[2]];
+    let id = lv.block(below);
+    let on_belt = with_world(|w| w.table.get(id).map(|(b, _)| b))
+        .flatten()
+        .is_some_and(|b| b == create_engine::Block::Belt);
+    let sounds: &[(&str, f32, f32)] = if on_belt {
+        &[
+            ("minecraft:block.wool.hit", 0.75, 1.0),
+            ("minecraft:entity.item.break", 0.15, 0.75),
+        ]
+    } else {
+        let pitch = 0.75 + lv.speed(at).abs() / 1024.0;
+        &[
+            ("minecraft:block.anvil.land", 0.5 * 0.125, pitch),
+            ("minecraft:entity.item.break", 0.5 * 0.5, pitch),
+        ]
+    };
+    let centre = at.map(|v| f64::from(v) + 0.5);
+    for &(sound, volume, pitch) in sounds {
+        lv.level.play_sound(
+            &mut *lv.host,
+            sound,
+            centre,
+            mod_api::SoundSource::Blocks,
+            volume,
+            pitch,
+        );
     }
 }
 

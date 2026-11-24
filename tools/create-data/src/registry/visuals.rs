@@ -28,6 +28,64 @@ pub(crate) fn spinner_definition(item: &str) -> Value {
     } })
 }
 
+/// Item definitions the port writes by hand for items Create draws with a custom renderer or a
+/// swapped model, each naming only original model ids (checked against the jar):
+/// - goggles: `GogglesModel` draws `create:block/goggles` on the head, the flat item elsewhere;
+/// - wand of symmetry: `SymmetryWandItemRenderer`'s parts, standing still;
+/// - extendo grip: the glue's `create:extendo_grip` special model (its parts at rest).
+pub(crate) const PORT_ITEM_DEFINITIONS: [(&str, &[&str]); 3] = [
+    ("goggles", &["item/goggles", "block/goggles"]),
+    (
+        "wand_of_symmetry",
+        &[
+            "item/wand_of_symmetry/item",
+            "item/wand_of_symmetry/core",
+            "item/wand_of_symmetry/core_glow",
+            "item/wand_of_symmetry/bits",
+        ],
+    ),
+    (
+        "extendo_grip",
+        &[
+            "item/extendo_grip",
+            "item/extendo_grip/item",
+            "item/extendo_grip/cog",
+            "item/extendo_grip/thin_short",
+            "item/extendo_grip/wide_short",
+            "item/extendo_grip/thin_long",
+            "item/extendo_grip/wide_long",
+            "block/deployer/hand_pointing",
+        ],
+    ),
+];
+
+/// The definition of one of [`PORT_ITEM_DEFINITIONS`].
+pub(crate) fn port_item_definition(item: &str) -> Value {
+    let model = |m: &str| json!({ "type": "minecraft:model", "model": format!("create:{m}") });
+    let inner = match item {
+        "goggles" => json!({
+            "type": "minecraft:select",
+            "property": "minecraft:display_context",
+            "cases": [{ "when": "head", "model": model("block/goggles") }],
+            "fallback": model("item/goggles"),
+        }),
+        "wand_of_symmetry" => {
+            let parts: Vec<Value> = ["item", "core", "core_glow", "bits"]
+                .iter()
+                .map(|p| model(&format!("item/wand_of_symmetry/{p}")))
+                .collect();
+            json!({ "type": "minecraft:composite", "models": parts })
+        }
+        "extendo_grip" => json!({
+            "type": "minecraft:special",
+            "base": "create:item/extendo_grip",
+            "model": { "type": "create:extendo_grip" },
+        }),
+        other => unreachable!("no port item definition for {other}"),
+    };
+    json!({ "model": inner })
+}
+
 /// The asset paths this generator owns, including obsolete generated frames.
 pub(super) fn owns(path: &str) -> bool {
     matches!(path, BLOCK_ATLAS | SHADER)
@@ -66,6 +124,18 @@ pub(super) fn assets(contains: impl Fn(&str) -> bool) -> Result<BTreeMap<String,
         out.insert(
             format!("assets/create/items/{item}.json"),
             crate::pretty(&spinner_definition(item)),
+        );
+    }
+    for (item, models) in PORT_ITEM_DEFINITIONS {
+        for m in models {
+            let target = format!("assets/create/models/{m}.json");
+            if !contains(&target) {
+                return Err(format!("{target}: missing {item} model in the pinned jar"));
+            }
+        }
+        out.insert(
+            format!("assets/create/items/{item}.json"),
+            crate::pretty(&port_item_definition(item)),
         );
     }
     let mut sources = Vec::new();

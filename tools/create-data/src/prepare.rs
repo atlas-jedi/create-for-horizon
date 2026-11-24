@@ -74,39 +74,11 @@ fn custom_rendered(name: &str) -> Option<Value> {
         // `SymmetryWandItemRenderer`: CORE, CORE_GLOW, BITS.
         "wand_of_symmetry" => &["item", "core", "core_glow", "bits"],
         // `ExtendoGripItemRenderer`: its arms, hand and cog posed by the mod's special model
-        // renderer (`create:extendo_grip`, `glue/equipment.rs`).
-        // The glue's `create:extendo_grip_pose` node picks one by where it is drawn and the
-        // time (its per-stack callback): at rest away from a first-person hand, else as the swing
-        // left it; the cog turned to a 1/10 of its 45° repeat; the hand pointing, punching or
-        // holding.
-        "extendo_grip" => {
-            let special = |animation: f64, cog: f64, hand: &str| {
-                json!({
-                    "type": "minecraft:special",
-                    "base": "create:item/extendo_grip",
-                    "model": {
-                        "type": "create:extendo_grip",
-                        "animation": animation,
-                        "cog": cog,
-                        "hand": hand,
-                    },
-                })
-            };
-            let mut models = Map::new();
-            for c in 0..GRIP_COG_STEPS {
-                let cog = c as f64 * 45.0 / GRIP_COG_STEPS as f64;
-                models.insert(format!("rest_{c}"), special(0.25, cog, "pointing"));
-                for a in 0..GRIP_SWING_STEPS {
-                    let animation = a as f64 / (GRIP_SWING_STEPS - 1) as f64;
-                    for hand in ["punching", "holding"] {
-                        models.insert(
-                            format!("hand_{a}_{c}_{hand}"),
-                            special(animation, cog, hand),
-                        );
-                    }
-                }
-            }
-            return Some(json!({ "type": "create:extendo_grip_pose", "models": models }));
+        // renderer (`create:extendo_grip`, `glue/equipment.rs`). `GogglesModel`: the goggles'
+        // block model on the head. Horizon asks a special model once per stack: the glue's `create:extendo_grip` draws
+        // the grip's parts at rest (`registry::visuals::PORT_ITEM_DEFINITIONS`).
+        "extendo_grip" | "goggles" => {
+            return Some(crate::registry::visuals::port_item_definition(name)["model"].clone());
         }
         "cardboard_sword" => {
             return Some(json!({
@@ -306,11 +278,6 @@ fn layered(sources: &[PathBuf]) -> Result<bool, String> {
     }
     Ok(hash == crate::jar::CREATE.sha512)
 }
-
-/// The extendo grip's cog angles within its 45° repeat, and its swing's steps (the glue's
-/// `GRIP_COG_STEPS`, `GRIP_SWING_STEPS`).
-const GRIP_COG_STEPS: usize = 10;
-const GRIP_SWING_STEPS: usize = 8;
 
 pub fn prepare(repo: &Path, sources: &[PathBuf], out: &Path) -> Result<String, String> {
     let layered = layered(sources)?;
