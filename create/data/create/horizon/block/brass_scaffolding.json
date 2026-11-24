@@ -105,7 +105,6 @@
       ]
     ]
   },
-  "context_collision": "scaffolding",
   "components": {
     "!minecraft:cooking_fuel": {}
   }

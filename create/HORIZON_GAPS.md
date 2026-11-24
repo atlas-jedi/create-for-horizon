@@ -61,3 +61,9 @@ Port experimental do create-sunrise para o SDK do Horizon (Nightly `f1bb66f`). C
 - `cargo horizon-mod build`: gera `target/horizon-mod/create.hmod` (pacote de fonte nativa; o launcher compila).
 - `cargo horizon-mod check target/horizon-mod/create.hmod`: aceito (sem assinatura).
 - `cargo horizon-mod check` (sem arquivo): falha só no passo extra de `cargo check` para `wasm32-unknown-unknown`, porque o target wasm32 não está instalado no toolchain da máquina (não instalei para não mexer fora da pasta). Não testado: `cargo test`, build release, rodar no jogo.
+
+## Declarações de conteúdo
+
+- As declarações ficam em `data/create/horizon/` e `assets/create/horizon/`, onde o Horizon as lê (o Sunrise lê `.../sunrise/`).
+- Andaimes do Create: o campo `context_collision: "scaffolding"` não existe no Horizon e saiu. A colisão é a do template `minecraft:scaffolding`.
+- Painel de fábrica: o campo `shapes_from_block_entity` não existe no Horizon e saiu (sem colisão por painel, como já estava listado).

@@ -1049,7 +1049,7 @@ pub(super) fn native_assets() -> (BTreeMap<String, Vec<u8>>, BTreeSet<String>) {
             };
             files
                 .entry(format!(
-                    "assets/create/sunrise/connected_tables/{table}.json"
+                    "assets/create/horizon/connected_tables/{table}.json"
                 ))
                 .or_insert_with(|| {
                     let grid = rule.ty.sheet_size();
@@ -1103,7 +1103,7 @@ pub(super) fn native_assets() -> (BTreeMap<String, Vec<u8>>, BTreeSet<String>) {
                 file["orient"] = json!("texture");
             }
             files.insert(
-                format!("assets/create/sunrise/connected/{}_{i}.json", plan.name),
+                format!("assets/create/horizon/connected/{}_{i}.json", plan.name),
                 crate::pretty(&file),
             );
         }
@@ -1227,7 +1227,7 @@ mod tests {
         let (files, _) = native_assets();
         let table = |name| {
             serde_json::from_slice::<serde_json::Value>(
-                &files[&format!("assets/create/sunrise/connected_tables/{name}.json")],
+                &files[&format!("assets/create/horizon/connected_tables/{name}.json")],
             )
             .unwrap()
         };

@@ -136,7 +136,6 @@
       ]
     }
   },
-  "shapes_from_block_entity": true,
   "collision_shapes": {
     "default": []
   },

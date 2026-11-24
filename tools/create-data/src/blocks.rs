@@ -4191,7 +4191,7 @@ mod tests {
         let expected: Value =
             serde_json::from_str(include_str!("pending_template_decisions.json")).unwrap();
         let root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/data/create/sunrise/block");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/data/create/horizon/block");
         let mut unlisted = BTreeSet::new();
         for (name, defaults) in runtime_defaults() {
             if matches!(name.as_str(), "chocolate" | "honey") {
@@ -4263,7 +4263,7 @@ mod tests {
     #[test]
     fn every_default_state_key_exists_on_declared_block() {
         let root =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/data/create/sunrise/block");
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/data/create/horizon/block");
         let pending: Value =
             serde_json::from_str(include_str!("pending_template_decisions.json")).unwrap();
         for entry in fs::read_dir(root).unwrap() {
