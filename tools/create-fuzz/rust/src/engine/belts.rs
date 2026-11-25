@@ -36,6 +36,9 @@ impl Run {
             if sneaking {
                 return false;
             }
+            // `BeltSlicer`'s SUCCESS takes the click; its FAIL, like a pass, goes on to the held
+            // item's own use (glue `use_belt_with`): the wrench's `onWrenched`, the belt
+            // connector's `useOn` below.
             if (item == bc::ITEM || item == "create:wrench")
                 && self.slice_belt(p, item, face, hit.map(|v| v - 0.5), seg)
             {
@@ -65,13 +68,16 @@ impl Run {
                 );
                 return true;
             }
-            if item == "create:wrench" && face != Dir::Up && self.belt_cased(p) {
-                self.set_belt_casing(p, None);
-                return true;
-            }
-            if item == "create:wrench" && seg.part == belt::Part::Pulley && face.axis() != Axis::Y {
-                let s = with_prop(&self.name(self.at(p)), "part", "middle");
-                self.switch(p, self.id(&s));
+            // glue `wrench_used` -> `belt::wrench_belt` (`BeltBlock.onWrenched`), whatever face
+            // was clicked: a casing comes off, else a pulley becomes a middle segment. The
+            // logistics subsystem takes the wrench on a belt either way: a belt is never turned.
+            if item == "create:wrench" {
+                if self.belt_cased(p) {
+                    self.set_belt_casing(p, None);
+                } else if seg.part == belt::Part::Pulley {
+                    let s = with_prop(&self.name(self.at(p)), "part", "middle");
+                    self.switch(p, self.id(&s));
+                }
                 return true;
             }
         }
@@ -258,7 +264,8 @@ impl Run {
         self.set(p, id);
     }
     /// `BeltSlicer.useWrench`/`useConnector` as the glue's `logistics/slicer.rs` does them:
-    /// true when the slicer answered the click.
+    /// true when the belt changed (`SUCCESS`); a refusal (`FAIL`) or a pass is false, and the
+    /// held item's own use follows.
     fn slice_belt(
         &mut self,
         p: Pos,
@@ -277,21 +284,19 @@ impl Run {
             {
                 return false;
             }
-            if length != 2 {
-                self.slice_wrench(p, seg, length, hit);
-            }
-            return true;
+            return length != 2 && self.slice_wrench(p, seg, length, hit);
         }
         if length == bc::MAX_LENGTH {
-            return true;
+            return false;
         }
         if !seg.hovering_end(hit) {
             return false;
         }
         self.slice_connector(p, seg, length)
     }
-    /// `use_wrench` past its pass-through checks: shorten from the hovered end, or split.
-    fn slice_wrench(&mut self, p: Pos, seg: belt::Segment, length: i32, hit: [f64; 3]) {
+    /// `use_wrench` past its pass-through checks: shorten from the hovered end, or split. True
+    /// when the belt changed.
+    fn slice_wrench(&mut self, p: Pos, seg: belt::Segment, length: i32, hit: [f64; 3]) -> bool {
         let v = seg.vector();
         let index = self.w.dims[0].belts[&self.w.dims[0].belt_of[&p]]
             .chain
@@ -321,7 +326,7 @@ impl Run {
             // `BeltBlockEntity.destroy` (`:194-198`): the clicked START is the controller, so
             // `getInventory().ejectAll()` empties it before the transfer.
             if seg.part == belt::Part::Start {
-                self.w.destroy_belt(0, &mut taken);
+                self.w.destroy_belt(0, &mut taken, rpm);
             }
             self.set(p, AIR);
             let chain: Vec<_> = taken.chain.iter().copied().filter(|q| *q != p).collect();
@@ -345,23 +350,23 @@ impl Run {
                 self.w
                     .reform_belt(0, chain[0], belt::Inventory::fresh(Vec::new()));
             }
-            return;
+            return true;
         }
         let toward_positive = (0..3).map(|i| hit[i] * f64::from(v[i])).sum::<f64>() > 0.;
         let next = add(p, if toward_positive { v } else { v.map(|x| -x) });
         if index == 0 || index == 1 && !toward_positive {
-            return;
+            return false;
         }
         if index == length - 1 || index == length - 2 && toward_positive {
-            return;
+            return false;
         }
         let Some(next_seg) = self.segment(next) else {
-            return;
+            return false;
         };
         // A survival split takes a belt connector and shafts from the inventory; the actor's
         // inventory holds neither (`use` equips only the held wrench), so it is refused.
         if !self.creative {
-            return;
+            return false;
         }
         let (controller, mut taken) = self.w.take_belt(0, p).unwrap();
         let (here, there) = if toward_positive {
@@ -403,9 +408,11 @@ impl Run {
         fresh.add_all(moved);
         self.w.reform_belt(0, controller, taken.items);
         self.w.reform_belt(0, new_controller, fresh);
+        true
     }
-    /// `use_connector` at a hovered end: join the belt there, or lengthen this one. False when
-    /// the glue passes the click on to the connector item (a block there that is no belt).
+    /// `use_connector` at a hovered end: join the belt there, or lengthen this one. True when
+    /// the belt changed; false when it refused (a block there that is no belt, a belt it cannot
+    /// join), and the connector item's own use follows.
     fn slice_connector(&mut self, p: Pos, seg: belt::Segment, length: i32) -> bool {
         let clicked_controller = self.w.dims[0].belt_of[&p];
         let v = seg.vector();
@@ -423,14 +430,14 @@ impl Run {
                 return false;
             };
             if !seg.compatible(&other) {
-                return true;
+                return false;
             }
             let Some(oc) = self.w.dims[0].belt_of.get(&next).copied() else {
-                return true;
+                return false;
             };
             let other_length = self.w.dims[0].belts[&oc].chain.len() as i32;
             if other_length + length > bc::MAX_LENGTH {
-                return true;
+                return false;
             }
             // `BeltSlicer.java:290-306`: per segment of the other belt in chain order,
             // `detachKinetics`, `beltLength = 0`, then the flip. The clicked belt's segments

@@ -660,7 +660,7 @@ fn reloaded_ejector(e: &create_engine::ejector::Ejector) -> create_engine::eject
     r.lid.previous = lid;
     r.lid.target = lid;
     r.powered = e.powered;
-    r.max_stack = e.max_stack.min(64);
+    r.max_stack = e.max_stack.min(create_engine::depot::ABSOLUTE_MAX_STACK);
     // `EarlyTarget`, `EarlyTargetPos`, `EarlyTargetTime`.
     r.early = e.early;
     for f in &e.flying {

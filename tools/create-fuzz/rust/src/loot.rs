@@ -19,8 +19,7 @@ pub fn requires_tool(state: &str) -> Option<bool> {
         return Some(true);
     }
     let name = block.strip_prefix("create:")?;
-    let path =
-        crate::defaults::checkout().join(format!("create/data/create/sunrise/block/{name}.json"));
+    let path = crate::defaults::block_data(name);
     let doc: Value = serde_json::from_str(&std::fs::read_to_string(path).ok()?).ok()?;
     Some(
         doc["properties"]["requires_tool"]

@@ -148,6 +148,7 @@ impl Run {
             return;
         }
         if self.funnel_filter_use(p, item, face, hit, sneaking)
+            || self.funnel_insert_use(p, item, face, sneaking)
             || self.smart_chute_filter_use(p, item, face, hit, sneaking)
         {
             return;
@@ -287,10 +288,11 @@ impl Run {
                     |q| self.replaceable(q),
                 )
             {
-                self.place_cog(target, item, large, axis);
+                self.place_helped(target, item, axis);
                 return;
             }
-            // SpeedControllerBlock's placement helper sends the held large cog above it.
+            // SpeedControllerBlock's placement helper sends the held large cog above it
+            // (transmission.rs `controller_target`).
             if item == "create:large_cogwheel"
                 && let Some((Block::RotationSpeedController, info)) = own
             {
@@ -301,7 +303,7 @@ impl Run {
                     Axis::X
                 };
                 if self.replaceable(target) && self.w.valid_cog_position(0, target, true, axis) {
-                    self.place_cog(target, item, true, axis);
+                    self.place_helped(target, item, axis);
                     return;
                 }
             }
@@ -400,22 +402,24 @@ impl Run {
                         p,
                         axis,
                         hit.map(|v| v - 0.5),
+                        // `PoleHelper.matchesAxis`: an `AbstractSimpleShaftBlock` (shaft, cog,
+                        // large cog) or a powered shaft along the axis.
                         |q| {
                             self.w.table.get(self.at(q)).is_some_and(|(b, i)| {
-                                matches!(b, Block::Shaft | Block::PoweredShaft)
-                                    && i.axis == Some(axis)
+                                matches!(
+                                    b,
+                                    Block::Shaft
+                                        | Block::PoweredShaft
+                                        | Block::Cogwheel
+                                        | Block::LargeCogwheel
+                                ) && i.axis == Some(axis)
                             })
                         },
-                        |q| self.at(q) == AIR,
+                        // `canBeReplaced` (transmission.rs `pole_target`'s `lv.free`).
+                        |q| self.replaceable(q),
                     );
                     if let Some(q) = at {
-                        if let Some(large) = cog_item(item) {
-                            self.place_cog(q, item, large, axis);
-                        } else {
-                            let next =
-                                format!("create:shaft[axis={},waterlogged=false]", axis_name(axis));
-                            self.set(q, self.id(&next));
-                        }
+                        self.place_helped(q, item, axis);
                         return;
                     }
                 }
@@ -668,6 +672,28 @@ impl Run {
             let state = format!("{item}[axis={},waterlogged=false]", axis_name(axis));
             self.set(p, self.id(&state));
         }
+    }
+
+    /// The glue's `place_helped` (transmission.rs, `PlacementOffset.placeInWorld`): the held
+    /// shaft or cog at `p` on `axis`, written as is (no `canSurvive`: a cog the shaft line
+    /// reaches stands even where `isValidCogwheelPosition` would refuse it), a shaft turned
+    /// into a powered shaft before an engine (`ShaftBlock.pickCorrectShaftType`), waterlogged
+    /// in a water source only (`getFluidState(pos).getType() == Fluids.WATER`).
+    fn place_helped(&mut self, p: Pos, item: &str, axis: Axis) {
+        let item = if item == "create:shaft"
+            && create_engine::steam::shaft_for_placement(p, axis, |q| self.w.engine_at(0, q))
+                == Block::PoweredShaft
+        {
+            "create:powered_shaft"
+        } else {
+            item
+        };
+        let water = parse_state(&self.name(self.at(p))).0 == "minecraft:water"
+            && self
+                .world_fluid(p)
+                .is_some_and(|(f, level)| f == create_engine::tank::Fluid::Water && level == 0);
+        let state = format!("{item}[axis={},waterlogged={water}]", axis_name(axis));
+        self.set(p, self.id(&state));
     }
 
     pub(super) fn switch(&mut self, p: Pos, id: u32) {

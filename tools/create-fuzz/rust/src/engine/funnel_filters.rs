@@ -133,6 +133,75 @@ impl Run {
         }
         true
     }
+    /// The glue's `use_funnel_insert` (`FunnelBlock.useItemOn`, after a brass funnel's filter
+    /// slot): a click on the opening of an inserting, unpowered funnel (no belt funnel) puts the
+    /// held stack (the actor's 64, a bucket's 1) into the inventory behind it as far as it fits
+    /// and the filter passes it, once the funnel has its inventory (`funnel_inv_ready`). True
+    /// when the click was the funnel's, an empty hand's too.
+    pub(super) fn funnel_insert_use(
+        &mut self,
+        p: Pos,
+        item: &str,
+        face: Dir,
+        sneaking: bool,
+    ) -> bool {
+        let Some((block, info)) = self.funnel_at(p) else {
+            return false;
+        };
+        let held = (item != "minecraft:air").then_some(item);
+        // Sneaking with something in hand, the block's use is skipped.
+        if sneaking && held.is_some() {
+            return false;
+        }
+        let Some(facing) = info.facing else {
+            return false;
+        };
+        if !matches!(block, Block::AndesiteFunnel | Block::BrassFunnel)
+            || !create_engine::funnel::inserts_click(
+                facing,
+                info.extracting,
+                info.powered,
+                face,
+                held,
+            )
+        {
+            return false;
+        }
+        let Some(item) = held else {
+            return true;
+        };
+        if !self.funnel_passes(p, item) || !self.w.funnel_inv_ready(0, p) {
+            return true;
+        }
+        let Some(entry) = crate::transport::contract()
+            .items
+            .iter()
+            .find(|i| i.id == item)
+        else {
+            self.notes.push(format!(
+                "adapter gap: funnel click insertion of {item} at {p:?}"
+            ));
+            return true;
+        };
+        let count = if item.ends_with("_bucket") { 1 } else { 64 };
+        let stack = crate::transport::Stack {
+            item: item.to_owned(),
+            count: count.min(entry.max_stack.max(1)),
+        };
+        let behind = create_engine::funnel::behind(p, facing);
+        match self.w.table.get(self.at(behind)).map(|(b, _)| b) {
+            Some(Block::Depot) => {
+                self.depot_insert(behind, &stack, false);
+            }
+            Some(b) => self.notes.push(format!(
+                "adapter gap: funnel click insertion into create:{} at {behind:?}",
+                b.name()
+            )),
+            // No inventory behind it: nothing goes in.
+            None => {}
+        }
+        true
+    }
     /// `amount::value_settings` for a brass funnel (only while its board shows): a short
     /// click's release sets the filter from `interact`'s item (a wrench or an arm does
     /// nothing), a pick sets the amount.

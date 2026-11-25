@@ -58,7 +58,7 @@ impl Run {
         self.facts(p)
             .map_or_else(|| !self.replaceable(p), |f| f.collision)
     }
-    fn set_world_state(&mut self, p: Pos, state: &str) {
+    pub(super) fn set_world_state(&mut self, p: Pos, state: &str) {
         let id = self.id(state);
         assert!(
             id != OTHER || state == "minecraft:stone",

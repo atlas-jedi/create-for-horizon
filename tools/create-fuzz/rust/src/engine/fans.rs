@@ -35,6 +35,19 @@ fn fan_transparent(name: &str) -> bool {
 }
 
 impl Run {
+    /// glue/processing/mod.rs `Processing::neighbor_changed` for the block `state` at `q`, whose
+    /// neighbour changed (`neighborChanged`): an encased fan rebuilds its current on its next
+    /// tick (`fan::neighbor_changed`, `EncasedFanBlockEntity.blockInFrontChanged`) rather than
+    /// at its next check (`fanBlockCheckRate`). The drill's half (`destroyNextTick`) is not
+    /// mirrored: the driver does not run drills (`tick_drills`).
+    pub(super) fn processing_neighbor_changed(&mut self, q: Pos, state: u32) {
+        if self.w.table.get(state).map(|(b, _)| b) == Some(create_engine::Block::EncasedFan)
+            && let Some(f) = self.w.dims[0].fans.get_mut(&q)
+        {
+            f.rebuild = true;
+        }
+    }
+
     /// `tick_fans`, without nozzles and entities (none in the admitted worlds).
     pub(super) fn tick_fans(&mut self) {
         for pos in self.w.fans_to_tick(0) {

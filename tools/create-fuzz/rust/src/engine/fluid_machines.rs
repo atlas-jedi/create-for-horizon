@@ -1,7 +1,7 @@
 //! The item drain/spout fluid phase and player boundaries from glue/fluids/machines.rs.
 use super::*;
 use crate::transport::{Input, Outcome, Stack};
-use create_engine::{Block, belt, depot, drain, kinetics::Dir, spout};
+use create_engine::{Block, belt, depot, drain, spout};
 impl Run {
     pub(super) fn fluid_item_input(&mut self, p: Pos, input: &Input) -> Option<Outcome> {
         if self.w.block_at(0, p) != Some(Block::ItemDrain) {
@@ -31,11 +31,13 @@ impl Run {
         let mut taken = Vec::new();
         match input {
             Input::DropOn { stack } => {
+                // glue/fluids/machines.rs `drain_landed`: in the way the item entity moves
+                // (`drain::landing_side`); the harness lands it with no motion, so north.
                 let got = drain::insert(
                     self.w.dims[0].drains.get_mut(&p).unwrap(),
                     &stack.item,
                     stack.count,
-                    Dir::North,
+                    drain::landing_side([0.0; 3]),
                     &crate::fluid_recipes::emptying(),
                 );
                 remainder = (got < stack.count).then(|| Stack {
@@ -165,15 +167,32 @@ impl Run {
                 }
                 Some(held.count - got)
             } else {
-                self.insert_transport(
+                // The glue's `insert_into_from(.., false)`: no belt behind the hand-over, so no
+                // smoother belt-to-belt offset (`BeltBlockEntity.tryInsertingFromSide`).
+                self.handle_insertion(
                     next,
                     side,
                     &belt::Item::new(&held.item, held.count, 0, false),
+                    false,
+                    false,
                 )
             };
             let left = match left {
                 Some(left) => left,
-                None if !self.host_collision(next) => 0,
+                // No input there: thrown off unless the block there turns a full face to the
+                // drain (`solid_side`, `BlockHelper.hasBlockSolidSide`; the host's full-face
+                // support), else it waits.
+                None if !self.sturdy(next, side.opposite()) => {
+                    let o = side.offset().map(f64::from);
+                    let at = [
+                        f64::from(p[0]) + 0.5 + o[0] * 0.75,
+                        f64::from(p[1]) + 0.5 + o[1] * 0.75 + 6.0 / 16.0,
+                        f64::from(p[2]) + 0.5 + o[2] * 0.75,
+                    ];
+                    let motion = [o[0] / 8.0, o[1] / 8.0 + 1.0 / 8.0, o[2] / 8.0];
+                    self.spawn_item(at, motion, &held.item, held.count);
+                    0
+                }
                 None => continue,
             };
             if left != held.count {
@@ -213,6 +232,94 @@ impl Run {
                 }
             }
         })
+    }
+    /// glue/fluids/machines.rs `tick_spout_blocks` (`SpoutBlockEntity.tick`'s block spouting),
+    /// the last of the fluids' level tick, before the transport walk runs the spouts' timers: an
+    /// idle spout holding fluid over a block it can fill (`spout::block_fill`) starts its 20-tick
+    /// cycle, and at 6 (the walk takes it to 5 later this tick) fills the block if it still can,
+    /// the fluid leaving its tank. The spouts whose cycle it started (`BLOCK_FILLS`,
+    /// `spout_block_fills`) are the ones it fills for; a belt or depot cycle at 6 is skipped.
+    pub(super) fn tick_spout_blocks(&mut self) {
+        let mut due: Vec<(Pos, spout::Spout)> = self.w.dims[0]
+            .spouts
+            .iter()
+            .filter(|(_, s)| s.fluid.is_some() && matches!(s.processing, -1 | 6))
+            .map(|(p, s)| (*p, *s))
+            .collect();
+        due.sort_by_key(|(p, _)| *p);
+        for (p, mut s) in due {
+            let custom = self.spout_block_fills.remove(&p);
+            if s.processing == 6 && !custom {
+                continue;
+            }
+            let Some((fluid, have)) = s.fluid else {
+                continue;
+            };
+            let below = add(p, [0, -2, 0]);
+            let fill = self.block_fill_at(below, fluid, have);
+            let before = s;
+            if s.processing == -1 {
+                if spout::start_block_fill(&mut s, fill) {
+                    self.spout_block_fills.insert(p);
+                    self.put_spout(p, s, before);
+                }
+                continue;
+            }
+            // `customProcess.fillBlock(.., false)`: the block may have changed since.
+            let Some((amount, change)) = fill else {
+                continue;
+            };
+            if self.apply_block_fill(below, change) {
+                spout::finish_block_fill(&mut s, amount);
+                self.put_spout(p, s, before);
+            }
+        }
+    }
+    /// The glue's `block_fill_at`: what spouting the block at `at` with `have` of `fluid` would
+    /// take and do (`BlockSpoutingBehaviour.get(level, pos).fillBlock(.., simulate)`).
+    fn block_fill_at(
+        &self,
+        at: Pos,
+        fluid: create_engine::tank::Fluid,
+        have: u32,
+    ) -> Option<(u32, spout::BlockFill)> {
+        let (name, props) = parse_state(&self.name(self.at(at)));
+        let property = |k: &str| {
+            props
+                .iter()
+                .find(|(p, _)| p == k)
+                .and_then(|(_, v)| v.parse::<i32>().ok())
+        };
+        spout::block_fill(&name, property, fluid, have)
+    }
+    /// The glue's `apply_block_fill`: `level.setBlockAndUpdate(pos, ..)` with what the spout made
+    /// of the block at `at` (a block's default state, or an integer property one higher). False,
+    /// filling nothing, for a state the host catalogue lacks.
+    fn apply_block_fill(&mut self, at: Pos, fill: spout::BlockFill) -> bool {
+        let next = match fill {
+            spout::BlockFill::Become(block) => match block {
+                // `LayeredCauldronBlock`'s default `LEVEL` is 1.
+                "minecraft:water_cauldron" => Some(format!("{block}[level=1]")),
+                _ => Some(block.to_owned()),
+            },
+            spout::BlockFill::Raise(property) => {
+                let current = self.name(self.at(at));
+                let (_, props) = parse_state(&current);
+                props
+                    .iter()
+                    .find(|(k, _)| k == property)
+                    .and_then(|(_, v)| v.parse::<i32>().ok())
+                    .map(|v| with_prop(&current, property, &(v + 1).to_string()))
+            }
+        };
+        let Some(next) = next.filter(|s| crate::fluid_world::id(s).is_some()) else {
+            self.notes.push(format!(
+                "adapter gap: spouted block at {at:?} has no host state ({fill:?})"
+            ));
+            return false;
+        };
+        self.set_world_state(at, &next);
+        true
     }
     /// glue/fluids/machines.rs `put_spout`: a fill started or done marks the column, a tank
     /// that changed is read by comparators.
@@ -261,7 +368,7 @@ impl Run {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use create_engine::tank::Fluid;
+    use create_engine::{kinetics::Dir, tank::Fluid};
 
     #[test]
     fn depot_filling_matches_glue_step_and_preserves_all_outputs() {
@@ -352,5 +459,128 @@ mod tests {
         }
         assert_eq!(direct.fluid, Some((Fluid::Water, 1000)));
         assert_eq!(direct.held.unwrap().item, "minecraft:bucket");
+    }
+
+    fn dry_run() -> Run {
+        let mut sc = crate::fluid_inputs::generate(19);
+        sc.blocks.clear();
+        sc.events.clear();
+        Run::new(&sc)
+    }
+
+    #[test]
+    fn spout_fills_the_cauldron_two_below_on_the_tick_create_does() {
+        // `SpoutBlockEntity.tick`: idle with fluid over a fillable block, the cycle starts
+        // (20, then 19 the same tick); the fill lands as the timer reaches 5.
+        let mut run = dry_run();
+        let (p, below) = ([0, 6, 0], [0, 4, 0]);
+        run.set(p, run.id("create:spout"));
+        run.set(below, run.id("minecraft:cauldron"));
+        let mut s = spout::Spout::default();
+        spout::fill(&mut s, Fluid::Water, 1000);
+        run.w.dims[0].spouts.insert(p, s);
+        let mut fills = Vec::new();
+        for tick in 0..80 {
+            let shown = run.name(run.at(below));
+            run.tick_spout_blocks();
+            run.tick_transport();
+            if run.name(run.at(below)) != shown {
+                let s = run.w.dims[0].spouts[&p];
+                assert_eq!(s.processing, 5, "tick {tick}");
+                fills.push((tick, run.name(run.at(below)), s.fluid));
+            }
+        }
+        assert_eq!(
+            fills,
+            vec![
+                (
+                    14,
+                    "minecraft:water_cauldron[level=1]".into(),
+                    Some((Fluid::Water, 750))
+                ),
+                (
+                    35,
+                    "minecraft:water_cauldron[level=2]".into(),
+                    Some((Fluid::Water, 500))
+                ),
+                (
+                    56,
+                    "minecraft:water_cauldron[level=3]".into(),
+                    Some((Fluid::Water, 250))
+                ),
+            ]
+        );
+        // Full: the spout idles with what is left.
+        assert_eq!(run.w.dims[0].spouts[&p].processing, -1);
+        // One run at a time (`Run::new` takes the driver's lock).
+        drop(run);
+        // An empty cauldron takes lava a whole bucket at a time, and nothing less.
+        let mut run = dry_run();
+        run.set(p, run.id("create:spout"));
+        run.set(below, run.id("minecraft:cauldron"));
+        let mut s = spout::Spout::default();
+        spout::fill(&mut s, Fluid::Lava, 999);
+        run.w.dims[0].spouts.insert(p, s);
+        run.tick_spout_blocks();
+        assert_eq!(run.w.dims[0].spouts[&p].processing, -1);
+        spout::fill(run.w.dims[0].spouts.get_mut(&p).unwrap(), Fluid::Lava, 1);
+        for _ in 0..15 {
+            run.tick_spout_blocks();
+            run.tick_transport();
+        }
+        assert_eq!(run.name(run.at(below)), "minecraft:lava_cauldron");
+        assert_eq!(run.w.dims[0].spouts[&p].fluid, None);
+        // A cycle the block spouting did not start (a belt's or depot's) fills no block at 6,
+        // though a fillable one is there now (`customProcess` null).
+        run.set(below, run.id("minecraft:cauldron"));
+        let mut s = spout::Spout::default();
+        spout::fill(&mut s, Fluid::Water, 1000);
+        s.processing = 6;
+        run.w.dims[0].spouts.insert(p, s);
+        run.tick_spout_blocks();
+        assert_eq!(run.name(run.at(below)), "minecraft:cauldron");
+        assert_eq!(run.w.dims[0].spouts[&p], s);
+    }
+
+    #[test]
+    fn drain_throws_its_stack_off_unless_a_full_face_holds_it() {
+        // `ItemDrainBlockEntity.tick`: at the far side with nothing taking it, the stack flies
+        // off unless `BlockHelper.hasBlockSolidSide` holds it.
+        for (beside, thrown) in [
+            (None, true),
+            (Some("minecraft:stone_slab[type=bottom,waterlogged=false]"), true),
+            (Some("minecraft:cobblestone"), false),
+        ] {
+            let mut run = dry_run();
+            let p = [0, 4, 0];
+            run.set(p, run.id("create:item_drain"));
+            if let Some(state) = beside {
+                run.set([1, 4, 0], run.id(state));
+            }
+            drain::insert(
+                run.w.dims[0].drains.get_mut(&p).unwrap(),
+                "minecraft:cobblestone",
+                3,
+                Dir::East,
+                &crate::fluid_recipes::emptying(),
+            );
+            for _ in 0..12 {
+                run.tick_drain(p);
+            }
+            run.dispose_item_entities();
+            let held = run.w.dims[0].drains[&p].held.clone();
+            assert_eq!(held.is_none(), thrown, "{beside:?}");
+            if thrown {
+                let d = &run.drops[0];
+                assert_eq!(run.drops.len(), 1);
+                assert_eq!(d.stack.item, "minecraft:cobblestone");
+                assert_eq!(d.stack.count, 3);
+                assert_eq!(d.pos, [1.25, 4.5 + 6.0 / 16.0, 0.5]);
+                assert_eq!(d.motion, [1.0 / 8.0, 1.0 / 8.0, 0.0]);
+            } else {
+                assert!(run.drops.is_empty());
+                assert_eq!(held.unwrap().count, 3);
+            }
+        }
     }
 }

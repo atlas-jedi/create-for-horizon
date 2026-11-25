@@ -76,7 +76,9 @@ max-tick-time=-1
 P
     sed -i "s/^server-port=.*/server-port=${FUZZ_PORT:-25599}/" "$run/server.properties"
     rm -f "$FUZZ_DIR/ready"
-    (cd "$here/java"; exec setsid nohup "$gradlew" --no-daemon --max-workers=4 -q runServer </dev/null > "$FUZZ_DIR/server.log" 2>&1) &
+    # Git Bash on Windows has no `setsid`: the server then runs in this shell's session.
+    setsid="$(command -v setsid || true)"
+    (cd "$here/java"; exec $setsid nohup "$gradlew" --no-daemon --max-workers=4 -q runServer </dev/null > "$FUZZ_DIR/server.log" 2>&1) &
     echo $! > "$FUZZ_DIR/server.pid"
     for _ in $(seq 600); do
         [ -f "$FUZZ_DIR/ready" ] && { echo "server ready"; exit 0; }
@@ -90,7 +92,12 @@ stop)
     # The Gradle process and the server JVM under it.
     if [ -f "$FUZZ_DIR/server.pid" ]; then
         pid="$(cat "$FUZZ_DIR/server.pid")"
-        kids="$(pgrep -P "$pid" || true)"
+        # Windows (Git Bash): the JVMs are native processes a signal to the shell does not
+        # reach; end the whole tree.
+        if command -v taskkill >/dev/null && [ -r "/proc/$pid/winpid" ]; then
+            taskkill //PID "$(cat "/proc/$pid/winpid")" //T //F >/dev/null 2>&1 || true
+        fi
+        kids="$(pgrep -P "$pid" 2>/dev/null || true)"
         kill -- -"$pid" 2>/dev/null || kill $pid $kids 2>/dev/null || true
         for _ in $(seq 30); do kill -0 $pid $kids 2>/dev/null || break; sleep 1; done
         rm -f "$FUZZ_DIR/server.pid"
@@ -120,7 +127,9 @@ fuzz)
     if [ "${1:-}" = cover ]; then
         python3 "$here/tools/coverage/campaign.py" begin "$here" "$CREATE_HORIZON_DIR" "$create_dir" "$2"
     fi
-    cargo +1.99.1 run -q --release --manifest-path "$manifest" -- "$@"
+    # FUZZ_TOOLCHAIN: the rustup toolchain of that version under another name (Windows:
+    # +stable-x86_64-pc-windows-msvc).
+    cargo "${FUZZ_TOOLCHAIN:-+1.99.1}" run -q --release --manifest-path "$manifest" -- "$@"
     if [ "${1:-}" = cover ]; then
         python3 "$here/tools/coverage/campaign.py" complete
     fi ;;

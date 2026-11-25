@@ -79,10 +79,13 @@ impl Run {
         self.tick_millstones();
         self.tick_fans();
         self.tick_crushers();
+        self.tick_burners();
+        // `Fluids::level_tick`, after processing's in `SUBSYSTEMS`: tank layers, boilers, then
+        // the spouts' block spouting (`machines::tick_spout_blocks`).
         self.tick_tank_layers();
         self.tick_fluids();
         self.tick_boilers();
-        self.tick_burners();
+        self.tick_spout_blocks();
         // Ejector redstone before the walk ticks them (Java's `neighborChanged` runs at the
         // block change).
         self.ejector_signals();

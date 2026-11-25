@@ -121,11 +121,15 @@ impl Run {
         };
         match loot {
             Some(drops) => {
+                // `BeltBlock.getDrops`: a pulley's shaft too. The port's belt loot table rolls
+                // it (a shaft pool for every part but the middle); a checkout whose table
+                // lacks that pool gets it here.
+                let shaft_rolled = drops.iter().any(|(item, _)| item == "create:shaft");
                 for (item, count) in drops {
                     self.pop_resource(p, &item, count);
                 }
-                // `BeltBlock.getDrops`: a pulley's shaft too.
                 if !kept
+                    && !shaft_rolled
                     && let Some((Block::Belt, i)) = self.w.table.get(state)
                     && i.belt.is_some_and(|s| s.part != belt::Part::Middle)
                 {
@@ -148,8 +152,9 @@ impl Run {
         let belts = std::mem::take(&mut d.belt_drops);
         let depots = std::mem::take(&mut d.depot_drops);
         let ejectors = std::mem::take(&mut d.ejector_drops);
-        for (c, seg, length, item) in belts {
-            let (at, motion) = belt::eject(c, &seg, length, 0.0, item.position);
+        // `BeltInventory.eject` at the speed the belt had (glue `break_pass`).
+        for (c, seg, length, item, rpm) in belts {
+            let (at, motion) = belt::eject(c, &seg, length, rpm, item.position);
             self.spawn_item(at, motion, &item.item, item.count);
         }
         for (p, item, count) in depots {

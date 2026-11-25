@@ -267,15 +267,12 @@ pub fn update_cover(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
     }
 }
 
-/// `BeltBlock.onWrenched` after `BeltSlicer.useWrench` passed it on: a casing comes off when a
-/// side or the bottom is clicked; a pulley clicked on a side becomes a middle segment again, its
-/// shaft back to the player outside creative. True when the wrench did something.
-pub fn wrench_belt(
-    lv: &mut ServerLevel<'_>,
-    pos: [i32; 3],
-    player: mod_api::PlayerRef,
-    clicked: Dir,
-) -> bool {
+/// `BeltBlock.onWrenched` after `BeltSlicer.useWrench` passed the click on or refused it
+/// (`FAIL`, which goes on to the wrench too): a casing comes off; else a pulley becomes a middle
+/// segment again, its shaft back to the player outside creative. Whatever face was clicked:
+/// the slicer passes a side click on a cased segment or a pulley, and refuses a top click it
+/// cannot cut (a belt of two, a cut too close to an end). True when the wrench did something.
+pub fn wrench_belt(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: mod_api::PlayerRef) -> bool {
     let Some((_, _, seg)) = belt_segment(lv, pos) else {
         return false;
     };
@@ -288,11 +285,11 @@ pub fn wrench_belt(
                 .map(|v| v == "true")
         })
         .unwrap_or(false);
-    if cased && clicked != Dir::Up {
+    if cased {
         set_casing(lv, pos, None);
         return true;
     }
-    if seg.part == belt::Part::Pulley && clicked.axis() != Axis::Y {
+    if seg.part == belt::Part::Pulley {
         crate::glue::items::wrench::switch_property(lv, pos, "part", "middle");
         if !crate::glue::items::creative(&*lv.host, player)
             && let Some(shaft) = items::stack_of(&*lv.host, "create:shaft", 1)

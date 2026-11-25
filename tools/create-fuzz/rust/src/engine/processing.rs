@@ -279,7 +279,10 @@ impl Run {
                     let mut left = Vec::new();
                     for (item, count) in std::mem::take(&mut c.slots) {
                         let one = belt::Item::new(&item, count, 0, false);
-                        let n = self.insert_transport(next, facing, &one).unwrap_or(count);
+                        // The glue's `insert_into_from(.., false)`: no belt behind the hand-over.
+                        let n = self
+                            .handle_insertion(next, facing, &one, false, false)
+                            .unwrap_or(count);
                         if n > 0 {
                             left.push((item, n));
                         }
@@ -342,6 +345,11 @@ impl Run {
                     .into_iter()
                     .map(|i| self.books.cutting.get(i))
                     .collect();
+                // The glue's `applyRecipe`: an index past the list starts over, an empty list
+                // (an item no recipe takes) included.
+                if s.index >= list.len() {
+                    s.index = 0;
+                }
                 let recipe = list.get(s.index).copied();
                 s.apply(recipe, limit, &mut rng, None);
             }
@@ -364,7 +372,10 @@ impl Run {
                     let mut left = Vec::new();
                     for (item, count) in std::mem::take(&mut s.slots) {
                         let one = belt::Item::new(&item, count, 0, false);
-                        let n = self.insert_transport(next, facing, &one).unwrap_or(count);
+                        // The glue's `insert_into_from(.., false)`: no belt behind the hand-over.
+                        let n = self
+                            .handle_insertion(next, facing, &one, false, false)
+                            .unwrap_or(count);
                         if n > 0 {
                             left.push((item, n));
                         }
@@ -463,8 +474,31 @@ impl Run {
     pub(super) fn processing_use(&mut self, p: Pos) -> Option<Vec<Stack>> {
         match self.w.block_at(0, p)? {
             Block::Millstone => Some(self.use_millstone(p)),
+            Block::MechanicalSaw => self.use_saw(p),
             _ => None,
         }
+    }
+
+    /// `use_saw` with an empty hand (`SawBlock.useItemOn`): a saw facing up gives what it holds,
+    /// in slot order, and is emptied, its recipe index kept. None for a saw facing elsewhere
+    /// (the click passes). The filter slot's own click (`filtering::click`) is not mirrored: no
+    /// family gives a saw a filter.
+    fn use_saw(&mut self, pos: Pos) -> Option<Vec<Stack>> {
+        let up = self.w.table.get(self.at(pos)).and_then(|(_, i)| i.facing) == Some(Dir::Up);
+        if !up {
+            return None;
+        }
+        let Some(s) = self.w.dims[0].saws.remove(&pos) else {
+            return Some(Vec::new());
+        };
+        self.saw_index.insert(pos, s.index);
+        self.w.mark_unsaved(0, pos);
+        Some(
+            s.slots
+                .into_iter()
+                .map(|(item, count)| Stack { item, count })
+                .collect(),
+        )
     }
 
     /// The machines' item handlers: the millstone's container, the crushing wheel controller's

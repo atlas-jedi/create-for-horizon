@@ -1,0 +1,215 @@
+{
+  "version": 3,
+  "seed": 0,
+  "ticks": 90,
+  "checkpoints": [
+    31,
+    41,
+    71,
+    81
+  ],
+  "blocks": [
+    {
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "state": "create:shaft[axis=x,waterlogged=false]"
+    },
+    {
+      "pos": [
+        0,
+        8,
+        1
+      ],
+      "state": "create:shaft[axis=x,waterlogged=false]"
+    },
+    {
+      "pos": [
+        3,
+        8,
+        0
+      ],
+      "state": "create:shaft[axis=x,waterlogged=false]"
+    },
+    {
+      "pos": [
+        3,
+        8,
+        4
+      ],
+      "state": "create:shaft[axis=x,waterlogged=false]"
+    }
+  ],
+  "events": [
+    {
+      "tick": 10,
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:belt_connector",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.5
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    },
+    {
+      "tick": 20,
+      "pos": [
+        0,
+        8,
+        1
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:belt_connector",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.5
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    },
+    {
+      "tick": 30,
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:andesite_casing",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.5
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    },
+    {
+      "tick": 40,
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:wrench",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.5
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    },
+    {
+      "tick": 50,
+      "pos": [
+        3,
+        8,
+        0
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:belt_connector",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.5
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    },
+    {
+      "tick": 60,
+      "pos": [
+        3,
+        8,
+        4
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:belt_connector",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.5
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    },
+    {
+      "tick": 70,
+      "pos": [
+        3,
+        8,
+        1
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:shaft",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.5
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    },
+    {
+      "tick": 80,
+      "pos": [
+        3,
+        8,
+        1
+      ],
+      "action": {
+        "kind": "use",
+        "item": "create:wrench",
+        "face": "up",
+        "hit": [
+          0.5,
+          1.0,
+          0.1
+        ],
+        "yaw": 0.0,
+        "pitch": 0.0,
+        "sneaking": false
+      }
+    }
+  ]
+}

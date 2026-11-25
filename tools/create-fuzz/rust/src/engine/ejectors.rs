@@ -45,7 +45,8 @@ impl Run {
             count: h.count,
             max: h.limit(),
         });
-        let n = depot::merge_take(e.max_stack, held_stack, used, s.count);
+        // `getRemainingSpace(inserted)`: the limit is capped by the arriving stack's own size.
+        let n = depot::merge_take(e.max_stack, s.limit(), held_stack, used, s.count);
         if n == 0 || simulate {
             return s.count - n;
         }
@@ -247,13 +248,14 @@ impl Run {
         self.w.dims[0].ejector_changes.clear();
         self.flush_block_drops();
     }
-    /// interaction/values.rs `B::WeightedEjector`: row 0's value is `maxStackSize`.
+    /// interaction/values.rs `B::WeightedEjector`: row 0's value is `maxStackSize`
+    /// (`between(0, Item.ABSOLUTE_MAX_STACK_SIZE)`).
     pub(super) fn ejector_stack_size(&mut self, p: Pos, pick: create_engine::board::Settings) {
         let d = &mut self.w.dims[0];
         let Some(e) = d.ejectors.get_mut(&p) else {
             return;
         };
-        e.max_stack = pick.value.clamp(0, 64) as u8;
+        e.max_stack = pick.value.clamp(0, i32::from(depot::ABSOLUTE_MAX_STACK)) as u8;
         self.w.mark_unsaved(0, p);
     }
     pub(super) fn ejector_observation(&self, p: Pos) -> Option<crate::logistics::Ejector> {

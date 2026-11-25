@@ -53,9 +53,9 @@ impl Run {
         self.w.speed(0, p)
     }
     /// `getInputChutes`: the chute above facing down, and the diagonal chutes above beside it
-    /// facing toward it.
+    /// facing toward it, in `Iterate.directions`' order.
     fn input_chutes(&self, p: Pos) -> Vec<Pos> {
-        [Dir::Down, Dir::North, Dir::South, Dir::West, Dir::East]
+        [Dir::Down, Dir::South, Dir::North, Dir::East, Dir::West]
             .into_iter()
             .filter_map(|f| {
                 let o = if f == Dir::Down { [0; 3] } else { f.offset() };
@@ -125,8 +125,9 @@ impl Run {
             .find(|(k, _)| k == "shape")
             .and_then(|(_, v)| Shape::read(v))
     }
-    /// `chute_direct_input` and `chute_take`: the whole stack, at the top, while it is empty and
-    /// takes it.
+    /// `chute_direct_input` and `chute_take`: the whole stack, where `setItem(stack)` starts it
+    /// (`chute::start`: the top while it falls, the bottom while the fans carry it up), while it
+    /// is empty and takes it.
     pub(super) fn chute_direct_input(&mut self, p: Pos, item: &belt::Item) -> u8 {
         let Some((block, powered)) = self.chute_block(p) else {
             return item.count;
@@ -144,7 +145,8 @@ impl Run {
                 count: item.count,
             },
         );
-        self.w.set_chute_position(0, p, 1.);
+        let at = chute::start(self.chute_motion(p));
+        self.w.set_chute_position(0, p, at);
         0
     }
     /// `tick_chute_shapes` (`updateChuteState`): diagonal chutes with nothing to lead into turn
@@ -357,9 +359,11 @@ impl Run {
             }
         }
     }
-    /// `rise` (`handleUpwardOutput`): into the chute above if it is empty, takes the stack and
-    /// does not fall, else the depot above, else out of the top when nothing solid is over it;
-    /// it waits in the middle while the way is shut.
+    /// `rise` (`handleUpwardOutput`): through an open chute into the depot above (no chute's),
+    /// else into the chute leading in that rises fastest and takes it (`getInputChutes`,
+    /// `canAcceptItem`, `chute::best_input`), else out of the top when no chute leads in and
+    /// nothing solid is over it; it waits in the middle while the way is shut
+    /// (`chute::can_output_up`).
     fn chute_rise(
         &mut self,
         pos: Pos,
@@ -371,34 +375,47 @@ impl Run {
         let above = [pos[0], pos[1] + 1, pos[2]];
         let above_chute = self.chute_block(above);
         let block_above = self.w.table.get(self.at(above)).map(|(b, _)| b);
-        let container = above_chute.is_none() && block_above == Some(Block::Depot);
-        if above_chute.is_none() && block_above == Some(Block::WeightedEjector) {
+        let container =
+            above_chute.is_none() && self.chute_open(pos) && block_above == Some(Block::Depot);
+        if above_chute.is_none()
+            && self.chute_open(pos)
+            && block_above == Some(Block::WeightedEjector)
+        {
             self.notes
                 .push(format!("adapter gap: chute into the ejector at {above:?}"));
         }
-        let can = if !active {
-            false
-        } else if let Some((b, powered)) = above_chute {
-            !self.chute_stacks.contains_key(&above)
-                && self.chute_accepts(above, b, powered, &stack.item)
-                && self.chute_motion(above) >= 0.
-        } else if container {
-            true
+        let inputs = self.input_chutes(pos);
+        let best = if active && !container {
+            let candidates: Vec<(bool, f32)> = inputs
+                .iter()
+                .map(|&q| {
+                    let accepts = self.chute_block(q).is_some_and(|(b, powered)| {
+                        !self.chute_stacks.contains_key(&q)
+                            && self.chute_accepts(q, b, powered, &stack.item)
+                    });
+                    (accepts, self.chute_motion(q))
+                })
+                .collect();
+            chute::best_input(candidates).map(|i| inputs[i])
         } else {
-            let funnel_up = self
-                .funnel_at(above)
-                .is_some_and(|(_, i)| i.facing == Some(Dir::Up));
-            // `falls_through` upward: unless its bottom is a full solid side.
-            !funnel_up && !self.sturdy(above, Dir::Down)
+            None
+        };
+        let can = active && {
+            // `handleUpwardOutput(true)`: a simulated `insertItemStacked` into the depot.
+            let inventory = container.then(|| {
+                self.depot_insert(above, &stack, true)
+                    .is_none_or(|left| left.count != stack.count)
+            });
+            chute::can_output_up(inventory, best.is_some(), !inputs.is_empty(), || {
+                let funnel_up = self
+                    .funnel_at(above)
+                    .is_some_and(|(_, i)| i.facing == Some(Dir::Up));
+                // `falls_through` upward: unless its bottom is a full solid side.
+                !funnel_up && !self.sturdy(above, Dir::Down)
+            })
         };
         match chute::step(position, motion, can) {
             Fall::At(p) => Some(p),
-            Fall::Out if above_chute.is_some() => {
-                self.chute_stacks.remove(&pos);
-                self.chute_stacks.insert(above, stack);
-                self.w.set_chute_position(0, above, 0.);
-                None
-            }
             Fall::Out if container => match self.depot_insert(above, &stack, false) {
                 Some(l) if l.count == stack.count => Some(0.5),
                 Some(l) => {
@@ -410,6 +427,13 @@ impl Run {
                     None
                 }
             },
+            Fall::Out if let Some(target) = best => {
+                // `bestOutput.setItem(item, 0)`.
+                self.chute_stacks.remove(&pos);
+                self.chute_stacks.insert(target, stack);
+                self.w.set_chute_position(0, target, 0.);
+                None
+            }
             Fall::Out => {
                 // `handleUpwardOutput`: half a block over the centre, at twice the chute's speed.
                 self.chute_stacks.remove(&pos);

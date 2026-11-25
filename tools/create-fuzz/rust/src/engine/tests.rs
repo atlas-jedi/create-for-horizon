@@ -605,17 +605,29 @@ fn sneak_wrench_removes_a_connected_sloped_belt() {
 }
 
 #[test]
-fn ejected_stack_a_target_refuses_drops_as_an_item_entity() {
+fn an_empty_charged_ejector_takes_the_whole_ejected_stack() {
+    // The first ejector launches its 6 iron at the second, which is empty and charged. Create's
+    // `DepotBehaviour.getRemainingSpace(inserted)` (since `[0, 64, 99]` on mc1.21.1/dev) caps
+    // the stack-size setting (0: `Item.ABSOLUTE_MAX_STACK_SIZE`) by the arriving stack's own
+    // size, so all 6 go on and nothing is refused; before it, `ItemStack.EMPTY`'s size let one
+    // on and the rest dropped.
     let sc: crate::scenario::Scenario =
         serde_json::from_str(include_str!("../../../cases/items-ejector-drop.json")).unwrap();
     let r = super::run(&sc);
     assert!(r.notes.is_empty(), "{:?}", r.notes);
-    let drops = r.drops.unwrap();
-    assert_eq!(drops.len(), 1);
-    let d = &drops[0];
-    assert_eq!((d.tick, d.stack.count), (63, 1));
-    assert_eq!(d.pos[1], 9.0625);
-    assert!(r.checkpoints[&62].drops.as_ref().unwrap().is_empty());
+    assert!(r.drops.unwrap().is_empty());
+    let held = |tick: u32| -> Vec<(String, u8)> {
+        r.checkpoints[&tick].blocks["1,8,0"]
+            .transport
+            .as_ref()
+            .unwrap()
+            .items
+            .iter()
+            .map(|i| (i.stack.item.clone(), i.stack.count))
+            .collect()
+    };
+    assert!(held(62).is_empty());
+    assert_eq!(held(63), [("minecraft:iron_ingot".to_owned(), 6)]);
 }
 
 #[test]
@@ -730,4 +742,22 @@ fn a_broken_millstone_spills_its_slots_as_the_game_spills_a_container() {
             crate::transport::Spreader::DropItemStack
         ))
     );
+}
+
+#[test]
+fn a_refused_wrench_on_a_belt_goes_on_to_on_wrenched() {
+    // `BeltSlicer.useWrench` answers FAIL for a belt of two and for a cut too close to an end;
+    // FAIL does not consume the click, so `WrenchItem.useOn` runs `BeltBlock.onWrenched`, which
+    // takes a casing off or turns a pulley back into a middle whatever face was clicked.
+    let sc: crate::scenario::Scenario = serde_json::from_str(include_str!(
+        "../../../cases/belts-wrench-refused-goes-on.json"
+    ))
+    .unwrap();
+    let r = super::run(&sc);
+    assert!(r.notes.is_empty(), "{:?}", r.notes);
+    let state = |tick: u32, p: &str| r.checkpoints[&tick].blocks[p].state.clone();
+    assert!(state(31, "0,8,0").contains("casing=true"));
+    assert!(state(41, "0,8,0").contains("casing=false"));
+    assert!(state(71, "3,8,1").contains("part=pulley"));
+    assert!(state(81, "3,8,1").contains("part=middle"));
 }

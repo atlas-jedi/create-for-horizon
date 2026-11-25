@@ -59,7 +59,13 @@ impl Run {
                         count: left,
                     });
                 } else if self.belt_location(p).is_some() {
-                    if self.put_on_from_above(p, stack) == Some(0) {
+                    // `BeltBlock.entityInside`: not under a tunnel
+                    // (`BeltTunnelInteractionHandler.getTunnelOnPosition`, glue `item_landed`).
+                    let tunnel_above = matches!(
+                        self.w.block_at(0, [p[0], p[1] + 1, p[2]]),
+                        Some(Block::AndesiteTunnel | Block::BrassTunnel)
+                    );
+                    if !tunnel_above && self.put_on_from_above(p, stack) == Some(0) {
                         remainder = None;
                     }
                 } else if self.is_ejector(p) {
@@ -789,22 +795,20 @@ impl Run {
                 .map(|o| o.iter().cloned().collect())
                 .unwrap_or_default();
             outputs.sort_by(|a, b| (&a.item, a.count).cmp(&(&b.item, b.count)));
-            // glue/redstone/analog.rs: a depot's items over its held stack's max stack size (64
-            // when it holds none), an ejector's over its stack size.
+            // glue/redstone/analog.rs: a depot's items over its held stack's max stack size (99
+            // when it holds none), an ejector's over its stack size, capped by the held stack's.
             let present: u32 = self.depot_stacks.get(&p).map_or(0, |s| u32::from(s.count))
                 + outputs.iter().map(|s| u32::from(s.count)).sum::<u32>();
+            let held = self.depot_stacks.get(&p).map(|s| u32::from(s.limit()));
             let max = match self.w.dims[0].ejectors.get(&p) {
                 Some(e) => u32::from(e.max_stack),
-                None => self
-                    .depot_stacks
-                    .get(&p)
-                    .map_or(64, |s| u32::from(s.limit())),
+                None => held.unwrap_or(99),
             };
             return Some(Contents {
                 outputs,
                 kind: "depot".into(),
                 items,
-                comparator: Some(create_engine::comparator::depot(present, max)),
+                comparator: Some(create_engine::comparator::depot(present, max, held)),
             });
         }
         let b = self.w.dims[0].belts.get(&p)?;

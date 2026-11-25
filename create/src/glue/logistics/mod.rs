@@ -328,7 +328,7 @@ impl Subsystem for Logistics {
         player: PlayerRef,
         pos: [i32; 3],
         block: Block,
-        clicked: Dir,
+        _clicked: Dir,
         _point: [f64; 3],
         sneaking: bool,
     ) -> bool {
@@ -354,7 +354,7 @@ impl Subsystem for Logistics {
         };
         match block {
             Block::Belt => {
-                belt::wrench_belt(lv, pos, player, clicked);
+                belt::wrench_belt(lv, pos, player);
             }
             // FunnelBlock.onWrenched: `cycle(EXTRACTING)`.
             Block::AndesiteFunnel | Block::BrassFunnel => {

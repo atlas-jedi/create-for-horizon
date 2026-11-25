@@ -96,6 +96,15 @@ fn create_states(sc: &Scenario) -> Vec<String> {
             push(format!("create:shaft[axis={axis},waterlogged={water}]"));
         }
     }
+    // The shaft and cog placement helpers waterlog what they place in a water source
+    // (transmission.rs `place_helped`).
+    for cog in ["cogwheel", "large_cogwheel"] {
+        for axis in ["x", "y", "z"] {
+            for water in ["true", "false"] {
+                push(format!("create:{cog}[axis={axis},waterlogged={water}]"));
+            }
+        }
+    }
     // Chutes beside belts, and the shapes `tick_chute_shapes` gives them.
     for facing in ["down", "north", "south", "west", "east"] {
         for shape in ["normal", "window", "intersection"] {
@@ -266,6 +275,9 @@ pub struct Run {
     /// and the time it started its cut with.
     saw_index: HashMap<Pos, usize>,
     saw_duration: HashMap<Pos, f32>,
+    /// The glue's `BLOCK_FILLS`: spouts whose cycle fills the block two below them
+    /// (`SpoutBlockEntity.customProcess`).
+    spout_block_fills: std::collections::HashSet<Pos>,
     /// The side the current item handler access asks from.
     capability_side: Option<create_engine::kinetics::Dir>,
     _guard: std::sync::MutexGuard<'static, ()>,
@@ -342,6 +354,7 @@ impl Run {
             millstone_slots: HashMap::new(),
             saw_index: HashMap::new(),
             saw_duration: HashMap::new(),
+            spout_block_fills: Default::default(),
             capability_side: None,
             _guard: guard,
         }
@@ -585,6 +598,7 @@ impl Run {
                 // `updateShape` of each neighbour; a frame cell's is the engine's
                 // (`WaterWheelStructuralBlock.updateShape`), which schedules its tick.
                 self.w.neighbor_changed(0, q, s);
+                self.processing_neighbor_changed(q, s);
                 if new == AIR && self.hangs_on(q, s, p) {
                     fallen.push(q);
                 }
