@@ -74,10 +74,13 @@ pub fn inventory(slots: impl IntoIterator<Item = Option<(u32, u32)>>, slot_limit
 }
 
 /// `SharedDepotBlockMethods.getComparatorInputOverride`: the depot's items (held and outputs,
-/// `getPresentStackSize`) over its `maxStackSize` (0 counts as 64): the held stack's max stack
-/// size, 64 when it holds none; an ejector's stack-size setting.
-pub fn depot(present: u32, max_stack: u32) -> i32 {
-    let max = if max_stack == 0 { 64 } else { max_stack };
+/// `getPresentStackSize`) over its limit: its `maxStackSize` (a depot's: the held stack's max
+/// stack size, `Item.ABSOLUTE_MAX_STACK_SIZE` when it holds none; an ejector's stack-size
+/// setting), 0 counting as `Item.ABSOLUTE_MAX_STACK_SIZE`, capped by the held stack's own max
+/// stack size (`held_max`) when it holds one.
+pub fn depot(present: u32, max_stack: u32, held_max: Option<u32>) -> i32 {
+    let limit = if max_stack == 0 { 99 } else { max_stack };
+    let max = held_max.map_or(limit, |h| limit.min(h)).max(1);
     let f = present as f32 / max as f32;
     ((f * 14.0).floor() as i32 + i32::from(f > 0.0)).clamp(0, 15)
 }
@@ -162,18 +165,24 @@ mod tests {
 
     #[test]
     fn depots_read_their_items_over_the_held_stack_size() {
-        assert_eq!(depot(0, 64), 0);
-        assert_eq!(depot(1, 64), 1);
+        assert_eq!(depot(0, 99, None), 0);
+        assert_eq!(depot(1, 64, Some(64)), 1);
         // 32 of 64: floor(7) + 1.
-        assert_eq!(depot(32, 64), 8);
-        assert_eq!(depot(64, 64), 15);
+        assert_eq!(depot(32, 64, Some(64)), 8);
+        assert_eq!(depot(64, 64, Some(64)), 15);
         // Held 16 ender pearls (max 16): full.
-        assert_eq!(depot(16, 16), 15);
+        assert_eq!(depot(16, 16, Some(16)), 15);
         // Outputs past the held stack's size can't read more than 15.
-        assert_eq!(depot(200, 64), 15);
-        // An ejector set to stacks of 8 holding 4: floor(7) + 1; its 0 setting counts as 64.
-        assert_eq!(depot(4, 8), 8);
-        assert_eq!(depot(4, 0), depot(4, 64));
+        assert_eq!(depot(200, 64, Some(64)), 15);
+        // Outputs alone on a depot holding nothing: over 99, floor(9.05) + 1.
+        assert_eq!(depot(64, 99, None), 10);
+        // An ejector set to stacks of 8 holding 4: floor(7) + 1; its 0 setting counts as 99,
+        // capped by what it holds.
+        assert_eq!(depot(4, 8, Some(64)), 8);
+        assert_eq!(depot(4, 0, Some(64)), depot(4, 64, Some(64)));
+        // An ejector set to 0 or 32 holding 16 ender pearls: full.
+        assert_eq!(depot(16, 0, Some(16)), 15);
+        assert_eq!(depot(16, 32, Some(16)), 15);
     }
 
     #[test]

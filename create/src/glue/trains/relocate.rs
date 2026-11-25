@@ -370,6 +370,8 @@ pub fn track_clicked(lv: &mut ServerLevel<'_>, player: PlayerRef, pos: [i32; 3])
             return Some(None);
         }
         t.runtime.interrupted();
+        // `TrainRelocator.relocate`: `status.successfulMigration`.
+        t.status.successful_migration();
         t.column = t.column_on(net);
         t.fresh = true;
         Some(Some((was, t.column)))

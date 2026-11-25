@@ -83,6 +83,30 @@ pub fn trains_to_nbt(
                 if t.train.derailed {
                     c.insert("derailed".into(), Tag::Byte(1));
                 }
+                // `Fuel`.
+                if t.train.fuel > 0 {
+                    c.insert("fuel".into(), Tag::Int(t.train.fuel));
+                }
+                // `Owner`, as four ints.
+                if let Some(u) = t.owner {
+                    c.insert("owner".into(), Tag::IntArray(uuid_ints(u).to_vec()));
+                }
+                // Each carriage's `FrontConductor` and `BackConductor` (bits 1 and 2).
+                if t.conductors.iter().any(|c| c[0] || c[1]) {
+                    c.insert(
+                        "conductors".into(),
+                        Tag::IntArray(
+                            t.conductors
+                                .iter()
+                                .map(|c| i32::from(c[0]) | (i32::from(c[1]) << 1))
+                                .collect(),
+                        ),
+                    );
+                }
+                // `AnnounceArrival`.
+                if t.train.announce {
+                    c.insert("announce".into(), Tag::Byte(1));
+                }
                 if !t.name.is_empty() {
                     c.insert("name".into(), Tag::String(t.name.as_str().into()));
                 }
@@ -91,16 +115,8 @@ pub fn trains_to_nbt(
                 let seated: Vec<i32> = riders(t.id)
                     .into_iter()
                     .flat_map(|(car, l, u)| {
-                        [
-                            i32::from(car),
-                            l[0],
-                            l[1],
-                            l[2],
-                            (u >> 96) as i32,
-                            (u >> 64) as i32,
-                            (u >> 32) as i32,
-                            u as i32,
-                        ]
+                        let [a, b, c, d] = uuid_ints(u);
+                        [i32::from(car), l[0], l[1], l[2], a, b, c, d]
                     })
                     .collect();
                 if !seated.is_empty() {
@@ -163,6 +179,22 @@ pub fn trains_to_nbt(
                 Tag::Compound(c)
             })
             .collect(),
+    )
+}
+
+/// A UUID as four ints, most significant first (`NbtUtils.createUUID`).
+fn uuid_ints(u: u128) -> [i32; 4] {
+    [(u >> 96) as i32, (u >> 64) as i32, (u >> 32) as i32, u as i32]
+}
+
+/// The UUID of four ints.
+fn uuid_of(v: &[i32]) -> Option<u128> {
+    let [a, b, c, d] = <[i32; 4]>::try_from(v).ok()?;
+    Some(
+        (u128::from(a as u32) << 96)
+            | (u128::from(b as u32) << 64)
+            | (u128::from(c as u32) << 32)
+            | u128::from(d as u32),
     )
 }
 
@@ -426,13 +458,7 @@ pub fn riders_from_nbt(data: &Compound) -> Vec<Vec<(u16, [i32; 3], u128)>> {
                 v.as_chunks::<8>()
                     .0
                     .iter()
-                    .map(|r| {
-                        let u = (u128::from(r[4] as u32) << 96)
-                            | (u128::from(r[5] as u32) << 64)
-                            | (u128::from(r[6] as u32) << 32)
-                            | u128::from(r[7] as u32);
-                        (r[0] as u16, [r[1], r[2], r[3]], u)
-                    })
+                    .filter_map(|r| Some((r[0] as u16, [r[1], r[2], r[3]], uuid_of(&r[4..])?)))
                     .collect()
             })
         })
@@ -603,6 +629,13 @@ pub fn trains_from_nbt(host: &dyn Host, data: &Compound) -> Vec<TrainOnTrack> {
                     speed_before_stall: None,
                     derailed: matches!(c.get(&"derailed".into()), Some(Tag::Byte(1))),
                     backwards: false,
+                    fuel: match c.get(&"fuel".into()) {
+                        Some(Tag::Int(f)) => (*f).max(0),
+                        _ => 0,
+                    },
+                    fuel_offer: Vec::new(),
+                    burnt: None,
+                    announce: matches!(c.get(&"announce".into()), Some(Tag::Byte(1))),
                 },
                 cars,
                 heading: m.heading,
@@ -623,6 +656,11 @@ pub fn trains_from_nbt(host: &dyn Host, data: &Compound) -> Vec<TrainOnTrack> {
                 },
                 players: 0,
                 probes: Default::default(),
+                owner: ints(c, "owner").and_then(|v| uuid_of(v)),
+                status: Default::default(),
+                conductors: ints(c, "conductors").map_or_else(Vec::new, |v| {
+                    v.iter().map(|b| [b & 1 != 0, b & 2 != 0]).collect()
+                }),
             })
         })
         .collect()

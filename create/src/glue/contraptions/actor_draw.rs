@@ -718,9 +718,27 @@ pub(super) fn show_actors(
     key: [i32; 3],
     carried: &Carried,
 ) {
+    show_actors_riding(lv, anchor, key, carried, &[]);
+}
+
+/// [`show_actors`] with the stabilized structures riding it (`riding`: each one's key and what
+/// it carries), drawn by the same anchor: each one's controls are off by its own kinds turned
+/// off, and its deployers punch by its own key.
+pub(super) fn show_actors_riding(
+    lv: &mut ServerLevel<'_>,
+    anchor: [i32; 3],
+    key: [i32; 3],
+    carried: &Carried,
+    riding: &[([i32; 3], &Carried)],
+) {
     let dim = lv.dim;
     let now = lv.game_time();
-    if carried.actors.is_empty() && carried.controls.is_empty() {
+    let groups: Vec<([i32; 3], &Carried)> =
+        std::iter::once((key, carried)).chain(riding.iter().copied()).collect();
+    if groups
+        .iter()
+        .all(|(_, g)| g.actors.is_empty() && g.controls.is_empty())
+    {
         return;
     }
     let mut sent = SENT
@@ -728,36 +746,39 @@ pub(super) fn show_actors(
         .unwrap_or_default();
     let mut c = Compound::new();
     c.insert("S".into(), Tag::Byte(i8::from(carried.stalled)));
-    let locals = |f: &dyn Fn(&actors::Actor) -> bool| {
+    let locals = |f: &dyn Fn([i32; 3], &actors::Actor) -> bool| {
         Tag::IntArray(
-            carried
-                .actors
+            groups
                 .iter()
-                .filter(|a| f(a))
-                .flat_map(|a| a.local)
+                .flat_map(|(k, g)| g.actors.iter().map(move |a| (*k, a)))
+                .filter(|(k, a)| f(*k, a))
+                .flat_map(|(_, a)| a.local)
                 .collect(),
         )
     };
-    c.insert("Off".into(), locals(&|a| a.disabled));
+    c.insert("Off".into(), locals(&|_, a| a.disabled));
     c.insert(
         "CtlOff".into(),
         Tag::IntArray(
-            carried
-                .controls
+            groups
                 .iter()
-                .filter(|c| actors::stays_disabled(&carried.disabled, &c.1.filter))
-                .flat_map(|c| c.0)
+                .flat_map(|(_, g)| {
+                    g.controls
+                        .iter()
+                        .filter(|c| actors::stays_disabled(&g.disabled, &c.1.filter))
+                        .flat_map(|c| c.0)
+                })
                 .collect(),
         ),
     );
     c.insert(
         "Punch".into(),
-        locals(&|a| a.kind == Kind::Deployer && super::actors::deployer_punches(dim, key, a.local)),
+        locals(&|k, a| a.kind == Kind::Deployer && super::actors::deployer_punches(dim, k, a.local)),
     );
     let mut chases = Vec::new();
-    for a in carried
-        .actors
+    for a in groups
         .iter()
+        .flat_map(|(_, g)| g.actors.iter())
         .filter(|a| matches!(a.kind, Kind::Interface { .. }))
     {
         let (mut value, target, since, from) = sent

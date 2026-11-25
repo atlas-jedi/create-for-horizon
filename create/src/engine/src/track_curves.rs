@@ -74,6 +74,9 @@ pub struct Curves {
     /// Curves taken up with a track (`removeInboundConnections(dropAndDiscard)`), for the glue
     /// to drop their items (`spawnItems`).
     pub dropped: Vec<Saved>,
+    /// Track blocks whose curves drop nothing when they go (`TrackBlockEntity.cancelDrops`: a
+    /// creative player breaks them, `playerWillDestroy`), until the glue's next tick.
+    pub no_drops: std::collections::HashSet<[i32; 3]>,
 }
 
 /// `manageFakeTracksAlong`: the blocks a curve's fake track takes, a block above each column it
@@ -121,6 +124,7 @@ impl Curves {
             return Vec::new();
         };
         let others: Vec<[i32; 3]> = list.iter().map(|c| c.to).collect();
+        let drops = !self.no_drops.remove(&pos);
         // Each curve's fake track goes with it (drawn from its primary copy either end).
         for c in &list {
             let primary = if c.primary {
@@ -134,14 +138,16 @@ impl Curves {
             if let Some((from, to, curve, girder)) = primary {
                 self.fake
                     .extend(fake_track_along(&curve).into_iter().map(|p| (p, false)));
-                self.dropped.push(Saved {
-                    from,
-                    to,
-                    starts: curve.starts,
-                    axes: curve.axes,
-                    normals: curve.normals,
-                    girder,
-                });
+                if drops {
+                    self.dropped.push(Saved {
+                        from,
+                        to,
+                        starts: curve.starts,
+                        axes: curve.axes,
+                        normals: curve.normals,
+                        girder,
+                    });
+                }
             }
         }
         for o in &others {
@@ -156,6 +162,41 @@ impl Curves {
         self.revision += 1;
         self.changed.extend(&others);
         others
+    }
+
+    /// The curve between track blocks `a` and `b` taken up on its own
+    /// (`CurvedTrackDestroyPacket`: `removeConnection` at both ends), its fake track with it:
+    /// the curve as its primary end has it, None when there is none.
+    pub fn remove_curve(&mut self, a: [i32; 3], b: [i32; 3]) -> Option<Saved> {
+        let primary = self.between(a, b)?;
+        self.fake
+            .extend(fake_track_along(&primary.curve()).into_iter().map(|p| (p, false)));
+        for (here, there) in [(a, b), (b, a)] {
+            if let Some(l) = self.at.get_mut(&here) {
+                l.retain(|c| c.to != there);
+                if l.is_empty() {
+                    self.at.remove(&here);
+                }
+            }
+            self.changed.push(here);
+        }
+        self.revision += 1;
+        Some(primary)
+    }
+
+    /// The curve between track blocks `a` and `b` (either way), as its primary end has it.
+    pub fn between(&self, a: [i32; 3], b: [i32; 3]) -> Option<Saved> {
+        [(a, b), (b, a)].into_iter().find_map(|(from, to)| {
+            let c = self.at.get(&from)?.iter().find(|c| c.to == to && c.primary)?;
+            Some(Saved {
+                from,
+                to,
+                starts: c.curve.starts,
+                axes: c.curve.axes,
+                normals: c.curve.normals,
+                girder: c.girder,
+            })
+        })
     }
 
     /// The curves whose primary end is in column (cx, cz), to save with it.
@@ -292,5 +333,29 @@ mod tests {
         let gone: Vec<[i32; 3]> = c.fake.iter().filter(|f| !f.1).map(|f| f.0).collect();
         assert!(!laid.is_empty());
         assert_eq!(laid, gone);
+        // Its items drop.
+        assert_eq!(c.dropped, vec![turn()]);
+    }
+
+    #[test]
+    fn a_curve_goes_on_its_own_and_a_creative_break_drops_nothing() {
+        let mut c = Curves::default();
+        c.add(turn());
+        c.changed.clear();
+        assert_eq!(c.between([8, 0, 8], [0, 0, 0]), Some(turn()));
+        assert_eq!(c.remove_curve([8, 0, 8], [0, 0, 0]), Some(turn()));
+        assert!(c.at.is_empty());
+        assert_eq!(c.changed, vec![[8, 0, 8], [0, 0, 0]]);
+        // Taken up by itself, nothing is dropped here (the glue gives its items or not).
+        assert!(c.dropped.is_empty());
+        assert_eq!(c.remove_curve([8, 0, 8], [0, 0, 0]), None);
+        // A creative player breaking its track: no items.
+        c.add(turn());
+        c.no_drops.insert([0, 0, 0]);
+        c.remove_at([0, 0, 0]);
+        assert!(c.dropped.is_empty() && c.no_drops.is_empty());
+        c.add(turn());
+        c.remove_at([0, 0, 0]);
+        assert_eq!(c.dropped.len(), 1);
     }
 }

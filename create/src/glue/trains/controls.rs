@@ -625,6 +625,13 @@ fn click(host: &mut dyn ServerHost, dim: usize, player: u128, at: Target, wrench
         use_controls(host, dim, player, spectator, at, id);
         return;
     }
+    // A blaze burner with its blaze: a conductor (`ConductorBlockInteractionBehavior`).
+    if !spectator && state(id).is_some_and(|s| super::conductor::is_blaze_conductor(&*host, s)) {
+        if let Some(p) = host.player(player) {
+            super::conductor::blaze_clicked(host, dim, p, at);
+        }
+        return;
+    }
     // `handlePlayerInteraction`'s seat: the player sits on it (not a spectator).
     if !spectator && state(id).is_some_and(|s| super::riding::is_seat(&*host, s)) {
         super::riding::sit(host, dim, player, at);
@@ -670,7 +677,7 @@ pub fn after_trains(lv: &mut ServerLevel<'_>) {
     for (player, train) in due {
         let Some((speed, throttle)) = with_world(|w| {
             let t = w.dims[dim].railway.trains.iter().find(|t| t.id == train)?;
-            let top = create_engine::trains::TOP_SPEED * create_engine::trains::MANUAL_SPEED;
+            let top = t.train.max_speed() * create_engine::trains::MANUAL_SPEED;
             let speed = (t.train.speed.abs() / top) as f32;
             Some((speed, th::steps(t.train.throttle as f32)))
         })

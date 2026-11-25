@@ -327,6 +327,7 @@ impl Subsystem for Fluids {
         plumbing::tick(lv);
         rims::tick(lv);
         engine::tick(lv);
+        machines::tick_spout_blocks(lv);
     }
 
     fn client_reset(&self) {
@@ -371,6 +372,7 @@ impl Subsystem for Fluids {
             TANK,
             TANK_FLUIDS,
             SPOUT_START,
+            spouted::SPLASH,
             HOSE,
             BOILER,
             rims::RIMS,

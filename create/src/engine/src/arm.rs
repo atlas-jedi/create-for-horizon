@@ -356,6 +356,22 @@ pub trait World {
         let _ = p;
         false
     }
+    /// `collectItem`: the arm at `arm` took a stack of an item it did not hold
+    /// (`!ItemStack.isSameItem(heldItem, prevHeld)`: `ITEM_PICKUP`, .125, .5 + rand × .25).
+    fn collected(&mut self, arm: [i32; 3]) {
+        let _ = arm;
+    }
+    /// What the last real `insert` gave back for a stack it used up whole, taken once: a blaze
+    /// burner's container (`BlazeBurnerPoint.insert` returns it as the remainder when the
+    /// stack was one item, so the arm holds a lava bucket's empty bucket).
+    fn remainder(&mut self) -> Option<Stack> {
+        None
+    }
+    /// The facing the block at the point has now (`CrafterPoint`, `DeployerPoint` and
+    /// `FunnelPoint.updateCachedState` drop their cached angles when the state changes).
+    fn facing(&mut self, p: &Point) -> Option<Dir> {
+        p.facing
+    }
 }
 
 /// A mechanical arm's block entity.
@@ -556,6 +572,7 @@ impl Arm {
             if !world.valid(&p) {
                 continue;
             }
+            self.inputs[i as usize].facing = world.facing(&p);
             for slot in 0..world.slots(&p) {
                 if self.distributable(&p, slot, world) == 0 {
                     continue;
@@ -598,6 +615,7 @@ impl Arm {
             if !world.valid(&p) {
                 continue;
             }
+            self.outputs[i as usize].facing = world.facing(&p);
             if world.insert(&p, &item, count, true) == count {
                 continue;
             }
@@ -630,7 +648,8 @@ impl Arm {
         }
     }
 
-    /// `depositItem`.
+    /// `depositItem`: what the point leaves of the stack stays held, or what it gave back for
+    /// the whole stack (a blaze burner's container), which it then takes to an output.
     fn deposit(&mut self, pos: [i32; 3], world: &mut impl World) -> bool {
         let mut musical = false;
         if let Some(p) = self.target().copied()
@@ -638,8 +657,13 @@ impl Arm {
             && let Some((item, count)) = self.held.take()
         {
             let left = world.insert(&p, &item, count, false);
-            self.held = (left > 0).then_some((item, left));
-            musical = p.kind == Kind::Jukebox && left == 0;
+            let given = world.remainder();
+            self.held = if left > 0 {
+                Some((item, left))
+            } else {
+                given.filter(|r| r.1 > 0)
+            };
+            musical = p.kind == Kind::Jukebox && self.held.is_none();
         }
         world.deposited(pos, musical);
         let phase = if self.held.is_none() {
@@ -662,7 +686,11 @@ impl Arm {
                 if amount == 0 {
                     continue;
                 }
+                let before = self.held.as_ref().map(|h| item_id(&h.0).to_owned());
                 self.held = world.extract(&p, slot, amount, false);
+                if self.held.as_ref().map(|h| item_id(&h.0)) != before.as_deref() {
+                    world.collected(pos);
+                }
                 self.retarget(pos, Phase::SearchOutputs, -1);
                 self.idle = false;
                 return true;
@@ -715,14 +743,16 @@ impl Arm {
     }
 
     /// Whether a sleeping arm must still be woken by the lazy tick: one of the points it waits
-    /// on does not report its changes.
+    /// on does not report its changes. Holding, it waits on its outputs; empty-handed, on its
+    /// inputs and its outputs both, for it takes only what the outputs would take
+    /// (`getDistributableAmount`, which Create's `searchForItem` asks every tick).
     pub fn polls(&self) -> bool {
-        let list = if self.held.is_some() {
-            &self.outputs
+        let unreported = if self.held.is_some() {
+            self.outputs.iter().any(|p| !p.kind.reported())
         } else {
-            &self.inputs
+            self.points().any(|p| !p.kind.reported())
         };
-        list.iter().any(|p| !p.kind.reported()) || self.points().any(|p| p.kind == Kind::Jukebox)
+        unreported || self.points().any(|p| p.kind == Kind::Jukebox)
     }
 }
 
@@ -848,11 +878,16 @@ impl Arms {
     }
 
     /// Each tick: the lazy tick comes round for sleeping arms whose points don't report changes.
+    /// The tick it wakes them for is their lazy tick (`checkForMusic` every 11 ticks, as in
+    /// Create), not one more step of a counter that stood still while they slept.
     pub fn poll(&mut self, game_time: u64) {
         if self.pollers.is_empty() || !game_time.is_multiple_of(u64::from(LAZY_RATE) + 1) {
             return;
         }
         for pos in std::mem::take(&mut self.pollers) {
+            if let Some(a) = self.arms.get_mut(&pos) {
+                a.lazy = 0;
+            }
             self.wake(pos);
         }
     }
@@ -1241,11 +1276,16 @@ mod tests {
     }
 
     /// Depots as a world: their stack by position (a depot takes into its one held slot while
-    /// it holds the same item, up to 64).
+    /// it holds the same item, up to 64); blaze burners that burn a lava bucket and give back
+    /// its bucket; jukeboxes playing; the pickup sounds played.
     #[derive(Default)]
     struct Depots {
         stacks: HashMap<[i32; 3], Stack>,
         locked: Vec<[i32; 3]>,
+        burners: Vec<[i32; 3]>,
+        given: Option<Stack>,
+        playing: Vec<[i32; 3]>,
+        pickups: usize,
     }
 
     impl World for Depots {
@@ -1268,6 +1308,15 @@ mod tests {
             Some(out)
         }
         fn insert(&mut self, p: &Point, item: &str, count: u8, simulate: bool) -> u8 {
+            if self.burners.contains(&p.pos) {
+                if item != "minecraft:lava_bucket" {
+                    return count;
+                }
+                if !simulate && count == 1 {
+                    self.given = Some(("minecraft:bucket".into(), 1));
+                }
+                return count - 1;
+            }
             let have = self.stacks.get(&p.pos).cloned();
             if have.as_ref().is_some_and(|h| h.0 != item) {
                 return count;
@@ -1282,6 +1331,15 @@ mod tests {
         }
         fn keep_alive(&mut self, p: &Point) {
             self.locked.push(p.pos);
+        }
+        fn playing(&mut self, p: &Point) -> bool {
+            self.playing.contains(&p.pos)
+        }
+        fn collected(&mut self, _: [i32; 3]) {
+            self.pickups += 1;
+        }
+        fn remainder(&mut self) -> Option<Stack> {
+            self.given.take()
         }
     }
 
@@ -1559,5 +1617,103 @@ mod tests {
         // Removed: what it held drops, nothing watches its points any more.
         assert_eq!(arms.removed(pos), Some(("minecraft:dirt".into(), 2)));
         assert!(arms.watch.is_empty());
+    }
+
+    #[test]
+    fn an_empty_handed_arm_polls_a_full_output_that_does_not_report() {
+        // A depot (reported) feeds a millstone (not reported) full of something else: the arm
+        // takes nothing and sleeps, but its lazy tick still looks at the millstone, so it picks
+        // up once the millstone has room (Create's `searchForItem` asks every tick).
+        let mut arms = Arms::default();
+        let pos = [0, 0, 0];
+        arms.placed(pos, false);
+        let mill = Point {
+            pos: [0, 0, 2],
+            kind: Kind::Millstone,
+            facing: None,
+        };
+        arms.set_points(pos, vec![depot([2, 0, 0])], vec![mill]);
+        let mut d = Depots::default();
+        d.stacks.insert([2, 0, 0], ("minecraft:wheat".into(), 4));
+        d.stacks.insert([0, 0, 2], ("minecraft:cobblestone".into(), 64));
+        for _ in 0..20 {
+            arms.tick(|_| 64.0, &mut d);
+        }
+        assert!(arms.running.is_empty(), "nothing it could put down: asleep");
+        assert_eq!(arms.pollers, [pos], "the millstone does not report its changes");
+        d.stacks.remove(&[0, 0, 2]);
+        arms.poll(11);
+        for _ in 0..20 {
+            arms.tick(|_| 64.0, &mut d);
+        }
+        assert_eq!(arms.arms[&pos].held, Some(("minecraft:wheat".into(), 4)));
+    }
+
+    #[test]
+    fn a_burner_gives_back_the_bucket_of_a_lava_bucket() {
+        // `BlazeBurnerPoint.insert`: a single lava bucket burns and its bucket is the
+        // remainder, which the arm carries on to the next output that takes it.
+        let pos = [0, 0, 0];
+        let mut arm = Arm::new(false);
+        let burner = Point {
+            pos: [0, 0, 2],
+            kind: Kind::BlazeBurner,
+            facing: None,
+        };
+        arm.set_points(
+            pos,
+            vec![depot([2, 0, 0])],
+            vec![burner, depot([-2, 0, 0])],
+        );
+        let mut w = Depots {
+            burners: vec![[0, 0, 2]],
+            ..Default::default()
+        };
+        w.stacks
+            .insert([2, 0, 0], ("minecraft:lava_bucket".into(), 1));
+        arm.progress = 1.0;
+        let mut carried_bucket = false;
+        for _ in 0..200 {
+            arm.tick(pos, 256.0, &mut w);
+            carried_bucket |= arm.held.as_ref().is_some_and(|h| h.0 == "minecraft:bucket");
+        }
+        assert!(carried_bucket, "the arm holds the bucket after fuelling the burner");
+        assert_eq!(arm.held, None);
+        assert_eq!(w.stacks.get(&[-2, 0, 0]), Some(&("minecraft:bucket".into(), 1)));
+        assert!(!w.stacks.contains_key(&[2, 0, 0]));
+        // One pickup sound, for the lava bucket it took (the bucket was given, not collected).
+        assert_eq!(w.pickups, 1);
+    }
+
+    #[test]
+    fn a_sleeping_arm_starts_and_stops_dancing_at_its_next_lazy_tick() {
+        let mut arms = Arms::default();
+        let pos = [0, 0, 0];
+        arms.placed(pos, false);
+        let jukebox = Point {
+            pos: [0, 0, 2],
+            kind: Kind::Jukebox,
+            facing: None,
+        };
+        arms.set_points(pos, vec![jukebox], Vec::new());
+        let mut d = Depots::default();
+        for _ in 0..20 {
+            arms.tick(|_| 64.0, &mut d);
+        }
+        assert!(arms.running.is_empty());
+        assert_eq!(arms.pollers, [pos], "a jukebox among its points");
+        // A record goes in: the next poll is the arm's lazy tick, so it dances within 11 ticks
+        // (`checkForMusic`), not once its frozen counter has run down over 11 polls.
+        d.playing.push([0, 0, 2]);
+        arms.changes.clear();
+        arms.poll(22);
+        arms.tick(|_| 64.0, &mut d);
+        assert_eq!(arms.arms[&pos].phase, Phase::Dancing);
+        assert_eq!(arms.changes, [pos]);
+        // The record ends: the next poll stops it.
+        d.playing.clear();
+        arms.poll(33);
+        arms.tick(|_| 64.0, &mut d);
+        assert_eq!(arms.arms[&pos].phase, Phase::SearchInputs);
     }
 }

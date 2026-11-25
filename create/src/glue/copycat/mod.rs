@@ -87,6 +87,12 @@ fn shown(dim: usize, pos: [i32; 3]) {
     with(dim, |d| d.shown.push(pos));
 }
 
+/// The material the copycat at `pos` in level `dim` holds (`CopycatBlockEntity.getMaterial`),
+/// None for none.
+pub(crate) fn material_at(dim: usize, pos: [i32; 3]) -> Option<BlockState> {
+    with(dim, |d| d.copycats.get(&pos).and_then(|c| c.material))
+}
+
 /// The copycat block `block` is, if it is one.
 fn copycat_block(block: mod_api::BlockKey) -> Option<Block> {
     [Block::CopycatPanel, Block::CopycatStep]

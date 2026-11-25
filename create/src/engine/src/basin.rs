@@ -235,7 +235,8 @@ pub fn insert_one_stack(slots: &mut [Slot], item: &str, count: u8, max: u8) -> u
     insert_stacked(&mut slots[at..at + 1], item, count, max)
 }
 
-/// `getMatchingRecipes`: the recipes that would apply now, those with the most ingredients first.
+/// `getMatchingRecipes`: the recipes that would apply now, those with the most item ingredients
+/// first (`getIngredients().size()`: a recipe's fluid ingredients don't count), ties in data order.
 pub fn matching(recipes: &[Recipe], slots: &[Slot], tanks: &Tanks, cx: &Context) -> Vec<usize> {
     let mut out: Vec<usize> = (0..recipes.len())
         .filter(|&i| {
@@ -250,7 +251,7 @@ pub fn matching(recipes: &[Recipe], slots: &[Slot], tanks: &Tanks, cx: &Context)
             .is_some()
         })
         .collect();
-    out.sort_by_key(|&i| std::cmp::Reverse(recipes[i].ingredients.len() + recipes[i].fluids.len()));
+    out.sort_by_key(|&i| std::cmp::Reverse(recipes[i].ingredients.len()));
     out
 }
 
@@ -269,6 +270,9 @@ pub struct Mixer {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MixStep {
     None,
+    /// The head reached the bottom and its processing time was set (`processingTicks < 0` at
+    /// `runningTicks == 20`): the basin bubbles when it holds fluid.
+    Bottom,
     /// At the bottom, the time is up: apply the recipe (`applyBasinRecipe`).
     Apply,
     /// The cycle ended: look at the basin again (`basinChecker.scheduleUpdate`).
@@ -319,6 +323,7 @@ impl Mixer {
                 let recipe_speed = if time != 0 { time as f32 / 100.0 } else { 1.0 };
                 self.processing_ticks =
                     (log2((512.0 / speed) as i32) * (recipe_speed * 15.0).ceil() as i32 + 1).max(1);
+                step = MixStep::Bottom;
             } else {
                 self.processing_ticks -= 1;
                 if self.processing_ticks == 0 {
@@ -348,6 +353,22 @@ pub fn shown_ticks(told: i32, elapsed: i64) -> i32 {
         t if t < 20 => (t + elapsed).min(20),
         20 => 20,
         t => (t + elapsed).min(40),
+    }
+}
+
+/// `MechanicalMixerBlockEntity.getRenderedHeadRotationSpeed`: the head turns at the mixer's
+/// speed going down, twice it near and at the bottom (from 15 running ticks to 20), its speed
+/// again going up, and half of it at rest. The renderer turns it `speed * 6 / 10` degrees a tick
+/// (`MixerVisual`: `speed * 2 * SPEED_MULTIPLIER`), twice a shaft's `speed * 3 / 10`: at rest it
+/// keeps pace with its cog.
+pub fn head_rotation_speed(running: bool, ticks: i32, speed: f32) -> f32 {
+    if !running {
+        return speed / 2.0;
+    }
+    if (15..=20).contains(&ticks) {
+        speed * 2.0
+    } else {
+        speed
     }
 }
 
@@ -644,10 +665,46 @@ mod tests {
                     assert_eq!(t, applied_at.unwrap() + 19);
                     return;
                 }
+                MixStep::Bottom => assert_eq!(t, 20, "processing starts at the bottom"),
                 MixStep::None => {}
             }
         }
         panic!("the cycle never ended");
+    }
+
+    #[test]
+    fn the_head_turns_with_its_cog_at_rest_and_faster_at_the_bottom() {
+        // Degrees a tick as the renderer turns it (`speed * 6 / 10`), against a shaft's.
+        let degrees = |running, ticks| head_rotation_speed(running, ticks, 64.0) * 0.6;
+        assert_eq!(degrees(false, 0), 64.0 * 0.3);
+        assert_eq!(degrees(true, 10), 64.0 * 0.6);
+        assert_eq!(degrees(true, 15), 64.0 * 1.2);
+        assert_eq!(degrees(true, 20), 64.0 * 1.2);
+        assert_eq!(degrees(true, 21), 64.0 * 0.6);
+    }
+
+    #[test]
+    fn fluid_ingredients_do_not_rank_a_recipe_first() {
+        // Mud's one item and a bucket of water against two items: the two items win, as
+        // `getIngredients().size()` counts only items.
+        let mud = Recipe {
+            id: "create:mixing/mud".into(),
+            ingredients: vec![vec!["minecraft:dirt".into()]],
+            fluids: vec![(Fluid::Water, 250)],
+            ..alloy()
+        };
+        let two = Recipe {
+            id: "two".into(),
+            ingredients: vec![vec!["minecraft:dirt".into()], vec!["minecraft:dirt".into()]],
+            ..alloy()
+        };
+        let mut slots: Vec<Slot> = vec![None; SLOTS];
+        slots[0] = Some(("minecraft:dirt".into(), 4));
+        let tanks = Tanks {
+            input: [Some((Fluid::Water, 1000)), None],
+            ..Tanks::default()
+        };
+        assert_eq!(matching(&[mud, two], &slots, &tanks, &cx(Heat::None)), vec![1, 0]);
     }
 }
 

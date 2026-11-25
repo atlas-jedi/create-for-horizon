@@ -1,20 +1,12 @@
 //! Create's mechanical drill (`DrillBlockEntity`, `BlockBreakingKineticBlockEntity`): turning, it
 //! breaks the block in front, in steps that come faster at speed and slower in hard blocks.
 
-/// The breaker's state (`ticksUntilNextProgress`, `destroyProgress`).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+/// The breaker's state (`ticksUntilNextProgress`, `destroyProgress`). A new one looks at the
+/// block in front on its first turning tick (both fields start at 0 in Create).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Breaker {
     pub ticks_until: i32,
     pub progress: i32,
-}
-
-impl Default for Breaker {
-    fn default() -> Breaker {
-        Breaker {
-            ticks_until: -1,
-            progress: 0,
-        }
-    }
 }
 
 /// What a tick did.
@@ -30,11 +22,18 @@ pub enum Step {
 }
 
 impl Breaker {
-    /// `lazyTick` (every 10 ticks): a breaker that finished looks again.
+    /// `lazyTick` (every 10 ticks): a breaker that finished looks again. A sideways saw does
+    /// this every tick (`SawBlockEntity.tick`: `ticksUntilNextProgress < 0`).
     pub fn lazy(&mut self) {
-        if self.ticks_until == -1 {
-            self.ticks_until = 1;
+        if self.ticks_until < 0 {
+            self.destroy_next_tick();
         }
+    }
+
+    /// `destroyNextTick`: look at the block in front again on the tick after next, whatever
+    /// the breaker was waiting for (`DrillBlock.neighborChanged`).
+    pub fn destroy_next_tick(&mut self) {
+        self.ticks_until = 1;
     }
 
     /// `tick` at `speed` rpm against a block of `hardness` (None: not breakable, `isBreakable`).
@@ -104,13 +103,20 @@ mod tests {
 
     #[test]
     fn stone_breaks_in_steps_at_speed() {
-        // 64 rpm: break speed 0.64; stone (hardness 1.5): one step every 2 ticks, 10 steps.
-        let mut b = Breaker::default();
+        // A new breaker looks at once; with nothing to break it waits for its lazy tick.
+        let mut fresh = Breaker::default();
+        assert_eq!(fresh.tick(64.0, None), Step::Wait);
+        assert_eq!(fresh.ticks_until, -1);
         assert_eq!(
-            b.tick(64.0, Some(1.5)),
+            fresh.tick(64.0, Some(1.5)),
             Step::Wait,
             "waits for its lazy tick"
         );
+        // 64 rpm: break speed 0.64; stone (hardness 1.5): one step every 2 ticks, 10 steps.
+        let mut b = Breaker {
+            ticks_until: -1,
+            progress: 0,
+        };
         b.lazy();
         let mut ticks = 0;
         loop {
@@ -124,11 +130,27 @@ mod tests {
             2 + 9 * 3,
             "first step on the second tick, then every third"
         );
-        // Dirt (0.5) at 256 rpm: 2.56 / 0.5 = 5 steps at once.
+        // Dirt (0.5) at 256 rpm: 2.56 / 0.5 = 5 steps at once, on its first tick.
         let mut d = Breaker::default();
-        d.lazy();
-        d.tick(256.0, Some(0.5));
         assert_eq!(d.tick(256.0, Some(0.5)), Step::Progress(5));
         assert_eq!(breakable(-1.0), None);
+    }
+
+    #[test]
+    fn a_neighbour_change_cuts_the_wait_short() {
+        // Obsidian (50) at 16 rpm: 312 ticks between steps; a neighbour change makes the drill
+        // look again on the tick after next.
+        let mut b = Breaker::default();
+        assert_eq!(b.tick(16.0, Some(50.0)), Step::Progress(1));
+        assert_eq!(b.ticks_until, 312);
+        b.destroy_next_tick();
+        assert_eq!(b.tick(16.0, Some(50.0)), Step::Wait);
+        assert_eq!(b.tick(16.0, Some(50.0)), Step::Progress(2));
+        // A sideways saw looks again every other tick while nothing is in front.
+        let mut saw = Breaker::default();
+        assert_eq!(saw.tick(16.0, None), Step::Wait);
+        saw.lazy();
+        assert_eq!(saw.tick(16.0, None), Step::Wait);
+        assert_eq!(saw.tick(16.0, Some(2.0)), Step::Progress(1));
     }
 }

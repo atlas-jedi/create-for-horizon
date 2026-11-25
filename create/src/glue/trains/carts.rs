@@ -16,6 +16,10 @@
 //! A contraption's actors (drills, saws, harvesters, ploughs, rollers, deployers) work as it
 //! rides (`tick_cart_actors`), dropping into its storage blocks and then into a chest
 //! minecart's own inventory (`addExtraInventories`).
+//!
+//! Each mechanical bearing on it carries what it faces as a contraption of its own
+//! (`StabilizedContraption`, `CartSub`): drawn, collided with and put back where it hangs, at
+//! its own yaw (`cart::stabilized_angle`), with its own storage, block data and actors.
 
 #[allow(unused_imports)] use crate::glue::compat::ext::*;
 use super::super::net;
@@ -243,6 +247,170 @@ struct OnCart {
     /// Its actors (drills, saws, harvesters, ploughs, rollers, deployers) and what they work
     /// on (`MovementContext`), made again from its blocks when it loads.
     carried: create_engine::actors::Carried,
+    /// The stabilized contraptions riding it (`stabilizedSubContraptions`).
+    subs: Vec<CartSub>,
+}
+
+/// A `StabilizedContraption` riding a cart's: the mechanical bearing it hangs on (offset from the
+/// cart's anchor) and that bearing's facing, and its own contraption, kept as a cart's is (its
+/// blocks offset from the cart's anchor, its storage, block data, glue and actors).
+#[derive(Clone, Debug, PartialEq)]
+struct CartSub {
+    bearing: [i32; 3],
+    facing: Dir,
+    on: OnCart,
+}
+
+impl CartSub {
+    /// `BlockFace.getConnectedPos`: the block in front of its bearing, its anchor.
+    fn front(&self) -> [i32; 3] {
+        let f = self.facing.offset();
+        [0, 1, 2].map(|k| self.bearing[k] + f[k])
+    }
+}
+
+/// The key the `i`th stabilized contraption riding the cart `uuid`'s keeps its block data and
+/// lent storage under (its own `MountedStorageManager`), apart from the cart's (`held_key`).
+fn sub_held_key(uuid: u128, i: usize) -> [i32; 3] {
+    [i32::MIN + 16 + i as i32, (uuid >> 32) as i32, uuid as i32]
+}
+
+/// Where a stabilized contraption riding a cart's stands (`getPassengerPosition`,
+/// `applyLocalTransforms`): its anchor's centre where the cart's structure (`pose`) puts the
+/// block in front of its bearing, its blocks turned about up by its own yaw
+/// (`cart::stabilized_angle`), as a pose of their offsets from the cart's anchor.
+fn sub_pose(
+    pose: &create_engine::collider::Pose,
+    sub: &CartSub,
+    cart_angle: f32,
+) -> create_engine::collider::Pose {
+    use create_engine::actors::{one_turn, turn_all};
+    let f = sub.front().map(f64::from);
+    let at = turn_all(f, &pose.turns);
+    let turns = one_turn(Axis::Y, f64::from(cart::stabilized_angle(sub.facing, cart_angle)));
+    let back = turn_all(f, &turns);
+    create_engine::collider::Pose {
+        centre: [0, 1, 2].map(|k| pose.centre[k] + at[k] - back[k]),
+        turns,
+    }
+}
+
+/// `Contraption.onEntityCreated` on a cart's contraption: each mechanical bearing on it
+/// (`MountedContraption.canBeStabilized`) assembles what it faces as a contraption of its own
+/// (`StabilizedContraption.assemble`, once the cart's left the world), its storage, block data,
+/// glue and controls with it. Offsets from the cart's anchor at `pos`. One that finds nothing
+/// or can't move stays in the world.
+fn assemble_cart_subs(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    cart: u128,
+    met: &[([i32; 3], Dir)],
+    mode: Mode,
+    initial: Dir,
+) -> Vec<CartSub> {
+    use crate::glue::contraptions::actors;
+    let Some(air) = super::default_state(&*lv.host, "minecraft:air") else {
+        return Vec::new();
+    };
+    let mut subs = Vec::new();
+    for &(bearing, facing) in met {
+        let gathered = crate::glue::contraptions::gather_moving(
+            lv,
+            |lv_ref| {
+                create_engine::contraption::gather_stabilized(bearing, facing, pos, |p| {
+                    let mut f = found(lv_ref, p)?;
+                    f.state = super::car_id(crate::glue::contraptions::captured(
+                        &*lv_ref.host,
+                        lv_ref.block_state(p)?,
+                    ));
+                    Some(f)
+                })
+                .ok_or(())
+            },
+            |g| crate::glue::contraptions::cells_of(pos, g),
+        );
+        let Ok(blocks) = gathered else {
+            continue;
+        };
+        let key = sub_held_key(cart, subs.len());
+        let at = |o: [i32; 3]| [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]];
+        let storage: Vec<([i32; 3], Vec<Option<ItemStack>>)> = blocks
+            .iter()
+            .filter_map(|(o, _)| Some((*o, take_storage_at(lv, at(*o))?)))
+            .collect();
+        // `StabilizedContraption.isAnchoringBlockAt`: none.
+        let mut extras = actors::carry_extras(lv, pos, &blocks, |_| false);
+        let glue = std::mem::take(&mut extras.glue);
+        let held = actors::carry_held(lv, key, pos, &blocks);
+        for (o, _) in &blocks {
+            lv.set_state(at(*o), air, update_all());
+        }
+        let carried = actors::with_extras(
+            actors::structure_actors(&*lv.host, &blocks, super::car_state),
+            &extras,
+        );
+        subs.push(CartSub {
+            bearing: [0, 1, 2].map(|k| bearing[k] - pos[k]),
+            facing,
+            on: OnCart {
+                cart,
+                m: Mounted::new(blocks, mode, initial),
+                link: None,
+                storage,
+                glue,
+                held,
+                carried,
+                subs: Vec::new(),
+            },
+        });
+    }
+    subs
+}
+
+/// `OrientedContraptionEntity.tickActors` for the stabilized contraptions riding the cart's:
+/// each one's actors work where it hangs, at its own yaw, dropping into its own storage; one
+/// that stalls stalls the cart's (`tickActors`' passengers).
+fn tick_sub_actors(lv: &mut ServerLevel<'_>, nc: &Cart, on: &mut OnCart) {
+    use crate::glue::contraptions::actors;
+    if on.subs.iter().all(|s| s.on.carried.actors.is_empty()) {
+        return;
+    }
+    let dim = lv.dim;
+    let pose = mounted::pose(nc.pos, on.m.initial, &on.m.turn);
+    let angle = on.m.angle();
+    let mut stalled = false;
+    for (i, sub) in on.subs.iter_mut().enumerate() {
+        if sub.on.carried.actors.is_empty() {
+            continue;
+        }
+        let p = sub_pose(&pose, sub, angle);
+        let key = sub_held_key(nc.uuid, i);
+        let funnel = sub.on.carried.actors.iter().any(|a| {
+            matches!(
+                a.kind,
+                create_engine::actors::Kind::Funnel { brass: true, .. }
+            )
+        });
+        if funnel {
+            actors::storage_from_nbt(lv, key, sub.on.held.as_ref());
+        }
+        actors::lend_storage(dim, key, sub.on.storage.clone());
+        let carried = &mut sub.on.carried;
+        let s = actors::on_vehicle(&[nc.entity.id()], || {
+            actors::tick_posed_actors(lv, key, carried, p.centre, &p.turns)
+        });
+        sub.on.carried.stalled = s;
+        stalled |= s;
+        let back = actors::lent_back(dim, key);
+        if funnel {
+            actors::forget_held(dim, key);
+        }
+        if back != sub.on.storage {
+            sub.on.storage = back;
+        }
+    }
+    let own = !on.carried.actors.is_empty() && on.carried.stalled;
+    on.carried.stalled = own || stalled;
 }
 
 impl OnCart {
@@ -289,6 +457,17 @@ fn tick_cart_actors(lv: &mut ServerLevel<'_>, nc: &Cart, on: &mut OnCart) {
             None => Vec::new(),
         };
         let key = held_key(uuid);
+        // A brass funnel's filter is in what the cart keeps of its block entities: lent to its
+        // actors while they tick.
+        let funnel = on.carried.actors.iter().any(|a| {
+            matches!(
+                a.kind,
+                create_engine::actors::Kind::Funnel { brass: true, .. }
+            )
+        });
+        if funnel {
+            crate::glue::contraptions::actors::storage_from_nbt(lv, key, on.held.as_ref());
+        }
         let mut lent = on.storage.clone();
         if items.is_some() {
             lent.push((CART_INVENTORY, before.clone()));
@@ -306,6 +485,9 @@ fn tick_cart_actors(lv: &mut ServerLevel<'_>, nc: &Cart, on: &mut OnCart) {
         });
         on.carried.stalled = stalled;
         let mut back = crate::glue::contraptions::actors::lent_back(dim, key);
+        if funnel {
+            crate::glue::contraptions::actors::forget_held(dim, key);
+        }
         let after = back
             .iter()
             .position(|(o, _)| *o == CART_INVENTORY)
@@ -335,45 +517,121 @@ fn tick_cart_actors(lv: &mut ServerLevel<'_>, nc: &Cart, on: &mut OnCart) {
             });
         }
     }
+    tick_sub_actors(lv, nc, on);
 }
 
-/// What the contraption on the cart in block `key` of level `dim` carries (its actors, controls
-/// and the kinds turned off), for a click on its contraption controls, with the cart and where
-/// each block is (by the cart's block: a cart's contraption turns with it); None for no such
-/// cart.
+/// What the contraption on a cart of level `dim` carries (its actors, controls and the kinds
+/// turned off), for a click on its contraption controls: the cart's by its key (`held_key`) or
+/// the cart's block, or the `i`th stabilized contraption riding it by its key
+/// (`sub_held_key`). With the cart's rider, which riding contraption (none: the cart's), and
+/// where each block is now (as the cart's structure, or the riding one, stands this tick); None
+/// for no such cart.
 pub(crate) fn take_cart_carried(
     lv: &mut ServerLevel<'_>,
     key: [i32; 3],
 ) -> Option<(
     EntityRef,
+    Option<usize>,
     create_engine::actors::Carried,
     crate::glue::contraptions::actors::Place,
 )> {
-    let rider = CARTS.with_borrow(|c| {
-        c.known.values().find_map(|known| {
-            (known.dim == lv.dim && known.pos.map(|v| v.floor() as i32) == key)
-                .then_some(known.rider)
-                .flatten()
+    let dim = lv.dim;
+    let (uuid, known) = CARTS.with_borrow(|c| {
+        c.known.iter().find_map(|(u, known)| {
+            let named = held_key(*u) == key
+                || (0..64).any(|i| sub_held_key(*u, i) == key)
+                || known.pos.map(|v| v.floor() as i32) == key;
+            (known.dim == dim && known.rider.is_some() && named).then_some((*u, *known))
         })
     })?;
+    let rider = known.rider?;
     let on = payload(lv.host, rider)?;
-    let place = move |o: [i32; 3]| [key[0] + o[0], key[1] + o[1], key[2] + o[2]];
-    Some((rider, on.carried.clone(), Box::new(place)))
+    let sub = (0..on.subs.len()).find(|i| sub_held_key(uuid, *i) == key);
+    let mut pose = mounted::pose(known.pos, on.m.initial, &on.m.turn);
+    let carried = match sub {
+        Some(i) => {
+            pose = sub_pose(&pose, &on.subs[i], on.m.angle());
+            on.subs[i].on.carried.clone()
+        }
+        None => on.carried.clone(),
+    };
+    let place = move |o: [i32; 3]| {
+        pose.to_world(o.map(|v| f64::from(v) + 0.5))
+            .map(|v| v.floor() as i32)
+    };
+    Some((rider, sub, carried, Box::new(place)))
 }
 
-/// What [`take_cart_carried`] took, changed by its controls, goes back to the same rider.
+/// What [`take_cart_carried`] took, changed by its controls, goes back to the same rider (to
+/// the stabilized contraption riding it it came from).
 pub(crate) fn put_cart_carried(
     lv: &mut ServerLevel<'_>,
     rider: EntityRef,
+    sub: Option<usize>,
     carried: create_engine::actors::Carried,
 ) {
     if let Some(mut on) = payload(lv.host, rider) {
-        if on.carried == carried {
+        let now = match sub {
+            Some(i) => match on.subs.get(i) {
+                Some(s) => &s.on.carried,
+                None => return,
+            },
+            None => &on.carried,
+        };
+        if *now == carried {
             return;
         }
-        Arc::make_mut(&mut on).carried = carried;
+        let m = Arc::make_mut(&mut on);
+        match sub {
+            Some(i) => m.subs[i].on.carried = carried,
+            None => m.carried = carried,
+        }
         save_rider(lv.host, rider, on);
     }
+}
+
+/// The contraption controls on the carts of level `lv` (on their structures and what rides
+/// them on bearings), each structure's by its key and where it stands this tick, for the
+/// clients near them to find with their ray.
+pub(crate) fn posed_controls(lv: &mut ServerLevel<'_>) -> Vec<create_engine::actors::PosedControls> {
+    use create_engine::actors::PosedControls;
+    let dim = lv.dim;
+    let carts: Vec<(u128, Known)> = CARTS.with_borrow(|c| {
+        c.known
+            .iter()
+            .filter(|(_, k)| k.dim == dim && k.rider.is_some())
+            .map(|(u, k)| (*u, *k))
+            .collect()
+    });
+    let mut out = Vec::new();
+    for (uuid, known) in carts {
+        let Some(on) = known.rider.and_then(|r| payload(lv.host, r)) else {
+            continue;
+        };
+        if on.carried.controls.is_empty() && on.subs.iter().all(|s| s.on.carried.controls.is_empty())
+        {
+            continue;
+        }
+        let pose = mounted::pose(known.pos, on.m.initial, &on.m.turn);
+        if !on.carried.controls.is_empty() {
+            out.push(PosedControls {
+                key: held_key(uuid),
+                pose,
+                controls: on.carried.controls.iter().map(|(o, _)| *o).collect(),
+            });
+        }
+        for (i, sub) in on.subs.iter().enumerate() {
+            if sub.on.carried.controls.is_empty() {
+                continue;
+            }
+            out.push(PosedControls {
+                key: sub_held_key(uuid, i),
+                pose: sub_pose(&pose, sub, on.m.angle()),
+                controls: sub.on.carried.controls.iter().map(|(o, _)| *o).collect(),
+            });
+        }
+    }
+    out
 }
 
 /// The key a cart's contraption's block data is carried under while it is put back.
@@ -1303,13 +1561,17 @@ fn assemble(lv: &mut ServerLevel<'_>, pos: [i32; 3], axis: Axis, backwards: bool
         return;
     };
     let anchor_id = super::car_id(anchor);
-    let gathered = {
-        let lv_ref = &*lv;
-        cart::gather(pos, anchor_id, |p| {
+    // `disassembleForMovement`: a running windmill bearing on it puts its sails back first.
+    let gathered = crate::glue::contraptions::gather_moving(
+        lv,
+        |lv_ref| cart::gather(pos, anchor_id, |p| {
             // The contraptions' search (storage blocks ride), the state in this module's
             // numbering.
             let mut f = found(lv_ref, p)?;
-            f.state = super::car_id(lv_ref.block_state(p)?);
+            f.state = super::car_id(crate::glue::contraptions::captured(
+                &*lv_ref.host,
+                lv_ref.block_state(p)?,
+            ));
             // `Contraption.moveBlock`: "cart assemblers attach themselves" to the block above.
             let below = [p[0], p[1] - 1, p[2]];
             if lv_ref
@@ -1324,9 +1586,13 @@ fn assemble(lv: &mut ServerLevel<'_>, pos: [i32; 3], axis: Axis, backwards: bool
                 f.movable = p != pos;
             }
             Some(f)
-        })
-    };
-    let Ok(Some(mut blocks)) = gathered else {
+        }),
+        |g| {
+            g.as_ref()
+                .map_or_else(Vec::new, |b| crate::glue::contraptions::cells_of(pos, &b.0))
+        },
+    );
+    let Ok(Some((mut blocks, met))) = gathered else {
         return;
     };
     // `capture`: other assemblers become anchors, the first holding a cart gives the
@@ -1429,6 +1695,7 @@ fn assemble(lv: &mut ServerLevel<'_>, pos: [i32; 3], axis: Axis, backwards: bool
         &extras,
     );
     crate::glue::advancements::assembled(lv, pos, &blocks);
+    let subs = assemble_cart_subs(lv, pos, nc.uuid, &met, mode, initial);
     let m = Mounted::new(blocks, mode, initial);
     // A furnace cart's push is zeroed (`PushX`, `PushZ` saved as 0 and loaded back).
     if nc.kind == "minecraft:furnace_minecart"
@@ -1444,6 +1711,7 @@ fn assemble(lv: &mut ServerLevel<'_>, pos: [i32; 3], axis: Axis, backwards: bool
         glue,
         held,
         carried,
+        subs,
     };
     if !save_rider(lv.host, rider, Arc::new(on.clone())) {
         put_back(lv, rider, nc.pos, on);
@@ -1598,31 +1866,31 @@ impl EntityPart for ContraptionRider {
     }
 }
 
-/// `AbstractContraptionEntity.disassemble`: each block where the contraption's turn (to the
-/// nearest quarter) puts it, above the block the cart is in (`addBlocksToWorld`); a block whose
-/// place is taken drops. Anchors are not placed (`customBlockPlacement`). Storage blocks take
-/// back what they carried (dropped where none went back).
-fn put_back(lv: &mut ServerLevel<'_>, rider: EntityRef, at: [f64; 3], on: OnCart) {
+/// `addBlocksToWorld` for one contraption of a cart's (`on`, its block data kept under `key`):
+/// its blocks (but anchors, and offset 0 with `skip_origin`) at `place(offset)` turned `quarter`
+/// about up, what their block entities held, their storage, controls and glue. Returns what
+/// could not go back, to drop.
+fn lay_back(
+    lv: &mut ServerLevel<'_>,
+    key: [i32; 3],
+    on: OnCart,
+    place: &dyn Fn([i32; 3]) -> [i32; 3],
+    quarter: i32,
+    skip_origin: bool,
+) -> Vec<([i32; 3], ItemStack)> {
     use crate::glue::contraptions::actors;
-    let m = &on.m;
-    let origin = [
-        at[0].floor() as i32,
-        (at[1] + 0.5).floor() as i32,
-        at[2].floor() as i32,
-    ];
-    let (quarter, blocks) = mounted::placed_back(&m.blocks, mounted::y_rot(m.initial), m.turn.yaw);
-    let key = held_key(on.cart);
-    let world_pos = |o: [i32; 3]| [origin[0] + o[0], origin[1] + o[1], origin[2] + o[2]];
-    let place = |o| world_pos(create_engine::contraption::rotate(o, quarter, Axis::Y));
-    let blocks: Vec<_> = blocks
-        .into_iter()
-        .filter_map(|(o, state)| {
-            if is_anchor(state) {
+    let blocks: Vec<_> = on
+        .m
+        .blocks
+        .iter()
+        .filter_map(|&(o, state)| {
+            if is_anchor(state) || (skip_origin && o == [0, 0, 0]) {
                 return None;
             }
+            let state = turned_state(&*lv.host, super::car_state(state)?, quarter, Axis::Y);
             Some((
-                world_pos(o),
-                turned_state(&*lv.host, super::car_state(state)?, quarter, Axis::Y),
+                place(o),
+                crate::glue::contraptions::put_back_state(&*lv.host, state),
             ))
         })
         .collect();
@@ -1676,6 +1944,46 @@ fn put_back(lv: &mut ServerLevel<'_>, rider: EntityRef, at: [f64; 3], on: OnCart
         .retain(|(o, _)| placed.contains_key(&place(*o)));
     carried.glue = on.glue;
     actors::release_extras(lv, &mut carried, place);
+    drops
+}
+
+/// `AbstractContraptionEntity.disassemble`: each block where the contraption's turn (to the
+/// nearest quarter) puts it, above the block the cart is in (`addBlocksToWorld`); a block whose
+/// place is taken drops. Anchors are not placed (`customBlockPlacement`). Storage blocks take
+/// back what they carried (dropped where none went back). Then the stabilized contraptions riding
+/// it go back, each turned by its own yaw.
+fn put_back(lv: &mut ServerLevel<'_>, rider: EntityRef, at: [f64; 3], mut on: OnCart) {
+    let m = &on.m;
+    let origin = [
+        at[0].floor() as i32,
+        (at[1] + 0.5).floor() as i32,
+        at[2].floor() as i32,
+    ];
+    let (quarter, _) = mounted::placed_back(&m.blocks, mounted::y_rot(m.initial), m.turn.yaw);
+    let world_pos = |o: [i32; 3]| [origin[0] + o[0], origin[1] + o[1], origin[2] + o[2]];
+    let place = |o| world_pos(create_engine::contraption::rotate(o, quarter, Axis::Y));
+    let subs = std::mem::take(&mut on.subs);
+    let cart = on.cart;
+    let mut drops = lay_back(lv, held_key(cart), on, &place, quarter, true);
+    // `disassemble`'s riders: each stabilized contraption set where its bearing's front went
+    // (`transform.apply(connectedPos)`) and taken apart turned by its own yaw.
+    for (i, sub) in subs.into_iter().enumerate() {
+        let front = sub.front();
+        let at = place(front);
+        let q = if sub.facing.axis() == Axis::Y { 0 } else { quarter };
+        let sub_place = |o: [i32; 3]| {
+            let r = create_engine::contraption::rotate(
+                [o[0] - front[0], o[1] - front[1], o[2] - front[2]],
+                q,
+                Axis::Y,
+            );
+            [at[0] + r[0], at[1] + r[1], at[2] + r[2]]
+        };
+        drops.extend(lay_back(lv, sub_held_key(cart, i), sub.on, &sub_place, q, false));
+        crate::glue::contraptions::disassemble_sound(lv, at);
+    }
+    // `CONTRAPTION_DISASSEMBLE` at the contraption's block.
+    crate::glue::contraptions::disassemble_sound(lv, origin);
     let drops: Vec<_> = drops
         .into_iter()
         .filter_map(|(pos, stack)| {
@@ -1758,6 +2066,16 @@ fn encode_payload(
     on: &OnCart,
     state_name: impl Fn(u32) -> Option<String>,
 ) -> Compound {
+    encode_contraption(host, on, &state_name)
+}
+
+/// [`encode_payload`], with the stabilized contraptions riding it (`SubContraptions`), each
+/// written as a cart's is with the bearing it hangs on (`Bearing`: offset and facing).
+fn encode_contraption(
+    host: &dyn Host,
+    on: &OnCart,
+    state_name: &dyn Fn(u32) -> Option<String>,
+) -> Compound {
     let m = &on.m;
     let blocks = m
         .blocks
@@ -1829,6 +2147,21 @@ fn encode_payload(
             Tag::Double(f64::from(link.length).to_bits()),
         );
     }
+    if !on.subs.is_empty() {
+        let subs = on
+            .subs
+            .iter()
+            .map(|sub| {
+                let mut s = encode_contraption(host, &sub.on, state_name);
+                let facing = Dir::ALL.iter().position(|d| *d == sub.facing).unwrap_or(0);
+                let mut at = sub.bearing.to_vec();
+                at.push(facing as i32);
+                s.insert("Bearing".into(), Tag::IntArray(at));
+                Tag::Compound(s)
+            })
+            .collect();
+        c.insert("SubContraptions".into(), Tag::List(subs));
+    }
     c
 }
 
@@ -1862,6 +2195,15 @@ fn contraption_of(
     host: &dyn Host,
     c: &Compound,
     state_id: impl Fn(&str) -> Option<u32>,
+) -> Option<OnCart> {
+    contraption_of_dyn(host, c, &state_id)
+}
+
+/// [`contraption_of`], with the stabilized contraptions riding it (`SubContraptions`).
+fn contraption_of_dyn(
+    host: &dyn Host,
+    c: &Compound,
+    state_id: &dyn Fn(&str) -> Option<u32>,
 ) -> Option<OnCart> {
     let Some(Tag::List(list)) = get(c, "Blocks") else {
         return None;
@@ -1936,6 +2278,22 @@ fn contraption_of(
         crate::glue::contraptions::actors::structure_actors(host, &m.blocks, super::car_state),
         &extras,
     );
+    let subs = match get(c, "SubContraptions") {
+        Some(Tag::List(list)) => list
+            .iter()
+            .filter_map(|t| {
+                let Tag::Compound(sc) = t else { return None };
+                let b = ints(get(sc, "Bearing"));
+                let facing = *Dir::ALL.get(usize::try_from(*b.get(3)?).ok()?)?;
+                Some(CartSub {
+                    bearing: [*b.first()?, *b.get(1)?, *b.get(2)?],
+                    facing,
+                    on: contraption_of_dyn(host, sc, state_id)?,
+                })
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
     Some(OnCart {
         cart: 0,
         m,
@@ -1944,6 +2302,7 @@ fn contraption_of(
         glue,
         held: get(c, "Held").cloned(),
         carried,
+        subs,
     })
 }
 
@@ -2299,17 +2658,37 @@ fn level_tick(lv: &mut ServerLevel<'_>) {
         lv,
         visuals
             .iter()
-            .filter_map(|on| {
-                let p = carts.get(&on.cart)?.pos;
-                Some((
+            .flat_map(|on| {
+                let Some(p) = carts.get(&on.cart).map(|c| c.pos) else {
+                    return Vec::new();
+                };
+                let base = mounted::y_rot(on.m.initial);
+                let angle = on.m.angle();
+                let mut shown = vec![(
                     on.cart,
+                    0,
                     [p[0], p[1] + 0.5, p[2]],
-                    on.m.angle(),
+                    angle,
                     on.m.turn.pitch,
-                    mounted::y_rot(on.m.initial),
+                    base,
                     on.m.blocks.as_slice(),
                     on.held.as_ref(),
-                ))
+                )];
+                // Its stabilized contraptions, where they hang at their own yaw, no pitch.
+                let pose = mounted::pose(p, on.m.initial, &on.m.turn);
+                for (i, sub) in on.subs.iter().enumerate() {
+                    shown.push((
+                        on.cart,
+                        1 + i,
+                        sub_pose(&pose, sub, angle).centre,
+                        cart::stabilized_angle(sub.facing, angle),
+                        0.0,
+                        base,
+                        sub.on.m.blocks.as_slice(),
+                        sub.on.held.as_ref(),
+                    ));
+                }
+                shown
             })
             .collect(),
     );
@@ -2454,12 +2833,26 @@ fn tick_mounted(lv: &mut ServerLevel<'_>, carts: &HashMap<u128, Cart>) -> Vec<Ar
             || before.m.blocks.clone(),
             super::car_state,
         );
+        // Each stabilized contraption riding it: its own stand-in where it hangs.
+        let angle = mounted::y_rot(before.m.initial) - turn.yaw;
+        for (i, sub) in before.subs.iter().enumerate() {
+            colliders::place(
+                lv,
+                colliders::Owner::Anchor(sub_held_key(uuid, i), 0),
+                colliders::Carrier::Own(colliders::STATIONARY),
+                sub_pose(&pose, sub, angle),
+                colliders::blocks_hash(&sub.on.m.blocks),
+                || sub.on.m.blocks.clone(),
+                super::car_state,
+            );
+        }
         let furnaces = fuel
             .into_iter()
             .flatten()
             .filter(|cart| cart.kind == "minecraft:furnace_minecart");
         if turn == before.m.turn
             && before.carried.actors.is_empty()
+            && before.subs.iter().all(|s| s.on.carried.actors.is_empty())
             && furnaces.clone().next().is_none()
         {
             live.push(before);
@@ -2477,7 +2870,12 @@ fn tick_mounted(lv: &mut ServerLevel<'_>, carts: &HashMap<u128, Cart>) -> Vec<Ar
         }
         let content_changed = before.storage != on.storage
             || before.carried.controls != on.carried.controls
-            || before.carried.disabled != on.carried.disabled;
+            || before.carried.disabled != on.carried.disabled
+            || before.subs.iter().zip(&on.subs).any(|(a, b)| {
+                a.on.storage != b.on.storage
+                    || a.on.carried.controls != b.on.carried.controls
+                    || a.on.carried.disabled != b.on.carried.disabled
+            });
         let on = Arc::new(on);
         let saved = if content_changed {
             save_rider(lv.host, rider, on.clone())
@@ -2828,6 +3226,7 @@ mod tests {
             glue: vec![Glue::span([0, 1, 0], [1, 2, 3])],
             held: Some(Tag::List(Vec::new())),
             carried: Default::default(),
+            subs: Vec::new(),
         };
         let body = encode_payload(&host, &on, |id| {
             assert_eq!(id, 72);

@@ -5,8 +5,9 @@ use super::super::server::{ServerLevel, update_all};
 use super::super::world::with_world;
 use super::colliders::{self, Owner};
 use super::{
-    actors, add, axis_of, clicker, dir_name, dir_of, draw, flag, found, in_click_level, prop,
-    put_back_blocks, state_of_text, state_text, state_with, take_blocks, turned_state,
+    actors, add, assemble_sound, axis_of, clicker, dir_name, dir_of, disassemble_sound, draw,
+    flag, found, in_click_level, prop, put_back_blocks, state_of_text, state_text, state_with,
+    take_blocks, turned_state,
 };
 use create_engine::Block;
 use create_engine::actors::Carried;
@@ -37,12 +38,108 @@ thread_local! {
     /// stop, for the checks of the next few ticks.
     static PISTONS_STOPPED: RefCell<HashMap<(usize, [i32; 3]), Stopped>> =
         RefCell::new(HashMap::new());
+    /// Windmill bearings to assemble again on their next tick (`queuedReassembly`): taken apart
+    /// for a structure that moves them, or set down by one.
+    /// The game time each was queued at: it assembles from the tick after.
+    static REASSEMBLE: RefCell<HashMap<(usize, [i32; 3]), i64>> = RefCell::new(HashMap::new());
+    /// The actors of the stabilized structures riding a turning bearing's (`Windmill.subs`, in
+    /// order), for the structures in `BEARING_CARRIED`.
+    static SUB_CARRIED: RefCell<HashMap<(usize, [i32; 3]), Vec<Carried>>> =
+        RefCell::new(HashMap::new());
 }
 
 pub(super) fn forget() {
     BEARING_CARRIED.with_borrow_mut(HashMap::clear);
     BEARINGS_LOOKED.with_borrow_mut(HashSet::clear);
     PISTONS_STOPPED.with_borrow_mut(HashMap::clear);
+    REASSEMBLE.with_borrow_mut(HashMap::clear);
+    SUB_CARRIED.with_borrow_mut(HashMap::clear);
+}
+
+/// The actors of the turning structure at `pos` and of what rides it stop working (it comes
+/// apart).
+fn cancel_carried(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    let dim = lv.dim;
+    if let Some(mut c) = BEARING_CARRIED.with_borrow_mut(|c| c.remove(&(dim, pos))) {
+        actors::cancel_actors(lv, pos, &mut c);
+    }
+    let riding = SUB_CARRIED
+        .with_borrow_mut(|c| c.remove(&(dim, pos)))
+        .unwrap_or_default();
+    for (i, mut c) in riding.into_iter().enumerate() {
+        actors::cancel_actors(lv, contraption::sub_key(pos, i), &mut c);
+    }
+}
+
+/// `Contraption.onEntityCreated`: each stabilized bearing the search of the structure just taken
+/// from the bearing at `pos` met assembles what it faces (`StabilizedContraption.assemble`,
+/// after the structure left the world), in the order met. One that finds nothing or can't move
+/// stays in the world.
+fn assemble_subs(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    met: &[([i32; 3], Dir)],
+) -> Vec<contraption::Stabilized> {
+    let mut subs = Vec::new();
+    for &(bearing, facing) in met {
+        let key = contraption::sub_key(pos, subs.len());
+        subs.extend(assemble_sub(lv, pos, key, bearing, facing));
+    }
+    subs
+}
+
+/// `StabilizedContraption.assemble` for the mechanical bearing at `bearing` riding the
+/// structure anchored at `pos` (offsets from there), its storage and block data kept under
+/// `key` (its own `MountedStorageManager`); None when it found nothing or can't move.
+pub(super) fn assemble_sub(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    key: [i32; 3],
+    bearing: [i32; 3],
+    facing: Dir,
+) -> Option<contraption::Stabilized> {
+    let blocks = super::gather_moving(
+        lv,
+        |lv| contraption::gather_stabilized(bearing, facing, pos, |p| found(lv, p)).ok_or(()),
+        |g| super::cells_of(pos, g),
+    )
+    .ok()?;
+    actors::carry_storage(lv, key, pos, &blocks);
+    // `StabilizedContraption.isAnchoringBlockAt`: none.
+    let extras = actors::carry_extras(lv, pos, &blocks, |_| false);
+    take_blocks(lv, pos, &blocks);
+    Some(contraption::Stabilized {
+        bearing: [0, 1, 2].map(|i| bearing[i] - pos[i]),
+        facing,
+        blocks,
+        extras,
+    })
+}
+
+/// `ControlledContraptionEntity.disassemble`'s riders: each stabilized structure on the bearing
+/// at `bearing`'s, which went back turned `quarter` about `axis`, is set where its front went
+/// (`transform.apply(connectedPos)`) and taken apart unturned: its blocks, what its block
+/// entities held, its storage, controls and glue, and what stood on it, with its sound.
+fn put_back_subs(
+    lv: &mut ServerLevel<'_>,
+    bearing: [i32; 3],
+    axis: Axis,
+    quarter: i32,
+    subs: &[contraption::Stabilized],
+) {
+    for (i, sub) in subs.iter().enumerate() {
+        let key = contraption::sub_key(bearing, i);
+        let place = |o: [i32; 3]| add(bearing, sub.placed(o, axis, quarter));
+        actors::expect_back(lv, key, place);
+        let blocks: Vec<([i32; 3], u32)> =
+            sub.blocks.iter().map(|(o, s)| (place(*o), *s)).collect();
+        put_back_blocks(lv, &blocks, |lv, p| lv.is_free(p));
+        let base = place([0; 3]).map(f64::from);
+        colliders::lift_riders(lv, Owner::Anchor(bearing, 1 + i as u8), Pose::translated(base));
+        actors::release_storage(lv, key, place);
+        actors::release_extras(lv, &mut sub.extras.clone(), place);
+        disassemble_sound(lv, place(sub.front()));
+    }
 }
 
 pub(super) fn register(r: &mut dyn Registrar) {
@@ -56,6 +153,99 @@ pub(super) fn register(r: &mut dyn Registrar) {
     }
     r.block_part(key(Block::WindmillBearing), WindmillPart);
     r.block_part(key(Block::MechanicalBearing), MechanicalBearingPart);
+    r.block_part(key(Block::MechanicalPiston), PistonPart);
+    r.block_part(key(Block::StickyMechanicalPiston), PistonPart);
+    let _ = ITEM_SLIME.set(r.particle_key("minecraft:item_slime"));
+}
+
+/// `ParticleTypes.ITEM_SLIME`.
+static ITEM_SLIME: std::sync::OnceLock<mod_api::ParticleKey> = std::sync::OnceLock::new();
+
+/// A slime ball sent at `at` (`ParticleTypes.ITEM_SLIME`, still).
+pub(super) fn slime_particle(lv: &mut ServerLevel<'_>, at: [f64; 3]) {
+    if let Some(&key) = ITEM_SLIME.get() {
+        let options = mod_api::ParticleOptions::simple(key);
+        let _ = lv
+            .level
+            .send_particles(&mut *lv.host, &options, None, at, [0.0; 3], 0.0, 1);
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Mechanical pistons' clicks
+
+struct PistonPart;
+
+#[mod_api::horizon_part]
+impl BlockPart for PistonPart {
+    /// `MechanicalPistonBlock.useItemOn`, for a player who may build and doesn't sneak: an
+    /// empty hand has the piston look at its speed on the next tick (`assembleNextTick`); a
+    /// slime ball (`c:slimeballs`) on the front of a retracted plain piston makes it sticky
+    /// (`SLIME_ADDED`, one ball outside creative). Anything else goes on to the item.
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut UseItemOnEvent<'_>,
+    ) -> Option<InteractionResult> {
+        let c = clicker(&*host, event.click);
+        let player = c.player?;
+        if player.may_build(&*host) != Some(true) || c.sneaking {
+            return None;
+        }
+        let pos = event.click.pos;
+        let slime = event.click.stack.is_some_and(|s| {
+            let tag = mod_api::Identifier::parse("c:slimeballs")
+                .ok()
+                .and_then(|t| host.tags().key(&t));
+            tag.is_some_and(|t| host.tags().is_in_tag(s.item(), t) == Some(true))
+        });
+        if !slime {
+            if c.held.is_some() {
+                return None;
+            }
+            if c.after_empty_main {
+                return Some(InteractionResult::Success);
+            }
+            in_click_level(host, event.click, |lv| {
+                let dim = lv.dim;
+                PISTONS_STOPPED.with_borrow_mut(|m| m.remove(&(dim, pos)));
+                with_world(|w| w.dims[dim].piston_checks.push(pos));
+            });
+            return Some(InteractionResult::Success);
+        }
+        let face = event.click.hit.face;
+        let point = event.click.hit.point;
+        let hand = event.click.hand;
+        in_click_level(host, event.click, |lv| {
+            let (name, props) = lv.name_props(pos)?;
+            if prop(&props, "state") != Some("retracted") {
+                return None;
+            }
+            let facing = prop(&props, "facing").and_then(dir_of)?;
+            if facing.offset() != face || name != "create:mechanical_piston" {
+                return None;
+            }
+            // `addParticle(ITEM_SLIME)` at the click, which Create's client spawns for itself.
+            slime_particle(lv, point);
+            super::play_entry(lv, super::SLIME_ADDED, pos, 0.5, 1.0);
+            if !super::super::items::creative(&*lv.host, player) {
+                super::super::items::shrink_held(&mut *lv.host, player, hand, 1);
+            }
+            let along = if flag(&props, "axis_along_first") { "true" } else { "false" };
+            let sticky = state_with(
+                &*lv.host,
+                "create:sticky_mechanical_piston",
+                &[
+                    ("facing", dir_name(facing)),
+                    ("axis_along_first", along),
+                    ("state", "retracted"),
+                ],
+            )?;
+            lv.set_num(pos, sticky, update_all());
+            Some(InteractionResult::Success)
+        })
+        .flatten()
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -258,10 +448,7 @@ impl BlockPart for MechanicalBearingPart {
                     let Some(facing) = facing_of(lv, pos, Block::MechanicalBearing) else {
                         return;
                     };
-                    if let Some(mut c) = BEARING_CARRIED.with_borrow_mut(|c| c.remove(&(dim, pos)))
-                    {
-                        actors::cancel_actors(lv, pos, &mut c);
-                    }
+                    cancel_carried(lv, pos);
                     let quarter = contraption::quarter(turn.angle_at(now));
                     let state = lv.block(pos);
                     if let Some(w) =
@@ -293,6 +480,52 @@ fn put_back(lv: &mut ServerLevel<'_>, bearing: [i32; 3], w: &create_engine::worl
     colliders::lift_riders(lv, Owner::Anchor(bearing, 0), placed);
     actors::release_storage(lv, bearing, |o| add(bearing, o));
     actors::release_extras(lv, &mut w.extras.clone(), |o| add(bearing, o));
+    // Its sails went back unturned (a windmill's angle is zeroed first), so do its riders.
+    put_back_subs(lv, bearing, Axis::Y, 0, &w.subs);
+    // `disassemble`: the structure's entity at its anchor (the block in front), then the bearing.
+    if let Some(&(anchor, _)) = blocks.first() {
+        disassemble_sound(lv, anchor);
+    }
+    disassemble_sound(lv, bearing);
+}
+
+/// `WindmillBearingBlockEntity.disassembleForMovement` for the windmill bearing at `pos`, which
+/// a structure's search met (`Contraption.moveBlock`): a running one puts its sails back
+/// (`disassemble`, its angle zeroed) and assembles again where it is next ticked
+/// (`queuedReassembly`). False for one not running.
+pub(super) fn disassemble_for_movement(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> bool {
+    let dim = lv.dim;
+    let running = with_world(|w| {
+        w.dims[dim]
+            .windmills
+            .get(&pos)
+            .is_some_and(|m| m.kind == create_engine::world::BearingKind::Windmill)
+    }) == Some(true);
+    if !running || facing_of(lv, pos, Block::WindmillBearing).is_none() {
+        return false;
+    }
+    cancel_carried(lv, pos);
+    let state = lv.block(pos);
+    let Some(w) = with_world(|w| w.windmill_disassembled(dim, pos, state)).flatten() else {
+        return false;
+    };
+    put_back(lv, pos, &w);
+    draw::hide(lv, pos);
+    queue_reassembly(lv, pos);
+    true
+}
+
+/// Whether the windmill bearing at `pos` was taken apart to move and is to assemble again
+/// (`queuedReassembly`), which then rides with it (`Subsystem::carry_out`).
+pub(super) fn take_queued_reassembly(dim: usize, pos: [i32; 3]) -> bool {
+    REASSEMBLE.with_borrow_mut(|r| r.remove(&(dim, pos))).is_some()
+}
+
+/// A windmill bearing set down with `queuedReassembly` (or taken apart to move) assembles from
+/// its next tick, unless a structure takes it first.
+pub(super) fn queue_reassembly(lv: &ServerLevel<'_>, pos: [i32; 3]) {
+    let now = lv.game_time();
+    REASSEMBLE.with_borrow_mut(|r| r.insert((lv.dim, pos), now));
 }
 
 /// The facing of the Create block `block` at `pos`.
@@ -353,6 +586,15 @@ pub(super) fn set_exception(
                     vec![n.to_string(), contraption::MIN_SAILS.to_string()],
                     None,
                 ),
+                Refused::NoPistonPoles => ("noPistonPoles", Vec::new(), None),
+                Refused::TooManyPistonPoles => (
+                    "tooManyPistonPoles",
+                    vec![create_engine::piston::MAX_POLES.to_string()],
+                    None,
+                ),
+                Refused::NoContacts => ("no_contacts", Vec::new(), None),
+                Refused::TooManyContacts => ("too_many_contacts", Vec::new(), None),
+                Refused::ColumnConflict => ("column_conflict", Vec::new(), None),
                 Refused::Empty => return,
             };
             let mut c = Compound::new();
@@ -401,6 +643,30 @@ fn sequence_limit(dim: usize, pos: [i32; 3], distance: bool) -> Option<f32> {
 /// without either.
 pub(super) fn tick_windmills(lv: &mut ServerLevel<'_>) {
     let dim = lv.dim;
+    // `queuedReassembly`: a windmill bearing taken apart to move that stayed, or one set down,
+    // assembles (`assembleNextTick`) unless it runs.
+    let now = lv.game_time();
+    let due: Vec<[i32; 3]> = REASSEMBLE.with_borrow_mut(|r| {
+        let due: Vec<[i32; 3]> = r
+            .iter()
+            .filter(|((d, _), t)| *d == dim && **t < now)
+            .map(|((_, p), _)| *p)
+            .collect();
+        for p in &due {
+            r.remove(&(dim, *p));
+        }
+        due
+    });
+    for p in due {
+        if facing_of(lv, p, Block::WindmillBearing).is_some() {
+            with_world(|w| {
+                let d = &mut w.dims[dim];
+                if !d.windmills.contains_key(&p) && !d.windmill_assemble.contains(&p) {
+                    d.windmill_assemble.push(p);
+                }
+            });
+        }
+    }
     let Some((orphans, queued)) = with_world(|w| {
         let d = &mut w.dims[dim];
         (
@@ -430,8 +696,12 @@ pub(super) fn tick_windmills(lv: &mut ServerLevel<'_>) {
         let Some(facing) = facing_of(lv, pos, Block::WindmillBearing) else {
             continue;
         };
-        let gathered = contraption::gather_windmill(pos, facing, |p| found(lv, p));
-        let (blocks, sails) = match gathered {
+        let gathered = super::gather_moving(
+            lv,
+            |lv| contraption::gather_windmill_stabilizing(pos, facing, |p| found(lv, p)),
+            |g| super::cells_of(pos, &g.blocks),
+        );
+        let contraption::Searched { blocks, sails, subs } = match gathered {
             Ok(g) => g,
             Err(r) => {
                 set_exception(lv, pos, Some(&r));
@@ -443,6 +713,7 @@ pub(super) fn tick_windmills(lv: &mut ServerLevel<'_>) {
         actors::carry_storage(lv, pos, pos, &blocks);
         let extras = actors::carry_extras(lv, pos, &blocks, |p| p == pos);
         take_blocks(lv, pos, &blocks);
+        let subs = assemble_subs(lv, pos, &subs);
         // `RotationDirection` on its value box: clockwise unless set otherwise.
         let clockwise = super::option_at(dim, pos) == 0;
         // `assemble`: the angle starts at 0, turning at the speed its sails generate
@@ -459,8 +730,10 @@ pub(super) fn tick_windmills(lv: &mut ServerLevel<'_>) {
             clockwise,
             kind: create_engine::world::BearingKind::Windmill,
             extras,
+            subs,
         };
         with_world(|world| world.windmill_assembled(dim, pos, state, w));
+        assemble_sound(lv, pos);
     }
     let changed = with_world(|w| {
         let mut v = std::mem::take(&mut w.dims[dim].windmill_changes);
@@ -490,7 +763,11 @@ fn show_windmill(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
     let facing = super::create_info(lv.block(pos))
         .and_then(|(_, i)| i.facing)
         .unwrap_or(Dir::Up);
-    draw::show_turn(lv, pos, &w.blocks, facing.axis(), w.turn);
+    let front = facing.offset();
+    let still = contraption::still_tops(&w.blocks, front, super::mechanical_bearing_facing, |f, l| {
+        contraption::bearing_stabilizes(facing, f, l)
+    });
+    draw::show_turn(lv, pos, &w.blocks, &w.subs, &still, facing.axis(), w.turn);
 }
 
 /// `tickActors` for turning bearings and windmills with actors: each works where the structure
@@ -502,7 +779,8 @@ pub(super) fn tick_bearing_actors(lv: &mut ServerLevel<'_>) {
     let now = lv.game_time();
     let structures = with_world(|w| w.dims[dim].windmills.len()).unwrap_or(0);
     if structures > 0 || BEARINGS_LOOKED.with_borrow(|l| !l.is_empty()) {
-        let fresh: Vec<([i32; 3], Blocks, Carried)> = with_world(|w| {
+        type Fresh = ([i32; 3], Blocks, Carried, Vec<contraption::Stabilized>);
+        let fresh: Vec<Fresh> = with_world(|w| {
             let mut fresh = Vec::new();
             BEARINGS_LOOKED.with_borrow_mut(|l| {
                 let d = &w.dims[dim];
@@ -510,19 +788,28 @@ pub(super) fn tick_bearing_actors(lv: &mut ServerLevel<'_>) {
                 l.retain(|k| k.0 != dim || d.windmills.contains_key(&k.1));
                 for (p, m) in &d.windmills {
                     if l.insert((dim, *p)) {
-                        fresh.push((*p, m.blocks.clone(), m.extras.clone()));
+                        fresh.push((*p, m.blocks.clone(), m.extras.clone(), m.subs.clone()));
                     }
                 }
             });
             fresh
         })
         .unwrap_or_default();
-        for (pos, blocks, extras) in fresh {
+        for (pos, blocks, extras, subs) in fresh {
             let carried = actors::with_extras(actors::bearing_actors(&*lv.host, &blocks), &extras);
-            if carried.actors.is_empty() && carried.controls.is_empty() {
+            // `OrientedContraptionEntity.tickActors` for each stabilized structure riding it.
+            let riding: Vec<Carried> = subs
+                .iter()
+                .map(|s| actors::with_extras(actors::bearing_actors(&*lv.host, &s.blocks), &s.extras))
+                .collect();
+            let none = |c: &Carried| c.actors.is_empty() && c.controls.is_empty();
+            if none(&carried) && riding.iter().all(none) {
                 continue;
             }
             BEARING_CARRIED.with_borrow_mut(|c| c.insert((dim, pos), carried));
+            if !riding.iter().all(none) {
+                SUB_CARRIED.with_borrow_mut(|c| c.insert((dim, pos), riding));
+            }
             with_world(|w| w.dims[dim].windmill_changes.push(pos));
         }
     }
@@ -534,17 +821,49 @@ pub(super) fn tick_bearing_actors(lv: &mut ServerLevel<'_>) {
             continue;
         };
         // The structure's turn, which the engine keeps for both kinds (`angle`).
-        let turn = with_world(|w| w.dims[dim].windmills.get(&pos).map(|m| m.turn)).flatten();
-        let (Some(facing), Some(turn)) = (facing, turn) else {
+        let running = with_world(|w| {
+            let m = w.dims[dim].windmills.get(&pos)?;
+            Some((m.turn, m.subs.clone()))
+        })
+        .flatten();
+        let (Some(facing), Some((turn, subs))) = (facing, running) else {
             actors::cancel_actors(lv, pos, &mut carried);
+            let riding = SUB_CARRIED
+                .with_borrow_mut(|c| c.remove(&(dim, pos)))
+                .unwrap_or_default();
+            for (i, mut c) in riding.into_iter().enumerate() {
+                actors::cancel_actors(lv, contraption::sub_key(pos, i), &mut c);
+            }
             continue;
         };
         let rpm = speed(dim, pos);
         let deg = f64::from(turn.angle_at(now));
         let was = carried.stalled;
-        let stalled = actors::tick_turning_actors(lv, pos, &mut carried, pos, facing.axis(), deg);
+        let mut stalled =
+            actors::tick_turning_actors(lv, pos, &mut carried, pos, facing.axis(), deg);
+        // Each stabilized structure's actors work where it hangs, upright; one stalling it
+        // stalls the structure it rides (`tickActors`' passengers).
+        let mut riding = SUB_CARRIED
+            .with_borrow_mut(|c| c.remove(&(dim, pos)))
+            .unwrap_or_default();
+        for (i, (sub, c)) in subs.iter().zip(riding.iter_mut()).enumerate() {
+            let shift = sub.shift(facing.axis(), deg);
+            let pivot = [0, 1, 2].map(|i| f64::from(pos[i]) + 0.5 + shift[i]);
+            let still = create_engine::actors::one_turn(facing.axis(), 0.0);
+            let key = contraption::sub_key(pos, i);
+            c.stalled = actors::tick_posed_actors(lv, key, c, pivot, &still);
+            stalled |= c.stalled;
+        }
         carried.stalled = stalled;
-        super::actor_draw::show_actors(lv, pos, pos, &carried);
+        let shown: Vec<([i32; 3], &Carried)> = riding
+            .iter()
+            .enumerate()
+            .map(|(i, c)| (contraption::sub_key(pos, i), c))
+            .collect();
+        super::actor_draw::show_actors_riding(lv, pos, pos, &carried, &shown);
+        if !riding.is_empty() {
+            SUB_CARRIED.with_borrow_mut(|c| c.insert((dim, pos), riding));
+        }
         if stalled != was {
             // Held while an actor stalls it, and turning on at its speed after (`isStalled`).
             let at = if stalled { 0.0 } else { rpm };
@@ -568,7 +887,27 @@ pub(super) fn take_turning(
 ) -> Option<(Carried, actors::Place)> {
     let dim = lv.dim;
     let now = lv.game_time();
-    let w = with_world(|w| w.dims[dim].windmills.get(&pos).cloned()).flatten()?;
+    let w = with_world(|w| w.dims[dim].windmills.get(&pos).cloned()).flatten();
+    // A stabilized structure riding one, by its own key: what it carries, and its blocks
+    // where it hangs.
+    if w.is_none()
+        && let Some((parent, i)) = contraption::sub_of_key(pos)
+    {
+        let w = with_world(|w| w.dims[dim].windmills.get(&parent).cloned()).flatten()?;
+        let sub = w.subs.get(i)?.clone();
+        let facing = super::create_info(lv.block(parent)).and_then(|(_, f)| f.facing)?;
+        let carried = SUB_CARRIED
+            .with_borrow(|c| c.get(&(dim, parent)).and_then(|v| v.get(i).cloned()))
+            .unwrap_or_else(|| {
+                actors::with_extras(actors::bearing_actors(&*lv.host, &sub.blocks), &sub.extras)
+            });
+        let shift = sub.shift(facing.axis(), f64::from(w.turn.angle_at(now)));
+        let place = move |o: [i32; 3]| {
+            [0, 1, 2].map(|k| (f64::from(parent[k] + o[k]) + 0.5 + shift[k]).floor() as i32)
+        };
+        return Some((carried, Box::new(place)));
+    }
+    let w = w?;
     let facing = super::create_info(lv.block(pos)).and_then(|(_, i)| i.facing)?;
     let carried = BEARING_CARRIED
         .with_borrow(|c| c.get(&(dim, pos)).cloned())
@@ -588,6 +927,22 @@ pub(super) fn take_turning(
 /// turns, and to the structure, which saves it and puts it back with its blocks.
 pub(super) fn put_turning(lv: &mut ServerLevel<'_>, pos: [i32; 3], carried: Carried) {
     let dim = lv.dim;
+    let live = with_world(|w| w.dims[dim].windmills.contains_key(&pos)) == Some(true);
+    if !live && let Some((parent, i)) = contraption::sub_of_key(pos) {
+        with_world(|w| {
+            if let Some(sub) = w.dims[dim].windmills.get_mut(&parent).and_then(|m| m.subs.get_mut(i)) {
+                sub.extras.controls.clone_from(&carried.controls);
+                sub.extras.disabled.clone_from(&carried.disabled);
+                w.dims[dim].unsaved.push((parent[0] >> 4, parent[2] >> 4));
+            }
+        });
+        SUB_CARRIED.with_borrow_mut(|c| {
+            if let Some(e) = c.get_mut(&(dim, parent)).and_then(|v| v.get_mut(i)) {
+                *e = carried;
+            }
+        });
+        return;
+    }
     with_world(|w| {
         if let Some(m) = w.dims[dim].windmills.get_mut(&pos) {
             m.extras.controls.clone_from(&carried.controls);
@@ -667,9 +1022,7 @@ pub(super) fn tick_bearings(lv: &mut ServerLevel<'_>) {
         let running = with_world(|w| w.dims[dim].windmills.get(&pos).map(|m| m.turn)).flatten();
         match running {
             Some(turn) if rpm == 0.0 && may_place(dim, pos, turn.angle_at(now)) => {
-                if let Some(mut c) = BEARING_CARRIED.with_borrow_mut(|c| c.remove(&(dim, pos))) {
-                    actors::cancel_actors(lv, pos, &mut c);
-                }
+                cancel_carried(lv, pos);
                 let quarter = contraption::quarter(turn.angle_at(now));
                 if let Some(w) = with_world(|w| w.windmill_disassembled(dim, pos, state)).flatten()
                 {
@@ -698,8 +1051,12 @@ pub(super) fn tick_bearings(lv: &mut ServerLevel<'_>) {
                 });
             }
             None if rpm != 0.0 => {
-                let gathered = contraption::gather_bearing(pos, facing, 0, |p| found(lv, p));
-                let (blocks, sails) = match gathered {
+                let gathered = super::gather_moving(
+                    lv,
+                    |lv| contraption::gather_bearing_stabilizing(pos, facing, 0, |p| found(lv, p)),
+                    |g| super::cells_of(pos, &g.blocks),
+                );
+                let contraption::Searched { blocks, sails, subs } = match gathered {
                     Ok(g) => g,
                     Err(r) => {
                         set_exception(lv, pos, Some(&r));
@@ -711,8 +1068,10 @@ pub(super) fn tick_bearings(lv: &mut ServerLevel<'_>) {
                 actors::carry_storage(lv, pos, pos, &blocks);
                 let extras = actors::carry_extras(lv, pos, &blocks, |p| p == pos);
                 take_blocks(lv, pos, &blocks);
+                let subs = assemble_subs(lv, pos, &subs);
                 let w = create_engine::world::Windmill {
                     extras,
+                    subs,
                     blocks,
                     sails,
                     clockwise: true,
@@ -725,6 +1084,7 @@ pub(super) fn tick_bearings(lv: &mut ServerLevel<'_>) {
                     },
                 };
                 with_world(|world| world.bearing_assembled(dim, pos, w));
+                assemble_sound(lv, pos);
             }
             None => {}
         }
@@ -766,6 +1126,10 @@ fn put_back_turned(
     colliders::lift_riders(lv, Owner::Anchor(bearing, 0), placed);
     actors::release_storage(lv, bearing, turn);
     actors::release_extras(lv, &mut w.extras.clone(), turn);
+    put_back_subs(lv, bearing, axis, quarter, &w.subs);
+    // `disassemble`: the structure's entity at its anchor, then the bearing.
+    disassemble_sound(lv, anchor);
+    disassemble_sound(lv, bearing);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -857,10 +1221,20 @@ pub(super) fn tick_gantries(lv: &mut ServerLevel<'_>) {
             continue;
         }
         let moving_dir = if v > 0.0 { sf } else { sf.opposite() };
-        let gathered = contraption::gather_gantry(c, cf, moving_dir, |p| found(lv, p));
-        let Ok(blocks) = gathered else {
-            continue;
+        let gathered = super::gather_moving(
+            lv,
+            |lv| contraption::gather_gantry(c, cf, moving_dir, |p| found(lv, p)),
+            |g| super::cells_of(c, g),
+        );
+        // `GantryCarriageBlockEntity.tryAssemble`: `lastException`.
+        let blocks = match gathered {
+            Ok(blocks) => blocks,
+            Err(r) => {
+                set_exception(lv, c, Some(&r));
+                continue;
+            }
         };
+        set_exception(lv, c, None);
         let carried = actors::carry(lv, c, c, &blocks, |p| p == shaft);
         crate::glue::advancements::assembled(lv, c, &blocks);
         take_blocks(lv, c, &blocks);
@@ -877,6 +1251,7 @@ pub(super) fn tick_gantries(lv: &mut ServerLevel<'_>) {
                 limit,
             })
         });
+        assemble_sound(lv, c);
     }
     let list = with_world(|w| std::mem::take(&mut w.dims[dim].gantries)).unwrap_or_default();
     let mut keep = Vec::new();
@@ -944,6 +1319,7 @@ pub(super) fn tick_gantries(lv: &mut ServerLevel<'_>) {
                 let placed = Pose::translated(at.map(f64::from));
                 colliders::lift_riders(lv, Owner::Gantry(g.start), placed);
                 actors::release(lv, g.start, at, &mut g.carried);
+                disassemble_sound(lv, at);
                 show_gantry(lv, &g, true);
                 super::super::persist::mark_pos_unsaved(dim, g.start);
             }
@@ -1226,8 +1602,12 @@ fn assemble_piston(lv: &mut ServerLevel<'_>, pos: [i32; 3], rpm: f32) {
         Some((Block::MechanicalPistonHead, Some(f))) => PoleCell::Head(f),
         _ => PoleCell::Other,
     };
-    let Some(c) = piston::collect(pos, facing, extended, cell) else {
-        return;
+    let c = match piston::collect(pos, facing, extended, cell) {
+        Ok(c) => c,
+        Err(r) => {
+            set_exception(lv, pos, Some(&r));
+            return;
+        }
     };
     let m = piston::movement(rpm, facing, c.progress as f32, c.range);
     let result = c.progress as f32 + m.signum() * 0.5;
@@ -1260,9 +1640,11 @@ fn assemble_piston(lv: &mut ServerLevel<'_>, pos: [i32; 3], rpm: f32) {
         .collect();
     let mut exclude = pole_worlds;
     exclude.push(pos);
-    let gathered = piston::gather_piston(c.anchor, facing, m < 0.0, sticky, &exclude, |p| {
-        found(lv, p)
-    });
+    let gathered = super::gather_moving(
+        lv,
+        |lv| piston::gather_piston(c.anchor, facing, m < 0.0, sticky, &exclude, |p| found(lv, p)),
+        |g| super::cells_of(c.anchor, g),
+    );
     let structure = match gathered {
         Ok(s) => s,
         Err(r) => {
@@ -1315,6 +1697,7 @@ fn assemble_piston(lv: &mut ServerLevel<'_>, pos: [i32; 3], rpm: f32) {
             },
         )
     });
+    assemble_sound(lv, pos);
     show_piston(lv, pos);
 }
 
@@ -1360,6 +1743,9 @@ fn put_back_piston(
         lv.set_property(pos, "state", state, update_all());
     }
     actors::release(lv, pos, origin, &mut m.carried);
+    // `disassemble`: the structure's entity at its anchor, then the piston.
+    disassemble_sound(lv, origin);
+    disassemble_sound(lv, pos);
     draw::hide(lv, pos);
     super::super::persist::mark_pos_unsaved(lv.dim, pos);
 }
@@ -1567,6 +1953,28 @@ fn windmills_to_nbt(
                     ]),
                 );
                 super::limit_to_nbt(&mut c, t.limit);
+                // `SubContraptions`: the stabilized structures riding it.
+                if !w.subs.is_empty() {
+                    let subs = w
+                        .subs
+                        .iter()
+                        .enumerate()
+                        .map(|(i, sub)| {
+                            let mut s = Compound::new();
+                            if let Some(t) = actors::storage_to_nbt(lv, contraption::sub_key(*p, i)) {
+                                s.insert("storage".into(), t);
+                            }
+                            let facing = Dir::ALL.iter().position(|d| *d == sub.facing);
+                            let mut at = sub.bearing.to_vec();
+                            at.push(facing.unwrap_or(0) as i32);
+                            s.insert("bearing".into(), Tag::IntArray(at));
+                            structure_to_nbt(lv, &mut s, &sub.blocks);
+                            actors::extras_to_nbt(&mut s, &sub.extras);
+                            Tag::Compound(s)
+                        })
+                        .collect();
+                    c.insert("subs".into(), Tag::List(subs));
+                }
                 // Its kind of bearing (`isWindmill`) with its sails; the angle slot is the
                 // `turn` tag's now.
                 c.insert(
@@ -1844,6 +2252,28 @@ fn windmills_from_nbt(
                     limit,
                 },
             };
+            let subs = match c.get(&"subs".into()) {
+                Some(Tag::List(l)) => l
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, t)| {
+                        let Tag::Compound(s) = t else { return None };
+                        let key = contraption::sub_key(pos, i);
+                        actors::storage_from_nbt(lv, key, s.get(&"storage".into()));
+                        let Some(Tag::IntArray(at)) = s.get(&"bearing".into()) else {
+                            return None;
+                        };
+                        let facing = *Dir::ALL.get(usize::try_from(*at.get(3)?).ok()?)?;
+                        Some(contraption::Stabilized {
+                            bearing: [*at.first()?, *at.get(1)?, *at.get(2)?],
+                            facing,
+                            blocks: structure_from_nbt(lv, s)?,
+                            extras: actors::extras_from_nbt(s),
+                        })
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             Some((
                 pos,
                 create_engine::world::Windmill {
@@ -1853,6 +2283,7 @@ fn windmills_from_nbt(
                     kind,
                     turn,
                     extras: actors::extras_from_nbt(c),
+                    subs,
                 },
             ))
         })

@@ -498,6 +498,8 @@ pub(crate) fn settings_at(
             if let Some(v) = pick.and_then(|s| board::option_value(s, now, n)) {
                 arm.selection = create_engine::arm::Selection::from_index(v);
                 w.mark_unsaved(dim, pos);
+                // Create's arm searches every tick: a sleeping one looks again by the new mode.
+                w.dims[dim].arms.wake(pos);
             }
             w.dims[dim].arms.arms.get(&pos).map(|a| a.selection.index())
         }),
@@ -515,11 +517,11 @@ pub(crate) fn settings_at(
                 None => Some(Some(now)),
             }
         }
-        // `EjectorBlockEntity.maxStackSize` (`between(0, 64)`, row 0).
+        // `EjectorBlockEntity.maxStackSize` (`between(0, Item.ABSOLUTE_MAX_STACK_SIZE)`, row 0).
         B::WeightedEjector => with_world(|w| {
             let e = w.dims[dim].ejectors.get_mut(&pos)?;
             if let Some(pick) = pick {
-                e.max_stack = pick.value.clamp(0, 64) as u8;
+                e.max_stack = pick.value.clamp(0, 99) as u8;
                 w.mark_unsaved(dim, pos);
             }
             w.dims[dim]

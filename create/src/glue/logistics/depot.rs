@@ -7,7 +7,7 @@ use super::super::net;
 use super::super::server::ServerLevel;
 use super::super::world::with_world;
 use super::arms::arms_touched;
-use super::items::{self, random_angle, upright};
+use super::items::{self, upright};
 use crate::glue::owned::OwnedInventory as _;
 use create_engine::{Block, depot};
 use mod_api::PlayerRef;
@@ -116,6 +116,11 @@ impl depot::PlayerUse for DepotUse<'_, '_> {
         }
         let dim = self.lv.dim;
         with_world(|w| w.depot_put(dim, self.pos, None));
+        // `level.playSound(null, pos, SoundEvents.ITEM_PICKUP, SoundSource.PLAYERS, .2f,
+        // 1f + level.getRandom().nextFloat())` once the held stack (not the outputs) is taken.
+        if stacks.first().is_some_and(Option::is_some) {
+            pickup_sound(self.lv, self.pos);
+        }
         Some(stacks.into_iter().flatten().collect())
     }
 
@@ -130,7 +135,7 @@ impl depot::PlayerUse for DepotUse<'_, '_> {
         let put = hand.as_ref().map(|s| {
             let id = items::id_of(&*self.lv.host, s);
             depot::Held::put_by_player(
-                random_angle(self.lv, self.pos),
+                items::stack_angle(self.lv, self.pos, &id),
                 upright(&*self.lv.host, &id),
                 facing,
             )
@@ -143,6 +148,89 @@ impl depot::PlayerUse for DepotUse<'_, '_> {
             .set_inventory_slot(&mut *self.lv.host, self.selected as u32, None);
         let dim = self.lv.dim;
         with_world(|w| w.depot_put(dim, self.pos, put));
+        // `AllSoundEvents.DEPOT_SLIDE.playOnServer(level, pos)`.
+        if put.is_some() {
+            arrival_sound(self.lv, self.pos, true);
+        }
+    }
+}
+
+/// `level.playSound(null, pos, SoundEvents.ITEM_PICKUP, SoundSource.PLAYERS, .2f,
+/// 1f + level.getRandom().nextFloat())`: a player took the depot's held stack.
+fn pickup_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    use mod_api::RandomSource as _;
+    let pitch = lv
+        .level
+        .with_random(&mut *lv.host, |r| r.next_float())
+        .map_or(1.0, |f| 1.0 + f);
+    lv.level.play_sound(
+        &mut *lv.host,
+        "minecraft:entity.item.pickup",
+        pos.map(|v| f64::from(v) + 0.5),
+        mod_api::SoundSource::Players,
+        0.2,
+        pitch,
+    );
+}
+
+/// `AllSoundEvents.DEPOT_SLIDE` (`SAND_BREAK` at .125 and pitch 1.5) or `DEPOT_PLOP`
+/// (`ITEM_FRAME_ADD_ITEM` at .25 and pitch 1.25) `.playOnServer(level, pos)`, at the block's
+/// centre: a player putting a stack down slides it, and so does `DepotBehaviour.insert` on an
+/// empty depot for a stack coming in from a side (`insertedFrom` horizontal); one from above or
+/// below lands (`from_side` false). Create's compound sounds are played as the vanilla sounds
+/// its `sounds.json` names.
+pub(super) fn arrival_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3], from_side: bool) {
+    let (sound, volume, pitch) = if from_side {
+        ("minecraft:block.sand.break", 0.125, 1.5)
+    } else {
+        ("minecraft:entity.item_frame.add_item", 0.25, 1.25)
+    };
+    lv.level.play_sound(
+        &mut *lv.host,
+        sound,
+        pos.map(|v| f64::from(v) + 0.5),
+        mod_api::SoundSource::Blocks,
+        volume,
+        pitch,
+    );
+}
+
+/// `DepotBehaviour.insert`'s sound for a stack that took the held slot of the (not merging)
+/// depot `held` describes: it slides in from a side, else lands.
+pub(super) fn inserted_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3], held: &depot::Held) {
+    arrival_sound(lv, pos, held.from.is_some());
+}
+
+thread_local! {
+    /// Depots whose held slot a handler filled (`DepotItemHandler.insertItem` from a hopper or
+    /// another mod) or the game wrote, by dimension: their landing sound waits for the
+    /// transaction's outcome and plays at the end of the tick if they still hold a stack.
+    static LANDED: std::cell::RefCell<Vec<(usize, [i32; 3])>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Notes that a handler or the game put a stack onto the empty depot at `pos` from above.
+pub(super) fn landed_later(dim: usize, pos: [i32; 3]) {
+    LANDED.with_borrow_mut(|l| l.push((dim, pos)));
+}
+
+/// The landing sounds `landed_later` noted in this level, for depots that still hold a stack.
+fn play_landed(lv: &mut ServerLevel<'_>) {
+    let dim = lv.dim;
+    let mut mine = LANDED.with_borrow_mut(|l| {
+        if l.is_empty() {
+            return Vec::new();
+        }
+        let (mine, rest) = std::mem::take(l).into_iter().partition::<Vec<_>, _>(|e| e.0 == dim);
+        *l = rest;
+        mine
+    });
+    mine.sort();
+    mine.dedup();
+    for (_, pos) in mine {
+        if items::slot(lv, pos, 0).is_some() {
+            arrival_sound(lv, pos, false);
+        }
     }
 }
 
@@ -157,13 +245,14 @@ pub fn player_yaw(lv: &ServerLevel<'_>, p: PlayerRef) -> Option<f32> {
 pub(super) fn handler_motion(lv: &ServerLevel<'_>, pos: [i32; 3], item: &str) -> depot::Held {
     depot::Held {
         position: 0.0,
-        ..depot::Held::new(random_angle(lv, pos), upright(&*lv.host, item))
+        ..depot::Held::new(items::stack_angle(lv, pos, item), upright(&*lv.host, item))
     }
 }
 
 /// `DepotBehaviour.insert` on the merging depot (an ejector's) at `pos`: `count` of `item`
 /// arriving with `motion`. Only while charged (`canAcceptItems`); as much as
-/// `getRemainingSpace` leaves (`depot::merge_take`, the stacks still sliding in counted). With
+/// `getRemainingSpace(inserted)` leaves (`depot::merge_take`, the stacks still sliding in
+/// counted). With
 /// nothing held it is the held stack; else it slides in on its own (`incoming.add`) and joins
 /// at the centre. The count left.
 pub(super) fn merge_insert(
@@ -202,7 +291,8 @@ pub(super) fn merge_insert(
     })
     .unwrap_or(0);
     let used = stacks.iter().map(|s| u32::from(s.2)).sum::<u32>() + incoming;
-    let n = depot::merge_take(max_stack, held, used, count);
+    let arriving_max = items::stack_limit(&*lv.host, item);
+    let n = depot::merge_take(max_stack, arriving_max, held, used, count);
     if n == 0 || simulate {
         return count - n;
     }
@@ -310,6 +400,7 @@ fn process_held(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
 
 /// Publish client notifications after the shared block-entity walk.
 pub fn send_changed_depots(lv: &mut ServerLevel<'_>) {
+    play_landed(lv);
     let dim = lv.dim;
     // `DepotBehaviour.destroy`: a removed depot's incoming stacks drop where it was.
     let drops = with_world(|w| std::mem::take(&mut w.dims[dim].depot_drops)).unwrap_or_default();
@@ -332,7 +423,8 @@ pub fn send_changed_depots(lv: &mut ServerLevel<'_>) {
             continue;
         }
         if let Some((_, item, _)) = depot_items(lv, pos).into_iter().find(|s| s.0 == 0) {
-            let held = depot::Held::new(random_angle(lv, pos), upright(&*lv.host, &item));
+            let held =
+                depot::Held::new(items::stack_angle(lv, pos, &item), upright(&*lv.host, &item));
             with_world(|w| {
                 if let Some(h) = w.dims[dim].depots.get_mut(&pos) {
                     *h = Some(held);
@@ -414,10 +506,13 @@ pub fn depot_contents_changed(lv: &ServerLevel<'_>, pos: [i32; 3]) {
         (_, None) => None,
         (Some(h), Some(_)) => Some(h),
         (None, Some(s)) => {
+            if with_world(|w| w.dims[dim].ejectors.contains_key(&pos)) != Some(true) {
+                landed_later(dim, pos);
+            }
             let id = items::id_of(&*lv.host, &s);
             Some(depot::Held {
                 position: 0.0,
-                ..depot::Held::new(random_angle(lv, pos), upright(&*lv.host, &id))
+                ..depot::Held::new(items::stack_angle(lv, pos, &id), upright(&*lv.host, &id))
             })
         }
     };

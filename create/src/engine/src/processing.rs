@@ -214,9 +214,81 @@ pub fn add_to_list(
     }
 }
 
+/// `MillstoneBlockEntity.tickAudio` and `CrushingWheelControllerBlockEntity.tickAudio`: the pitch
+/// their ambient noise asks for, `|speed| / 256 + .45` held within .85 and 1 (a crushing
+/// wheel controller's speed is a wheel's / 50, so it always asks for .85).
+pub fn machine_pitch(speed: f32) -> f32 {
+    (speed.abs() / 256.0 + 0.45).clamp(0.85, 1.0)
+}
+
+/// `SoundScapes.getGroupFromPitch`: the band an ambient sound's pitch falls in, very low (0) to
+/// very high (4); sources of one group and band share one sound.
+pub fn pitch_group(pitch: f32) -> u8 {
+    match pitch {
+        p if p < 0.70 => 0,
+        p if p < 0.90 => 1,
+        p if p < 1.10 => 2,
+        p if p < 1.30 => 3,
+        _ => 4,
+    }
+}
+
+/// `SoundScapes.MAX_AMBIENT_SOURCE_DISTANCE`: sources farther from the camera are not heard.
+pub const AMBIENT_DISTANCE: f64 = 16.0;
+
+/// `SoundScape.getVolume`: `count` sources sharing a sound heard `distance` blocks from where
+/// they stand on average: their count over 150, held within .025 and Create's default
+/// `ambientVolumeCap` (.1), times 2 fading to 0 at 16 blocks (`Mth.lerp`, not held, so a sound
+/// farther away asks for no volume).
+pub fn scape_volume(count: usize, distance: f64) -> f32 {
+    let near = 2.0 - 2.0 * distance / AMBIENT_DISTANCE;
+    (count as f32 / 150.0).clamp(0.025, 0.1) * near as f32
+}
+
+/// How many times a tick on average the game calls a block's `animateTick` (`ClientLevel
+/// .animateTick`: 667 tries a tick, each picking one block `nextInt(16) - nextInt(16)` and one
+/// `nextInt(32) - nextInt(32)` away along each axis from the player's block) for a block
+/// `offset` away. Used for the client effects of a block that has a client tick but whose
+/// `animateTick` the game can't call here.
+pub fn animate_tick_chance(offset: [i32; 3]) -> f64 {
+    // `nextInt(r) - nextInt(r)` is `d` with odds (r - |d|) / r².
+    let odds = |r: i32| {
+        offset
+            .iter()
+            .map(|&d| f64::from((r - d.abs()).max(0)) / f64::from(r * r))
+            .product::<f64>()
+    };
+    667.0 * (odds(16) + odds(32))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ambient_noise_follows_create_s_soundscapes() {
+        assert_eq!(machine_pitch(0.0), 0.85);
+        assert_eq!(machine_pitch(5.12), 0.85, "a controller crushing at 256 rpm");
+        assert_eq!(machine_pitch(-256.0), 1.0);
+        assert_eq!(pitch_group(0.85), 1);
+        assert_eq!(pitch_group(1.0), 2);
+        assert_eq!(pitch_group(0.5), 0);
+        // One source next to the camera: the least volume, doubled; none past 16 blocks.
+        assert_eq!(scape_volume(1, 0.0), 0.05);
+        assert_eq!(scape_volume(300, 8.0), 0.1);
+        assert!(scape_volume(1, 20.0) < 0.0);
+    }
+
+    #[test]
+    fn blocks_near_the_player_are_animated_more_often() {
+        let at = animate_tick_chance([0, 0, 0]);
+        assert!((at - 667.0 * (1.0 / 4096.0 + 1.0 / 32768.0)).abs() < 1e-12);
+        let near = animate_tick_chance([8, 0, 0]);
+        assert!(near < at && near > 0.09, "{near}");
+        // Only the wider tries reach 16 blocks and more; none reach 32.
+        assert!(animate_tick_chance([20, 0, 0]) < 0.02);
+        assert_eq!(animate_tick_chance([32, 0, 0]), 0.0);
+    }
 
     fn wheat_book() -> Book {
         // data/create/recipe/milling/wheat.json

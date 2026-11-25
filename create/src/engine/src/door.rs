@@ -1,7 +1,8 @@
 //! Create's sliding doors (`SlidingDoorBlock`, `SlidingDoorBlockEntity`): the iron door's
 //! template places them, keeps their halves together and follows redstone; these are Create's own
 //! rules on top: a double door opens and closes as one, `visible` turns off while the door is open
-//! or sliding, and on again once its panel has slid shut.
+//! or sliding, and on again once its panel has slid shut. A client's own view of the panel, which
+//! its renderer draws while the door is hidden, is a [`Panel`].
 
 use crate::kinetics::Dir;
 use crate::parts::StateInfo;
@@ -137,6 +138,93 @@ impl Slide {
 
     pub fn value(&self) -> f32 {
         self.value
+    }
+}
+
+/// `SlidingDoorBlockEntity.bridgeTicks` counts up to 2 while the door is open.
+const BRIDGE_TICKS: f64 = 2.0;
+
+/// A client's view of a door's panel (`SlidingDoorBlockEntity.animation` and `bridgeTicks` as a
+/// client ticks them), worked out from the game time with the partial tick: where it was at
+/// `since` and where it is heading, and how long the renderer keeps drawing it once the door
+/// shows its block again.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Panel {
+    from: f32,
+    since: f64,
+    target: f32,
+    /// When `bridgeTicks` would have counted up from 0 to what it has while the door is open
+    /// (it goes on from what it had when the door opens again before running out).
+    opened: f64,
+    /// `bridgeTicks` when the door last closed: it holds while the door slides shut hidden.
+    bridge: f64,
+    /// When the closed door was first seen shown again: its bridge runs out from then, a tick
+    /// at a time (`bridgeTicks--` while closed and visible).
+    shown: Option<f64>,
+}
+
+impl Panel {
+    /// A door first seen at `now` (`startWithValue(isOpen ? 1 : 0)`, `bridgeTicks` 0).
+    pub fn new(open: bool, now: f64) -> Panel {
+        let target = if open { 1.0 } else { 0.0 };
+        Panel {
+            from: target,
+            since: now,
+            target,
+            opened: now,
+            bridge: 0.0,
+            shown: None,
+        }
+    }
+
+    /// `LerpedFloat.getValue` of a linear chase at 0.15 a tick.
+    pub fn value(&self, now: f64) -> f32 {
+        let moved = ((now - self.since).max(0.0) * 0.15) as f32;
+        if self.target > self.from {
+            (self.from + moved).min(self.target)
+        } else {
+            (self.from - moved).max(self.target)
+        }
+    }
+
+    /// `bridgeTicks` at `now`: counting up while the door is open, else what it had.
+    fn bridge_at(&self, now: f64) -> f64 {
+        if self.target > 0.5 {
+            (now - self.opened).clamp(0.0, BRIDGE_TICKS)
+        } else {
+            self.bridge
+        }
+    }
+
+    /// The door is `open` at `now` (`animation.chase(open ? 1 : 0, .15f, LINEAR)`): the panel
+    /// turns toward it from where it has got.
+    pub fn follow(&mut self, open: bool, now: f64) {
+        let target = if open { 1.0 } else { 0.0 };
+        if self.target == target {
+            return;
+        }
+        if open {
+            self.opened = now - self.bridge;
+        } else {
+            self.bridge = self.bridge_at(now);
+        }
+        self.from = self.value(now);
+        self.since = now;
+        self.target = target;
+    }
+
+    /// `shouldRenderSpecial`: the door is hidden, or shown again less than its bridge ago.
+    pub fn special(&mut self, visible: bool, now: f64) -> bool {
+        if !visible {
+            self.shown = None;
+            return true;
+        }
+        if self.target > 0.5 {
+            // Open and shown, which Create's own writes never leave a door: the bridge counts.
+            return self.bridge_at(now) > 0.0;
+        }
+        let shown = *self.shown.get_or_insert(now);
+        now - shown < self.bridge
     }
 }
 
@@ -294,5 +382,40 @@ mod tests {
         let mut s = Slide::at_rest(false);
         assert!(!s.tick(false, true));
         assert!(s.at_target());
+    }
+
+    #[test]
+    fn a_door_shown_again_is_drawn_two_ticks_more() {
+        // Open long enough to fill the bridge, then closed: hidden while it slides shut.
+        let mut p = Panel::new(false, 0.0);
+        p.follow(true, 10.0);
+        assert!(p.special(false, 11.0));
+        p.follow(false, 30.0);
+        assert!(p.special(false, 35.0), "sliding shut, hidden");
+        // Shown again at 40: drawn until 42, then the block draws itself.
+        assert!(p.special(true, 40.0));
+        assert!(p.special(true, 41.5));
+        assert!(!p.special(true, 42.0));
+        // Opened for one tick only: one tick of bridge.
+        let mut p = Panel::new(false, 0.0);
+        p.follow(true, 10.0);
+        p.follow(false, 11.0);
+        assert!(p.special(true, 20.0));
+        assert!(!p.special(true, 21.0));
+        // A door first seen closed and shown never draws its panel.
+        let mut p = Panel::new(false, 0.0);
+        assert!(!p.special(true, 0.0));
+    }
+
+    #[test]
+    fn a_client_panel_chases_the_door_from_where_it_has_got() {
+        let mut p = Panel::new(false, 0.0);
+        p.follow(true, 0.0);
+        assert!((p.value(2.0) - 0.3).abs() < 1e-6);
+        p.follow(false, 2.0);
+        assert!((p.value(3.0) - 0.15).abs() < 1e-6);
+        assert_eq!(p.value(10.0), 0.0);
+        // First seen open: at rest open.
+        assert_eq!(Panel::new(true, 5.0).value(6.0), 1.0);
     }
 }

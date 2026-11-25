@@ -156,6 +156,8 @@ fn sound_block(b: &CreateBlock) -> Option<&'static str> {
         "wooden" => "minecraft:stripped_spruce_wood",
         "copperMetal" => "minecraft:copper_block",
         "netheriteMetal" => "minecraft:netherite_block",
+        // `initialProperties(() -> Blocks.DEEPSLATE)`: the rose quartz tiles.
+        "deepslate" => "minecraft:deepslate",
         _ => return None,
     })
 }
@@ -245,14 +247,13 @@ fn copper_template(name: &str) -> Option<&'static str> {
 }
 
 /// The template for one block, by its properties, then its name and Java class.
-/// Sounds set where the registration reader does not see them: `BuilderTransformers.ladder`,
-/// `scaffold` and `MetalBarsGen` (`SoundType.COPPER`), seats (`SharedProperties::wooden`, in a
-/// loop over the dyes), and the palette stones, copied from their base block
-/// (`AllPaletteStoneTypes`, `PalettesVariantEntry.initialProperties(baseBlock)`).
+/// Sounds set where the registration reader does not see them: `MetalBarsGen`
+/// (`SoundType.COPPER`), seats (`SharedProperties::wooden`, in a loop over the dyes), and the
+/// palette stones, copied from their base block (`AllPaletteStoneTypes`,
+/// `PalettesVariantEntry.initialProperties(baseBlock)`). (The ladders' and scaffolding's copper is
+/// their `BuilderTransformers` helper's, which the reader sees.)
 fn sound_override(n: &str) -> Option<&'static str> {
-    if (n.ends_with("_ladder") || n.ends_with("_scaffolding") || n.ends_with("_bars"))
-        && n != "copycat_bars"
-    {
+    if n.ends_with("_bars") && n != "copycat_bars" {
         return Some("minecraft:copper_block");
     }
     if n.ends_with("_seat") {
@@ -321,9 +322,8 @@ pub fn decide(b: &CreateBlock, shapes: &BTreeMap<&'static str, Value>) -> Decisi
     if let Some(reason) = later_phase(b) {
         return Decision::Pending(reason);
     }
-    // SeatBlock (waterlogged): AllShapes.SEAT, the cushion's half block (Create collides mobs
-    // with 6 px of it and players with 3; one shape here). Mobs landing on it sit
-    // (`entity_inside`).
+    // SeatBlock (waterlogged): AllShapes.SEAT, the cushion's half block (its collision, 6 px for
+    // mobs and 3 for players, in `declaration`). Mobs landing on it sit (`entity_inside`).
     if dyed(n, "seat").is_some() {
         return Decision::Declared {
             template: "minecraft:heavy_core",
@@ -619,14 +619,11 @@ fn kinetic(b: &CreateBlock, sounds: Option<&'static str>) -> Option<Decision> {
         ),
         // BeltFunnelBlock: a funnel over a belt (placed by the glue in place of a horizontal
         // funnel above one), its facing, `powered`, `shape` and waterlogging, iron's properties
-        // as the funnels'; no item of its own (it drops its funnel). Content shapes select by one
-        // property: AllShapes.BELT_FUNNEL_RETRACTED for every shape, turned to its facing.
+        // as the funnels'; no item of its own (it drops its funnel). Shapes: its shape's
+        // (`Shape.shaper`: retracted, extended, perpendicular) turned to its facing.
         "andesite_belt_funnel" | "brass_belt_funnel" => (
             "minecraft:iron_block",
-            Some(by_horizontal(&[
-                [2., -2., 14., 14., 14., 18.],
-                [0., -5., 8., 16., 16., 14.],
-            ])),
+            Some(belt_funnel_shapes()),
             own(&[
                 ("facing", &["north", "south", "west", "east"]),
                 ("powered", bools),
@@ -949,10 +946,10 @@ fn kinetic(b: &CreateBlock, sounds: Option<&'static str>) -> Option<Decision> {
             )
         }
         // FunnelBlock: facing (away from the inventory it is on), `extracting`, `powered`;
-        // AllShapes.FUNNEL_FLOOR turned to its facing: the half against the inventory.
+        // `getShape`: AllShapes.FUNNEL_FLOOR, FUNNEL_CEILING, or FUNNEL_WALL turned to its facing.
         "andesite_funnel" | "brass_funnel" => (
             "minecraft:iron_block",
-            Some(by_facing(&[[1., 0., 1., 15., 8., 15.]])),
+            Some(funnel_shapes()),
             own(&[
                 ("extracting", bools),
                 ("facing", facing),
@@ -1003,15 +1000,11 @@ fn kinetic(b: &CreateBlock, sounds: Option<&'static str>) -> Option<Decision> {
             own(&[("facing", facing), ("waterlogged", bools)]),
         ),
         // ChuteBlock: a barrel's template for its one slot; gold's properties; its facing
-        // (down, or a diagonal's), `shape` and waterlogging; a full block here, so items land on
-        // top of it.
+        // (down, or a diagonal's), `shape` and waterlogging. `ChuteShapes.getShape` by facing
+        // and shape (its collision below).
         "chute" => (
             "minecraft:barrel",
-            Some(by_property(
-                "facing",
-                &["down", "north", "south", "west", "east"],
-                &[[0., 0., 0., 16., 16., 16.]],
-            )),
+            Some(chute_shapes().0),
             own(&[
                 ("facing", &["down", "north", "south", "west", "east"]),
                 ("shape", &["normal", "window", "encased", "intersection"]),
@@ -1055,8 +1048,16 @@ fn kinetic(b: &CreateBlock, sounds: Option<&'static str>) -> Option<Decision> {
             ])),
             own(&[("facing", &["north", "south", "west", "east"])]),
         ),
-        // StationBlock: a full block of gold's properties (its track target is the glue's).
-        "track_station" => ("minecraft:gold_block", None, None),
+        // StationBlock: gold's properties (its track target is the glue's); AllShapes.STATION,
+        // a plate with the post on it.
+        "track_station" => (
+            "minecraft:gold_block",
+            Some(fixed(&[
+                [0., 0., 0., 16., 2., 16.],
+                [1., 0., 1., 15., 13., 15.],
+            ])),
+            None,
+        ),
         // SignalBlock: beside a track it splits it into sections; its type and redstone power.
         "track_signal" => (
             "minecraft:iron_block",
@@ -1183,24 +1184,9 @@ fn kinetic(b: &CreateBlock, sounds: Option<&'static str>) -> Option<Decision> {
             Some(by_facing(&CRANK)),
             own(&[("facing", facing), ("waterlogged", bools)]),
         ),
-        // BeltTunnelBlock (andesite): its own `axis` (HORIZONTAL_AXIS) and shape. Content shapes select by one
-        // property, so every state takes the cross's boxes (BeltTunnelShapes, all four sides
-        // open: a closed side's lower wall is missing).
+        // BeltTunnelBlock (andesite): its own `axis` (HORIZONTAL_AXIS) and shape. Shapes:
+        // BeltTunnelShapes by axis and shape (the openings on its open sides).
         "andesite_tunnel" | "brass_tunnel" => {
-            let boxes: Vec<Value> = [
-                [2., -5., 2., 14., 16., 14.],
-                [0., -5., 0., 2., 16., 2.],
-                [14., -5., 0., 16., 16., 2.],
-                [0., -5., 14., 2., 16., 16.],
-                [14., -5., 14., 16., 16., 16.],
-                [2., 10., 0., 14., 16., 2.],
-                [2., 10., 14., 14., 16., 16.],
-                [0., 10., 2., 2., 16., 14.],
-                [14., 10., 2., 16., 16., 14.],
-            ]
-            .iter()
-            .map(|b: &Px| json!(b.map(|v| v / 16.0)))
-            .collect();
             (
                 // BrassTunnelBlock: brass's properties (gold), andesite's for the other.
                 if b.name == "brass_tunnel" {
@@ -1208,8 +1194,7 @@ fn kinetic(b: &CreateBlock, sounds: Option<&'static str>) -> Option<Decision> {
                 } else {
                     "minecraft:polished_andesite"
                 },
-                Some(json!({ "property": "axis", "values": {
-                    "x": boxes, "z": boxes } })),
+                Some(tunnel_shapes()),
                 own(&[
                     ("axis", &["x", "z"]),
                     (
@@ -1690,7 +1675,8 @@ fn own_states(b: &CreateBlock) -> Option<Decision> {
     }
     // ControlsBlock (`SharedProperties::softMetal`, netherite sounds, pickaxe): facing (toward
     // whoever placed it), `open` (on a moving contraption), `virtual`, waterlogged; AllShapes
-    // .CONTROLS. A train assembled with it is driven by `/create_debug drive` (riding is gap 3).
+    // .CONTROLS (its collision, CONTROLS_COLLISION, in `declaration`). A train assembled with it
+    // is driven by `/create_debug drive` (riding is gap 3).
     if n == "controls" {
         return Some(declared(
             "minecraft:heavy_core",
@@ -1779,9 +1765,12 @@ fn own_states(b: &CreateBlock) -> Option<Decision> {
             true,
         ));
     }
-    // TrainTrapdoorBlock (TrapDoorBlock, `SharedProperties::softMetal`, Create's train and glass
-    // `BlockSetType`s: iron trapdoor sounds): vanilla's trapdoor states and redstone from the
-    // iron trapdoor's template; a click opens it as Create's `useWithoutItem` does (the glue).
+    // TrainTrapdoorBlock (TrapDoorBlock, `SharedProperties::softMetal`): vanilla's trapdoor
+    // states and redstone from the iron trapdoor's template; a click opens it as Create's
+    // `useWithoutItem` does (the glue). Its sounds are its `BlockSetType`'s, which TrapDoorBlock's
+    // constructor sets over the soft metal's (`properties.sound(type.soundType())`, as DoorBlock's
+    // for the sliding doors): `SlidingDoorBlock.TRAIN_SET_TYPE`'s netherite, `GLASS_SET_TYPE`'s
+    // glass (`TrainTrapdoorBlock::metal`, `::glass`); opening and closing, the iron trapdoor's.
     if n == "train_trapdoor" || n == "framed_glass_trapdoor" {
         return Some(Decision::Declared {
             template: "minecraft:iron_trapdoor",
@@ -1875,17 +1864,13 @@ fn own_states(b: &CreateBlock) -> Option<Decision> {
     }
     // NixieTubeBlock (DoubleFaceAttachedBlock, `SharedProperties::softMetal`, light 5): its face
     // (`double_face`, floor by default), facing and waterlogging. Only the orange one
-    // (`nixie_tube`) has an item. Shapes by facing: AllShapes.NIXIE_TUBE on the floor, along
-    // the axis clockwise of its facing (one property can't also select the wall and ceiling).
+    // (`nixie_tube`) has an item. Shapes by face and facing (`nixie_tube_shapes`).
     if n == "nixie_tube" || dyed(n, "nixie_tube").is_some() {
-        let along_z = px(&[[9., 0., 5., 15., 12., 11.], [1., 0., 5., 7., 12., 11.]]);
-        let along_x = px(&[[5., 0., 9., 11., 12., 15.], [5., 0., 1., 11., 12., 7.]]);
         return Some(declared(
             "minecraft:heavy_core",
             "minecraft:gold_block",
             true,
-            Some(json!({ "property": "facing", "values": {
-                "north": along_x, "south": along_x, "east": along_z, "west": along_z } })),
+            Some(nixie_tube_shapes()),
             own(&[
                 (
                     "double_face",
@@ -1899,9 +1884,9 @@ fn own_states(b: &CreateBlock) -> Option<Decision> {
     }
     let facing: &[&str] = &["down", "up", "north", "south", "west", "east"];
     // GirderBlock (`SharedProperties::softMetal`, netherite's sounds): `axis` (y by default),
-    // `bottom`, `top`, `x`, `z` set by the glue as Create's `updateState`. Content shapes select
-    // by one property: by `x`, AllShapes.GIRDER_CROSS when it runs along x (also for a lone x
-    // beam), else GIRDER_BEAM along z and EIGHT_VOXEL_POLE (also for a lone pole).
+    // `bottom`, `top`, `x`, `z` set by the glue as Create's `updateState`. `getShape` by `x` and
+    // `z`: AllShapes.GIRDER_CROSS (both beams and TEN_VOXEL_POLE), GIRDER_BEAM along x or z, or
+    // EIGHT_VOXEL_POLE.
     if n == "metal_girder" {
         let beam_x = [0., 2., 4., 16., 14., 12.];
         let beam_z = [4., 2., 0., 12., 14., 16.];
@@ -1909,9 +1894,11 @@ fn own_states(b: &CreateBlock) -> Option<Decision> {
             "minecraft:iron_chain",
             "minecraft:netherite_block",
             true,
-            Some(json!({ "property": "x", "values": {
-                "true": px(&[beam_x, beam_z, [3., 0., 3., 13., 16., 13.]]),
-                "false": px(&[beam_z, [4., 0., 4., 12., 16., 12.]]) } })),
+            Some(json!({ "properties": ["x", "z"], "values": {
+                "true,true": px(&[beam_x, beam_z, [3., 0., 3., 13., 16., 13.]]),
+                "true,false": px(&[beam_x]),
+                "false,true": px(&[beam_z]),
+                "false,false": px(&[[4., 0., 4., 12., 16., 12.]]) } })),
             own(&[
                 ("axis", &["y", "x", "z"]),
                 ("bottom", bools),
@@ -1980,8 +1967,8 @@ fn own_states(b: &CreateBlock) -> Option<Decision> {
     }
     // PlacardBlock (FaceAttachedHorizontalDirectionalBlock, `SharedProperties::copperMetal`):
     // the lever's template gives its placement, survival and signal (15 while `powered`, strong
-    // into the block it hangs on: Create's `getSignal` / `getDirectSignal`); the lever's shapes.
-    // FLOOR, NORTH by default.
+    // into the block it hangs on: Create's `getSignal` / `getDirectSignal`); its shapes are
+    // Create's (`declaration`). FLOOR, NORTH by default.
     if n == "placard" {
         return Some(declared(
             "minecraft:lever",
@@ -1998,7 +1985,8 @@ fn own_states(b: &CreateBlock) -> Option<Decision> {
         ));
     }
     // ClipboardBlock (FaceAttachedHorizontalDirectionalBlock, `SharedProperties::wooden`): the
-    // lever's placement and survival; `written` from the item's pages.
+    // lever's placement and survival, Create's shapes (`declaration`); `written` from the item's
+    // pages.
     if n == "clipboard" {
         return Some(declared(
             "minecraft:lever",
@@ -2388,7 +2376,7 @@ const BASIN: [[f64; 6]; 6] = [
 /// `BlazeBurnerBlock.HEAT_LEVEL` (`blaze`), in order.
 pub const HEATS: &[&str] = &["none", "smouldering", "fading", "kindled", "seething"];
 
-/// AllFluids' honey and chocolate as Horizon fluid declarations (`data/<id>/sunrise/fluid/`):
+/// AllFluids' honey and chocolate as Horizon fluid declarations (`data/<id>/horizon/fluid/`):
 /// in the world (`levelDecreasePerBlock(2)`, `tickRate(25)`, `slopeFindDistance(3)`, with their
 /// buckets), drawn with Create's still texture, untinted
 /// (`SolidRenderedPlaceableFluidType.getTintColor`). Create's flowing texture is the client's
@@ -2429,6 +2417,58 @@ pub fn flame_scroll_model() -> Value {
 /// and flame are drawn by the block entity (`BlazeBurnerRenderer`, the processing glue's client).
 pub fn blaze_burner_states() -> Value {
     json!({ "multipart": [{ "apply": { "model": "create:block/blaze_burner/block" } }] })
+}
+
+/// The sliding doors (`BuilderTransformers.slidingDoor`).
+pub const SLIDING_DOORS: [&str; 5] = [
+    "andesite_door",
+    "brass_door",
+    "copper_door",
+    "train_door",
+    "framed_glass_door",
+];
+
+/// A sliding door's blockstate: Create's (`p.doorBlock` with its `block_bottom` model for the
+/// four lower cases and `block_top` for the upper ones: the door's facing's `toYRot` turned a
+/// quarter more, another quarter when open and a half more for an open right hinge), for its
+/// `visible` states only. `SlidingDoorBlock.getRenderShape` is `ENTITYBLOCK_ANIMATED` while a
+/// door is not `visible`, so it draws nothing of its own then and its block entity draws it
+/// sliding (`SlidingDoorRenderer`). A content block's `render_shape` holds for all its states, so
+/// the hidden states are left out of the multipart instead: a state no case matches draws
+/// nothing, and this file stands over the jar's for every state.
+pub fn sliding_door_states(door: &str) -> Value {
+    let mut cases = Vec::new();
+    for (facing, y_rot) in [("east", 270), ("north", 180), ("south", 0), ("west", 90)] {
+        for (half, model) in [("lower", "block_bottom"), ("upper", "block_top")] {
+            for hinge in ["left", "right"] {
+                for open in [false, true] {
+                    let mut y = y_rot + 90;
+                    if open {
+                        y += 90;
+                    }
+                    if open && hinge == "right" {
+                        y += 180;
+                    }
+                    y %= 360;
+                    let mut apply = json!({ "model": format!("create:block/{door}/{model}") });
+                    if y != 0 {
+                        apply["y"] = json!(y);
+                    }
+                    cases.push(json!({
+                        "when": {
+                            "facing": facing,
+                            "half": half,
+                            "hinge": hinge,
+                            "open": open.to_string(),
+                            "visible": "true"
+                        },
+                        "apply": apply
+                    }));
+                }
+            }
+        }
+    }
+    json!({ "multipart": cases })
 }
 
 /// Create's partial models (`AllPartialModels`) that turn as parts, as hidden blocks of the
@@ -3771,6 +3811,10 @@ pub fn declaration(b: &CreateBlock, d: &Decision) -> Option<Value> {
     if let Some(s) = sounds {
         props.insert("sounds".into(), json!(s));
     }
+    // In `c:relocation_not_supported` (the track): nothing moves it, pistons neither.
+    if b.java.relocation_not_supported {
+        props.insert("push_reaction".into(), json!("IMMOVEABLE"));
+    }
     if *animated {
         props.insert("render_shape".into(), json!("ENTITYBLOCK_ANIMATED"));
     }
@@ -3822,9 +3866,14 @@ pub fn declaration(b: &CreateBlock, d: &Decision) -> Option<Value> {
     ) {
         props.insert("light".into(), json!(0));
     }
-    // AllBlocks' nixie tubes: `lightLevel($ -> 5)`.
+    // AllBlocks' nixie tubes: `lightLevel($ -> 5)` (the dyed ones are registered in a loop, which
+    // the registration reader does not see).
     if b.name == "nixie_tube" || dyed(&b.name, "nixie_tube").is_some() {
         props.insert("light".into(), json!(5));
+    }
+    // A chain's constant `lightLevel`: the refined radiance casing's 12, the experience block's 15.
+    if let Some(light) = b.java.light {
+        props.insert("light".into(), json!(light));
     }
     // Copycats draw their material through their block entity (`CopycatModel`'s `ModelData`),
     // with no model of their own in the chunk mesh, and glow as it (`hasDynamicLightEmission`).
@@ -3877,15 +3926,53 @@ pub fn declaration(b: &CreateBlock, d: &Decision) -> Option<Value> {
     if let Some(s) = shapes {
         doc.insert("shapes".into(), fork_shapes(template, &default, s));
     }
+    if dyed(&b.name, "seat").is_some() {
+        // SeatBlock.getCollisionShape: AllShapes.SEAT_COLLISION, and SEAT_COLLISION_PLAYERS for
+        // players.
+        doc.insert(
+            "collision_shapes".into(),
+            crate::shapes::fixed(&[[0., 0., 0., 16., 6., 16.]]),
+        );
+        doc.insert(
+            "collision_context_shapes".into(),
+            json!({ "player": crate::shapes::fixed(&[[0., 0., 0., 16., 3., 16.]]) }),
+        );
+    }
+    if b.name == "controls" {
+        // ControlsBlock.getCollisionShape: AllShapes.CONTROLS_COLLISION, its outline without the
+        // plate in front.
+        let collision = crate::shapes::by_horizontal(&[[0., 0., 6., 16., 16., 16.]]);
+        doc.insert(
+            "collision_shapes".into(),
+            fork_shapes(template, &default, &collision),
+        );
+    }
     if b.name == "belt" {
         // BeltBlock.getCollisionShape: BeltShapes.getCollisionShape (cut at 19 px) for what is
         // not yet riding the belt. Create gives its passengers the whole outline; a content shape
         // can't tell a passenger, so every entity has the cut one.
         doc.insert("collision_shapes".into(), crate::shapes::belt_shapes().1);
     }
+    if b.name == "chute" {
+        // AbstractChuteBlock.getCollisionShape: ChuteShapes.getCollisionShape, the outline cut
+        // to COLLISION_MASK (from the block's bottom to 24 px).
+        doc.insert("collision_shapes".into(), crate::shapes::chute_shapes().1);
+    }
+    if matches!(b.name.as_str(), "andesite_funnel" | "brass_funnel") {
+        // FunnelBlock.getCollisionShape: an item entity meets a sideways funnel's
+        // FUNNEL_COLLISION, the plate at its back, and passes into its opening.
+        let item = fork_shapes(template, &default, &crate::shapes::funnel_item_collision());
+        doc.insert("collision_context_shapes".into(), json!({ "item": item }));
+    }
+    if matches!(b.name.as_str(), "andesite_belt_funnel" | "brass_belt_funnel") {
+        // BeltFunnelBlock.getCollisionShape: an item entity meets a pushing or pulling belt
+        // funnel's FUNNEL_COLLISION.
+        let item = crate::shapes::belt_funnel_item_collision();
+        doc.insert("collision_context_shapes".into(), json!({ "item": item }));
+    }
     if b.name == "factory_gauge" {
-        // FactoryPanelBlockEntity.getShape publishes the active panels.
-        doc.insert("shapes_from_block_entity".into(), json!(true));
+        // FactoryPanelBlockEntity.getShape publishes the active panels. Horizon: a declaration
+        // has no `shapes_from_block_entity` (HORIZON_GAPS.md), so the panels have no shapes.
         // FactoryPanelBlock.getCollisionShape: empty for entities.
         doc.insert("collision_shapes".into(), json!({ "default": [] }));
     }
@@ -3938,30 +4025,54 @@ pub fn declaration(b: &CreateBlock, d: &Decision) -> Option<Value> {
     if !default.is_empty() {
         doc.insert("default_state".into(), Value::Object(default));
     }
+    if matches!(b.name.as_str(), "placard" | "clipboard") {
+        // PlacardBlock and ClipboardBlock.getShape, by face and facing; they collide with it too,
+        // where the lever's template has no collision.
+        let shapes = if b.name == "placard" {
+            crate::shapes::placard_shapes()
+        } else {
+            crate::shapes::clipboard_shapes()
+        };
+        doc.insert("shapes".into(), shapes.clone());
+        doc.insert("collision_shapes".into(), shapes);
+    }
+    if b.name == "lit_blaze_burner" {
+        // `lightLevel(LitBlazeBurnerBlock::getLight)`: 9 for a soul flame, else 12.
+        doc.insert(
+            "state_light".into(),
+            json!({ "properties": ["flame_type"], "values": { "regular": 12, "soul": 9 } }),
+        );
+    }
     Some(Value::Object(doc))
 }
 
-/// MetalScaffoldingBlock's shapes, declared: its outline is ScaffoldingBlock's `STABLE_SHAPE`
-/// (with the bottom slab when `bottom`), and its collision is scaffolding's context-dependent
-/// one (`ScaffoldingBlock.getCollisionShape`: solid only from above, unless descending), which
-/// a declared block takes by `context_collision`.
+/// MetalScaffoldingBlock's shapes, declared: its outline (`getShape`) is AllShapes.SCAFFOLD_HALF
+/// (its upper half slab) when `bottom`, else SCAFFOLD_FULL (the slab on four 2 px legs), and its
+/// interaction shape a full block (`getInteractionShape`). Horizon: no outline by held item (a
+/// full block while holding scaffolding) and no `context_collision` (HORIZON_GAPS.md); the
+/// `minecraft:scaffolding` template's collision stands.
 fn scaffolding_shapes(doc: &mut Map<String, Value>) {
-    let stable = json!([
-        [0.0, 0.875, 0.0, 1.0, 1.0, 1.0],
-        [0.0, 0.0, 0.0, 0.125, 1.0, 0.125],
-        [0.875, 0.0, 0.0, 1.0, 1.0, 0.125],
-        [0.0, 0.0, 0.875, 0.125, 1.0, 1.0],
-        [0.875, 0.0, 0.875, 1.0, 1.0, 1.0]
-    ]);
-    let mut unstable = stable.clone();
-    if let Value::Array(boxes) = &mut unstable {
-        boxes.push(json!([0.0, 0.0, 0.0, 1.0, 0.125, 1.0]));
-    }
+    let half = [0., 8., 0., 16., 16., 16.];
+    let full = [
+        half,
+        [0., 0., 0., 2., 16., 2.],
+        [0., 0., 14., 2., 16., 16.],
+        [14., 0., 0., 16., 16., 2.],
+        [14., 0., 14., 16., 16., 16.],
+    ];
+    let boxes = |b: &[crate::shapes::Px]| crate::shapes::fixed(b)["default"].clone();
     doc.insert(
         "shapes".into(),
-        json!({ "properties": ["bottom"], "values": { "true": unstable }, "default": stable }),
+        json!({
+            "properties": ["bottom"],
+            "values": { "true": boxes(&[half]) },
+            "default": boxes(&full),
+        }),
     );
-    doc.insert("context_collision".into(), json!("scaffolding"));
+    doc.insert(
+        "interaction_shapes".into(),
+        crate::shapes::fixed(&[[0., 0., 0., 16., 16., 16.]]),
+    );
 }
 
 /// Vanilla 26.3's state properties of the templates blocks with properties of their own are
@@ -4439,20 +4550,56 @@ mod tests {
     const OWN: &str = "test:own";
 
     fn declare(name: &str, info: (f64, f64, u32)) -> Value {
+        declare_with(name, info, &[], JavaFacts::default())
+    }
+
+    /// [`declare`] with the block's blockstate properties and registration facts.
+    fn declare_with(
+        name: &str,
+        info: (f64, f64, u32),
+        props: &[(&str, &[&str])],
+        java: JavaFacts,
+    ) -> Value {
         let b = CreateBlock {
             name: name.into(),
-            props: Props::new(),
+            props: props
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.iter().map(|v| v.to_string()).collect()))
+                .collect(),
             hardness: info.0,
             blast_resistance: info.1,
             stack: info.2,
-            java: JavaFacts::default(),
+            java,
         };
-        let d = decide(&b, &BTreeMap::new());
-        let mut doc = declaration(&b, &d).unwrap_or_else(|| panic!("{name}: {d:?}"));
+        declared_doc(&b)
+    }
+
+    /// `b`'s declaration, with its own properties as Create defines them under [`OWN`].
+    fn declared_doc(b: &CreateBlock) -> Value {
+        let d = decide(b, &BTreeMap::new());
+        let mut doc = declaration(b, &d).unwrap_or_else(|| panic!("{}: {d:?}", b.name));
         if let Decision::Declared { own: Some(own), .. } = &d {
             doc[OWN] = own.clone();
         }
         doc
+    }
+
+    /// `b`'s state count as Create has it: every property of its runtime default state
+    /// (`default_states.json`), with the values its declaration's own properties give it, else
+    /// those Create's generated data does (its blockstate, `waterloggable`); so a property left
+    /// to the template (a postbox's `waterlogged`) counts too.
+    fn create_state_count(b: &CreateBlock, doc: &Value) -> usize {
+        let own = doc[OWN].as_object();
+        runtime_defaults()[&b.name]
+            .keys()
+            .map(|k| {
+                own.and_then(|o| o.get(k))
+                    .and_then(Value::as_array)
+                    .map(Vec::len)
+                    .or_else(|| b.props.get(k).map(BTreeSet::len))
+                    .unwrap_or_else(|| panic!("{}.{k}: no values", b.name))
+            })
+            .product()
     }
 
     fn pairs(p: &[(&str, &str)]) -> Vec<(String, String)> {
@@ -4646,15 +4793,202 @@ mod tests {
         assert!(doc["properties"].get("render_shape").is_none());
     }
 
+    #[test]
+    fn registration_facts_give_sounds_light_and_push_reaction() {
+        // BuilderTransformers.casing's wood (after the chain's own sound) and a constant light.
+        let doc = declare_with(
+            "refined_radiance_casing",
+            (2.0, 6.0, 64),
+            &[],
+            JavaFacts {
+                class: Some("CasingBlock".into()),
+                transformer_base: Some("stone".into()),
+                transformed: true,
+                sound: Some("wood".into()),
+                light: Some(12),
+                ..JavaFacts::default()
+            },
+        );
+        assert_eq!(doc["properties"]["sounds"], "minecraft:oak_planks");
+        assert_eq!(doc["properties"]["light"], 12);
+        // `initialProperties(() -> Blocks.DEEPSLATE)`: deepslate's sounds.
+        let doc = declare_with(
+            "rose_quartz_tiles",
+            (1.25, 6.0, 64),
+            &[],
+            JavaFacts {
+                class: Some("Block".into()),
+                base: Some("deepslate".into()),
+                ..JavaFacts::default()
+            },
+        );
+        assert_eq!(doc["properties"]["sounds"], "minecraft:deepslate");
+        assert!(doc["properties"].get("light").is_none());
+        // `c:relocation_not_supported`: immovable.
+        let doc = declare_with(
+            "track",
+            (0.8, 0.8, 64),
+            &[],
+            JavaFacts {
+                relocation_not_supported: true,
+                ..JavaFacts::default()
+            },
+        );
+        assert_eq!(doc["properties"]["push_reaction"], "IMMOVEABLE");
+        assert!(
+            declare("track_signal", (3.0, 6.0, 64))["properties"]
+                .get("push_reaction")
+                .is_none()
+        );
+        // LitBlazeBurnerBlock.getLight by flame.
+        let doc = declare("lit_blaze_burner", (3.0, 6.0, 1));
+        assert_eq!(
+            doc["state_light"],
+            json!({ "properties": ["flame_type"], "values": { "regular": 12, "soul": 9 } })
+        );
+    }
+
+    #[test]
+    fn blocks_take_create_s_outline_and_collision_shapes() {
+        // SeatBlock: a half block to look at, 6 px to collide with, 3 px for players.
+        let doc = declare("lime_seat", (2.0, 2.0, 64));
+        assert_eq!(doc["shapes"]["values"]["false"][0][4], 0.5);
+        assert_eq!(doc["collision_shapes"]["default"][0][4], 0.375);
+        assert_eq!(
+            doc["collision_context_shapes"]["player"]["default"][0][4],
+            0.1875
+        );
+        // ControlsBlock: CONTROLS_COLLISION, without the plate in front.
+        let doc = declare("controls", (3.0, 6.0, 64));
+        assert_eq!(
+            doc["shapes"]["values"]["north"].as_array().unwrap().len(),
+            2
+        );
+        assert_eq!(
+            doc["collision_shapes"]["values"]["north"],
+            json!([[0.0, 0.0, 0.375, 1.0, 1.0, 1.0]])
+        );
+        // StationBlock: AllShapes.STATION.
+        let doc = declare("track_station", (3.0, 6.0, 64));
+        assert_eq!(doc["shapes"]["default"].as_array().unwrap().len(), 2);
+        assert_eq!(doc["shapes"]["default"][1][4], 0.8125);
+        // GirderBlock: by `x` and `z`, a lone pole when neither.
+        let doc = declare("metal_girder", (3.0, 6.0, 64));
+        assert_eq!(doc["shapes"]["properties"], json!(["x", "z"]));
+        assert_eq!(
+            doc["shapes"]["values"]["true,true"]
+                .as_array()
+                .unwrap()
+                .len(),
+            3
+        );
+        assert_eq!(
+            doc["shapes"]["values"]["false,true"],
+            json!([[0.25, 0.125, 0.0, 0.75, 0.875, 1.0]])
+        );
+        assert_eq!(
+            doc["shapes"]["values"]["false,false"],
+            json!([[0.25, 0.0, 0.25, 0.75, 1.0, 0.75]])
+        );
+        // Nixie tubes: by face and facing.
+        let doc = declare("blue_nixie_tube", (3.0, 6.0, 1));
+        assert_eq!(
+            doc["shapes"]["properties"],
+            json!(["double_face", "facing"])
+        );
+        assert_eq!(doc["properties"]["light"], 5);
+        // Placards and clipboards: Create's shapes, collided with too.
+        for name in ["placard", "clipboard"] {
+            let doc = declare(name, (3.0, 6.0, 64));
+            assert_eq!(
+                doc["shapes"]["properties"],
+                json!(["face", "facing"]),
+                "{name}"
+            );
+            assert_eq!(doc["collision_shapes"], doc["shapes"], "{name}");
+        }
+        // MetalScaffoldingBlock: SCAFFOLD_HALF when `bottom`, else SCAFFOLD_FULL; a full block to
+        // click.
+        let doc = declare_with(
+            "andesite_scaffolding",
+            (0.0, 0.0, 64),
+            &[
+                ("bottom", &["false", "true"]),
+                ("waterlogged", &["false", "true"]),
+            ],
+            JavaFacts::default(),
+        );
+        assert_eq!(doc["template"], "minecraft:scaffolding");
+        assert_eq!(
+            doc["shapes"]["values"]["true"],
+            json!([[0.0, 0.5, 0.0, 1.0, 1.0, 1.0]])
+        );
+        assert_eq!(doc["shapes"]["default"].as_array().unwrap().len(), 5);
+        assert_eq!(
+            doc["interaction_shapes"]["default"],
+            json!([[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]])
+        );
+    }
+
+    /// Create's checkout (`compile --create`): `$CREATE_CHECKOUT`, else the folder holding this
+    /// repository if it is one, else a `create-java` checkout beside this repository.
+    fn create_checkout() -> Option<std::path::PathBuf> {
+        let beside = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
+        match std::env::var_os("CREATE_CHECKOUT") {
+            Some(root) => Some(root.into()),
+            None => [beside.clone(), beside.join("create-java")]
+                .into_iter()
+                .find(|root| root.join("src/generated/resources").is_dir()),
+        }
+        .filter(|root| root.join("src/generated/resources").is_dir())
+    }
+
+    /// The committed block declarations are what `compile` declares, so one edited by hand is
+    /// caught (as parsed JSON: line endings and key order aside, and the fuel components
+    /// `compile` adds after declaring). Runs where Create's checkout is at hand.
+    #[test]
+    fn committed_block_declarations_are_current() {
+        let Some(root) = create_checkout() else {
+            eprintln!("no Create checkout at hand ($CREATE_CHECKOUT): skipped");
+            return;
+        };
+        let java = crate::java::read_all(&root.join("src/main/java"));
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/data/create/horizon/block");
+        let without_fuel = |mut doc: Value| {
+            let object = doc.as_object_mut().unwrap();
+            if let Some(Value::Object(c)) = object.get_mut("components") {
+                c.remove("minecraft:cooking_fuel");
+                c.remove("!minecraft:cooking_fuel");
+                if c.is_empty() {
+                    object.remove("components");
+                }
+            }
+            doc
+        };
+        let mut stale = Vec::new();
+        for b in read_blocks(&root.join("src/generated/resources"), &java) {
+            let Some(doc) = declaration(&b, &decide(&b, &BTreeMap::new())) else {
+                continue;
+            };
+            let path = dir.join(format!("{}.json", b.name));
+            let committed: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+            if without_fuel(doc) != without_fuel(committed) {
+                stale.push(b.name);
+            }
+        }
+        assert!(stale.is_empty(), "not what compile declares: {stale:?}");
+    }
+
     /// With Create's generated data beside the port: every valve handle, sliding door, toolbox,
     /// postbox and nixie tube is declared, with their state counts.
     #[test]
     fn create_data_declares_the_gap_two_families() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let generated = root.join("src/generated/resources");
-        if !generated.is_dir() {
+        let Some(root) = create_checkout() else {
+            eprintln!("no Create checkout at hand ($CREATE_CHECKOUT): skipped");
             return;
-        }
+        };
+        let generated = root.join("src/generated/resources");
         let java = crate::java::read_all(&root.join("src/main/java"));
         let all = read_blocks(&generated, &java);
         let mut states = BTreeMap::<&str, (usize, usize)>::new();
@@ -4663,11 +4997,10 @@ mod tests {
                 .into_iter()
                 .find(|f| b.name.ends_with(f) && !b.name.contains("trapdoor"));
             let Some(family) = family else { continue };
-            let d = decide(b, &BTreeMap::new());
-            let doc = declaration(b, &d).unwrap_or_else(|| panic!("{}: {d:?}", b.name));
+            let doc = declared_doc(b);
             let e = states.entry(family).or_default();
             e.0 += 1;
-            e.1 += states_and_default(&doc).0;
+            e.1 += create_state_count(b, &doc);
         }
         assert_eq!(states["valve_handle"], (17, 204));
         assert_eq!(states["_door"], (5, 640));
@@ -4676,21 +5009,64 @@ mod tests {
         assert_eq!(states["nixie_tube"], (16, 512));
     }
 
+    /// `doorBlock`'s turns for the `visible` states only: closed, the facing's quarter on; open,
+    /// another quarter, and a half more for a right hinge.
+    #[test]
+    fn sliding_doors_draw_only_while_visible() {
+        let doc = sliding_door_states("train_door");
+        let cases = doc["multipart"].as_array().unwrap();
+        assert_eq!(cases.len(), 32);
+        assert!(cases.iter().all(|c| c["when"]["visible"] == "true"));
+        let at = |facing: &str, half: &str, hinge: &str, open: &str| {
+            let c = cases
+                .iter()
+                .find(|c| {
+                    let w = &c["when"];
+                    w["facing"] == facing && w["half"] == half && w["hinge"] == hinge
+                        && w["open"] == open
+                })
+                .unwrap();
+            (
+                c["apply"]["model"].as_str().unwrap().to_owned(),
+                c["apply"].get("y").and_then(Value::as_i64).unwrap_or(0),
+            )
+        };
+        let bottom = "create:block/train_door/block_bottom".to_owned();
+        let top = "create:block/train_door/block_top".to_owned();
+        assert_eq!(at("north", "lower", "left", "false"), (bottom.clone(), 270));
+        assert_eq!(at("north", "upper", "left", "true"), (top.clone(), 0));
+        assert_eq!(at("north", "lower", "right", "true"), (bottom.clone(), 180));
+        assert_eq!(at("east", "lower", "left", "false"), (bottom.clone(), 0));
+        assert_eq!(at("east", "upper", "left", "true"), (top, 90));
+        assert_eq!(at("east", "lower", "right", "true"), (bottom, 270));
+    }
+
+    /// The committed sliding door blockstates are the generator's (`compile` writes them).
+    #[test]
+    fn committed_sliding_door_states_are_current() {
+        let dir =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/assets/create/blockstates");
+        for door in SLIDING_DOORS {
+            // Parsed, so a checkout's line endings don't matter.
+            let committed: Value =
+                serde_json::from_slice(&fs::read(dir.join(format!("{door}.json"))).unwrap())
+                    .unwrap();
+            assert_eq!(committed, sliding_door_states(door), "{door}");
+        }
+    }
+
     /// The decorative and kinetic blocks ported with their glue: Create's states and defaults.
     #[test]
     fn decorative_and_kinetic_blocks_take_create_s_states() {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../..");
-        let generated = root.join("src/generated/resources");
-        if !generated.is_dir() {
+        let Some(root) = create_checkout() else {
+            eprintln!("no Create checkout at hand ($CREATE_CHECKOUT): skipped");
             return;
-        }
+        };
+        let generated = root.join("src/generated/resources");
         let java = crate::java::read_all(&root.join("src/main/java"));
         let all = read_blocks(&generated, &java);
-        let doc = |n: &str| {
-            let b = all.iter().find(|b| b.name == n).unwrap();
-            let d = decide(b, &BTreeMap::new());
-            declaration(b, &d).unwrap_or_else(|| panic!("{n}: {d:?}"))
-        };
+        let block = |n: &str| all.iter().find(|b| b.name == n).unwrap();
+        let doc = |n: &str| declared_doc(block(n));
         let expect = [
             // GirderBlock: X, Z, TOP, BOTTOM, AXIS (y), WATERLOGGED.
             ("metal_girder", 96, vec![("axis", "y"), ("x", "false")]),
@@ -4719,8 +5095,8 @@ mod tests {
         ];
         for (n, count, defaults) in expect {
             let d = doc(n);
-            let (c, def) = states_and_default(&d);
-            assert_eq!(c, count, "{n}");
+            let (_, def) = states_and_default(&d);
+            assert_eq!(create_state_count(block(n), &d), count, "{n}");
             for (k, v) in defaults {
                 assert!(def.contains(&(k.to_owned(), v.to_owned())), "{n}: {k}");
             }

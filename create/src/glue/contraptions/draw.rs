@@ -88,6 +88,7 @@ impl Subsystem for Drawing {
 
     fn world_closed(&self) {
         LOADED.with_borrow_mut(Vec::clear);
+        POSED_SENT.with_borrow_mut(std::collections::HashSet::clear);
         actor_draw::forget();
     }
 
@@ -108,10 +109,23 @@ impl Subsystem for Drawing {
                 hide(lv, pos);
             }
         }
+        send_posed_controls(lv);
     }
 
     fn client_tick(&self, host: &mut dyn ClientHost) {
         client_tick(host);
+    }
+
+    /// The contraption controls on the carts and train carriages near the player
+    /// ([`POSED_CHANNEL`]).
+    fn server_message(&self, _host: &mut dyn ClientHost, channel: &str, data: &[u8]) -> bool {
+        if channel != POSED_CHANNEL {
+            return false;
+        }
+        if let Some(all) = create_engine::actors::PosedControls::decode_all(data) {
+            POSED.with_borrow_mut(|p| *p = all);
+        }
+        true
     }
 
     fn client_reset(&self) {
@@ -144,6 +158,7 @@ fn anchors(dim: usize, pos: [i32; 3]) -> bool {
             })
     })
     .unwrap_or(false)
+        || super::lifts::mirroring(dim, pos)
 }
 
 /// Linear motion and limited turns need a new pose every frame: `spin` cannot stop at a limit.
@@ -153,7 +168,13 @@ fn redraws_each_frame(data: &Compound) -> bool {
     };
     match int(c, "Kind") {
         Some(GLIDE | ELEVATOR) => true,
-        Some(TURN) => get_float(c, "Limit").is_some(),
+        // A sequenced turn, or one carrying stabilized structures (drawn where they hang).
+        Some(TURN) => {
+            get_float(c, "Limit").is_some()
+                || c.contains_key(&"Subs".into())
+                || c.contains_key(&"Still".into())
+        }
+        Some(CLOCK) => c.contains_key(&"Subs".into()) || c.contains_key(&"Still".into()),
         _ => false,
     }
 }
@@ -268,12 +289,16 @@ pub(super) fn show_turn(
     lv: &mut ServerLevel<'_>,
     anchor: [i32; 3],
     blocks: &[([i32; 3], u32)],
+    subs: &[create_engine::contraption::Stabilized],
+    still: &[[i32; 3]],
     axis: Axis,
     turn: Turn,
 ) {
     let mut c = Compound::new();
     c.insert("Kind".into(), Tag::Int(TURN));
     blocks_tags(&mut c, "", lv, anchor, blocks);
+    subs_tags(&mut c, lv, anchor, subs.iter().map(|s| (0, s)));
+    still_tag(&mut c, still);
     c.insert("Axis".into(), Tag::Int(axis_index(axis)));
     let now = lv.game_time();
     c.insert("Angle".into(), float(turn.angle_at(now)));
@@ -284,6 +309,35 @@ pub(super) fn show_turn(
         c.insert("Limit".into(), float(left));
     }
     write(lv, anchor, Some(c));
+}
+
+/// The mechanical bearings of a turning structure whose tops turn back against it
+/// (`StabilizedBearingMovementBehaviour`), for its clients.
+fn still_tag(c: &mut Compound, still: &[[i32; 3]]) {
+    if !still.is_empty() {
+        c.insert("Still".into(), Tag::IntArray(still.iter().flatten().copied().collect()));
+    }
+}
+
+/// The stabilized structures riding a turning structure, for its clients: each one's bearing,
+/// facing and the part it rides (a clock's hand), and its blocks.
+fn subs_tags<'a>(
+    c: &mut Compound,
+    lv: &ServerLevel<'_>,
+    anchor: [i32; 3],
+    subs: impl Iterator<Item = (u8, &'a create_engine::contraption::Stabilized)>,
+) {
+    let mut heads = Vec::new();
+    for (i, (hand, sub)) in subs.enumerate() {
+        heads.extend(sub.bearing);
+        heads.push(Dir::ALL.iter().position(|d| *d == sub.facing).unwrap_or(0) as i32);
+        heads.push(i32::from(hand));
+        let key = create_engine::contraption::sub_key(anchor, i);
+        blocks_tags(c, &format!("S{i}"), lv, key, &sub.blocks);
+    }
+    if !heads.is_empty() {
+        c.insert("Subs".into(), Tag::IntArray(heads));
+    }
 }
 
 /// A structure moving along a line: its blocks (offsets from `origin`, itself from the anchor)
@@ -327,6 +381,10 @@ pub(super) struct Hands<'a> {
     pub axis: Axis,
     pub angles: (f32, f32),
     pub speeds: (f32, f32),
+    /// The stabilized structures riding the hands (0 the hour's, 1 the minute's).
+    pub subs: &'a [(u8, create_engine::contraption::Stabilized)],
+    /// The mechanical bearings on them whose tops turn back against them.
+    pub still: &'a [[i32; 3]],
 }
 
 pub(super) fn show_clock(lv: &mut ServerLevel<'_>, anchor: [i32; 3], h: Hands<'_>) {
@@ -334,6 +392,8 @@ pub(super) fn show_clock(lv: &mut ServerLevel<'_>, anchor: [i32; 3], h: Hands<'_
     c.insert("Kind".into(), Tag::Int(CLOCK));
     blocks_tags(&mut c, "", lv, anchor, h.hour);
     blocks_tags(&mut c, "2", lv, anchor, h.minute);
+    subs_tags(&mut c, lv, anchor, h.subs.iter().map(|(hand, s)| (*hand, s)));
+    still_tag(&mut c, h.still);
     c.insert("Axis".into(), Tag::Int(axis_index(h.axis)));
     c.insert("Angle".into(), float(h.angles.0));
     c.insert("Angle2".into(), float(h.angles.1));
@@ -418,6 +478,48 @@ struct Drawn {
     props: Vec<(String, String)>,
     /// The Create block and facts of its state.
     create: Option<(create_engine::Block, create_engine::parts::StateInfo)>,
+    /// A mechanical bearing whose top turns back against the structure carrying it
+    /// (`StabilizedBearingMovementBehaviour`): drawn apart, still.
+    stabilizing: bool,
+}
+
+/// A stabilized structure riding a turning one, as its client draws it: its bearing (offset from
+/// the anchor), that bearing's facing and its blocks.
+struct SubDrawn {
+    bearing: [i32; 3],
+    facing: Dir,
+    /// The part it rides: 0, or a clock's minute hand 1.
+    hand: u8,
+    blocks: Vec<Drawn>,
+}
+
+/// The stabilized structures of a structure's data (`subs_tags`), and its blocks (`parts`, one
+/// list a part it turns) told which bearings' tops turn back against it (`still_tag`).
+fn drawn_subs(host: &dyn Host, c: &Compound, parts: &mut [&mut Vec<Drawn>]) -> Vec<SubDrawn> {
+    let still: Vec<[i32; 3]> = ints(c, "Still")
+        .as_chunks::<3>()
+        .0
+        .iter()
+        .map(|v| [v[0], v[1], v[2]])
+        .collect();
+    let subs: Vec<SubDrawn> = ints(c, "Subs")
+        .as_chunks::<5>()
+        .0
+        .iter()
+        .enumerate()
+        .map(|(i, h)| SubDrawn {
+            bearing: [h[0], h[1], h[2]],
+            facing: Dir::ALL[h[3].clamp(0, 5) as usize],
+            hand: h[4].clamp(0, 1) as u8,
+            blocks: drawn_blocks(host, c, &format!("S{i}")),
+        })
+        .collect();
+    for part in parts.iter_mut() {
+        for b in part.iter_mut() {
+            b.stabilizing = still.contains(&b.at.map(|v| v.round() as i32));
+        }
+    }
+    subs
 }
 
 fn drawn_blocks(host: &dyn Host, c: &Compound, suffix: &str) -> Vec<Drawn> {
@@ -452,6 +554,7 @@ fn drawn_blocks(host: &dyn Host, c: &Compound, suffix: &str) -> Vec<Drawn> {
                 _ => None,
             };
             Some(Drawn {
+                stabilizing: false,
                 at: o.map(|v| v as f32),
                 state,
                 entity,
@@ -476,6 +579,7 @@ enum Shape {
         rpm: f32,
         /// The degrees a sequenced turn may still go from `since`.
         limit: Option<f32>,
+        subs: Vec<SubDrawn>,
     },
     Glide {
         blocks: Vec<Drawn>,
@@ -494,6 +598,7 @@ enum Shape {
         angles: (f32, f32),
         speeds: (f32, f32),
         since: f64,
+        subs: Vec<SubDrawn>,
     },
     Elevator {
         blocks: Vec<Drawn>,
@@ -530,14 +635,19 @@ fn parse(host: &dyn Host, c: &Compound) -> Option<Shape> {
         _ => 0.0,
     };
     Some(match int(c, "Kind")? {
-        TURN => Shape::Turn {
-            blocks: drawn_blocks(host, c, ""),
-            axis: axis_vector(int(c, "Axis")?),
-            angle: get_float(c, "Angle").unwrap_or(0.0),
-            since,
-            rpm: get_float(c, "Rpm").unwrap_or(0.0),
-            limit: get_float(c, "Limit"),
-        },
+        TURN => {
+            let mut blocks = drawn_blocks(host, c, "");
+            let subs = drawn_subs(host, c, &mut [&mut blocks]);
+            Shape::Turn {
+                blocks,
+                axis: axis_vector(int(c, "Axis")?),
+                angle: get_float(c, "Angle").unwrap_or(0.0),
+                since,
+                rpm: get_float(c, "Rpm").unwrap_or(0.0),
+                limit: get_float(c, "Limit"),
+                subs,
+            }
+        }
         GLIDE => Shape::Glide {
             blocks: drawn_blocks(host, c, ""),
             origin: vec3(ints(c, "Origin")).map(|v| v as f32),
@@ -548,14 +658,19 @@ fn parse(host: &dyn Host, c: &Compound) -> Option<Shape> {
             clamp: get_float(c, "Min").zip(get_float(c, "Max")),
             rope: c.get(&"Rope".into()).is_some(),
         },
-        CLOCK => Shape::Clock {
-            hour: drawn_blocks(host, c, ""),
-            minute: drawn_blocks(host, c, "2"),
-            axis: axis_vector(int(c, "Axis")?),
-            angles: (get_float(c, "Angle")?, get_float(c, "Angle2")?),
-            speeds: (get_float(c, "Speed")?, get_float(c, "Speed2")?),
-            since,
-        },
+        CLOCK => {
+            let (mut hour, mut minute) = (drawn_blocks(host, c, ""), drawn_blocks(host, c, "2"));
+            let subs = drawn_subs(host, c, &mut [&mut hour, &mut minute]);
+            Shape::Clock {
+                hour,
+                minute,
+                axis: axis_vector(int(c, "Axis")?),
+                angles: (get_float(c, "Angle")?, get_float(c, "Angle2")?),
+                speeds: (get_float(c, "Speed")?, get_float(c, "Speed2")?),
+                since,
+                subs,
+            }
+        }
         ELEVATOR => {
             let n = ints(c, "Nums");
             let at = |i: usize| n.get(i).copied();
@@ -682,6 +797,7 @@ thread_local! {
 
 fn client_reset() {
     SHOWN.with_borrow_mut(HashMap::clear);
+    POSED.with_borrow_mut(Vec::clear);
     actor_draw::client_reset();
 }
 
@@ -796,9 +912,17 @@ fn draw_blocks(
             draw_carried(host, draw, anchor, b, block, entity);
         }
         draw.block(b.block, &props);
+        // A sliding door rides hidden (`Contraption.capture`), so its block above draws
+        // nothing: its block entity's renderer draws the panel (`SlidingDoorRenderer`).
+        if let Some((block, _)) = b.create
+            && create_engine::dye::is_sliding_door(block)
+        {
+            let local = b.at.map(|v| v.round() as i32);
+            crate::glue::decor::doors::draw_riding(draw, anchor, local, b.block, &props);
+        }
         if let Some((block, info)) = b.create {
             let actor = actors.filter(|_| actor_draw::draws(block));
-            draw_parts(draw, block, &info, &props, actor.is_some());
+            draw_parts(draw, block, &info, &props, actor.is_some(), b.stabilizing);
             match actor {
                 Some(frame) => {
                     let local = b.at.map(|v| v.round() as i32);
@@ -1110,26 +1234,12 @@ fn draw_parts(
     info: &create_engine::parts::StateInfo,
     props: &[(&str, &str)],
     actor: bool,
+    stabilizing: bool,
 ) {
-    use create_engine::client::{Model, draws};
-    if whole_model(block) {
-        return;
-    }
-    for d in draws(block, info, [0; 3], [0.0; 2]) {
-        if d.model == Model::Own || (actor && matches!(d.model, Model::DrillHead(_))) {
-            continue;
-        }
-        let Some((model, prop)) = super::super::kinetics::part_model(block, d.model) else {
-            continue;
-        };
+    for (model, prop, axis, phase) in carried_parts(block, info, actor, stabilizing) {
         draw.push();
-        let axis = match d.axis {
-            Axis::X => [1.0, 0.0, 0.0],
-            Axis::Y => [0.0, 1.0, 0.0],
-            Axis::Z => [0.0, 0.0, 1.0],
-        };
-        if d.phase != 0.0 {
-            draw.rotate_about(axis, d.phase, [0.5; 3]);
+        if phase != 0.0 {
+            draw.rotate_about(axis, phase, [0.5; 3]);
         }
         match prop {
             Some(p) => draw.block(model, &[p]),
@@ -1137,6 +1247,125 @@ fn draw_parts(
         };
         draw.pop();
     }
+}
+
+/// `ContraptionRenderInfo.renderBlockEntities` for a block a moving structure carries: the
+/// partial models its block entity's renderer draws besides its block model, each its model
+/// block, the property it takes (none: the block's own), and the axis (a unit vector) and
+/// degrees it is turned about its block's centre; a kinetic block's parts at rest. An actor's
+/// head (`actor`: drawn as it works) and a stabilizing bearing's top (`stabilizing`: drawn
+/// turned back against its carrier) are left out, and a mechanical bearing draws only its top
+/// (`StabilizedBearingMovementBehaviour.disableBlockEntityRendering`).
+pub(crate) fn carried_parts(
+    block: create_engine::Block,
+    info: &create_engine::parts::StateInfo,
+    actor: bool,
+    stabilizing: bool,
+) -> Vec<(BlockKey, Option<(&'static str, &'static str)>, [f32; 3], f32)> {
+    use create_engine::client::{Model, draws};
+    if whole_model(block) {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    for d in draws(block, info, [0; 3], [0.0; 2]) {
+        if d.model == Model::Own || (actor && matches!(d.model, Model::DrillHead(_))) {
+            continue;
+        }
+        if block == create_engine::Block::MechanicalBearing
+            && (!matches!(d.model, Model::BearingTopMetal(_)) || stabilizing)
+        {
+            continue;
+        }
+        let Some((model, prop)) = super::super::kinetics::part_model(block, d.model) else {
+            continue;
+        };
+        let axis = match d.axis {
+            Axis::X => [1.0, 0.0, 0.0],
+            Axis::Y => [0.0, 1.0, 0.0],
+            Axis::Z => [0.0, 0.0, 1.0],
+        };
+        out.push((model, prop, axis, d.phase));
+    }
+    out
+}
+
+/// A stabilized structure riding a structure turned `here` degrees about `axis` (`rate` a tick)
+/// through its anchor's centre (`OrientedContraptionEntity.applyLocalTransforms` riding a
+/// `ControlledContraptionEntity`: `repositionOnContraption`, its own yaw its initial one): its
+/// blocks where its bearing's front has turned to, upright, and its bearing's top with them
+/// (`StabilizedBearingMovementBehaviour`: turned back by the carrier's angle).
+#[allow(clippy::too_many_arguments)]
+fn draw_stabilized(
+    host: &dyn ClientHost,
+    draw: &mut dyn BlockEntityDrawContext,
+    pos: [i32; 3],
+    sub: &SubDrawn,
+    axis: [f32; 3],
+    here: f32,
+    rate: f32,
+    view: Option<&actor_draw::View>,
+    now: f64,
+    partial: f32,
+    camera: Option<[f64; 3]>,
+) {
+    let front = add_i(sub.bearing, sub.facing.offset()).map(f64::from);
+    let shift_at = |deg: f32| {
+        let r = create_engine::actors::turn_vec(front, axis_enum(axis), f64::from(deg));
+        [0, 1, 2].map(|i| (r[i] - front[i]) as f32)
+    };
+    let shift = shift_at(here);
+    let next = shift_at(here + rate);
+    let frame = view.map(|view| Frame {
+        anchor: pos,
+        view,
+        motion: Motion::Glide {
+            shift,
+            velocity: [0, 1, 2].map(|i| next[i] - shift[i]),
+        },
+        now,
+        partial,
+        camera,
+        elevator: None,
+    });
+    let pose = WorldPose::translated(pos, shift);
+    draw.push();
+    draw.translate(shift);
+    draw_blocks(host, draw, pos, &sub.blocks, frame.as_ref(), Lighting::Sampled(pose));
+    draw.pop();
+}
+
+/// `StabilizedBearingMovementBehaviour.renderInContraption` for a mechanical bearing `b` of a
+/// structure turned `here` degrees about `axis` through its anchor's centre, whose carrier can
+/// stabilize it: its top turned back by the carrier's angle, so it stays as placed where the
+/// bearing has turned to (its stabilized structure, if any, hangs from it).
+fn draw_still_top(
+    host: &dyn ClientHost,
+    draw: &mut dyn BlockEntityDrawContext,
+    pos: [i32; 3],
+    b: &Drawn,
+    axis: [f32; 3],
+    here: f32,
+) {
+    let Some(facing) = b.create.and_then(|(_, i)| i.facing) else {
+        return;
+    };
+    let at = b.at.map(f64::from);
+    let r = create_engine::actors::turn_vec(at, axis_enum(axis), f64::from(here));
+    let corner = [0, 1, 2].map(|i| r[i] as f32);
+    let pose = WorldPose::translated(pos, [0.0; 3]);
+    let level = host.level(host.dimension());
+    let own = draw.light();
+    draw.set_light(pose.light(host, level.as_ref(), corner));
+    draw.push();
+    draw.translate(corner);
+    let top = client::bearing_top(Block::MechanicalBearing, facing);
+    draw_bearing_top(draw, top.map(|m| (Block::MechanicalBearing, m)));
+    draw.pop();
+    draw.set_light(own);
+}
+
+fn add_i(a: [i32; 3], b: [i32; 3]) -> [i32; 3] {
+    [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
 }
 
 /// The bearing's separate top model, drawn under the same pose as its structure.
@@ -1197,6 +1426,7 @@ fn submit(
                 since,
                 rpm,
                 limit,
+                subs,
             } => {
                 let rate = rpm * 0.3;
                 let turned = rate * (now - since) as f32;
@@ -1204,7 +1434,8 @@ fn submit(
                 let held = limit.map(|l| turned.clamp(-l, l));
                 let here = (angle + held.unwrap_or(turned)) % 360.0;
                 let world_pose = WorldPose::turned(pos, *axis, here);
-                if view.is_some() || held.is_some() {
+                let still = blocks.iter().any(|b| b.stabilizing);
+                if view.is_some() || held.is_some() || !subs.is_empty() || still {
                     // Actors and sequenced turns need a fresh pose every frame.
                     let frame = if let Some(view) = &view {
                         let axis = axis_enum(*axis);
@@ -1238,6 +1469,26 @@ fn submit(
                         Lighting::Sampled(world_pose),
                     );
                     draw.pop();
+                    for b in blocks.iter().filter(|b| b.stabilizing) {
+                        draw_still_top(host, draw, pos, b, *axis, here);
+                    }
+                    let stopped = held.is_some_and(|h| h != turned);
+                    let step = if stopped { 0.0 } else { rate };
+                    for sub in subs {
+                        draw_stabilized(
+                            host,
+                            draw,
+                            pos,
+                            sub,
+                            *axis,
+                            here,
+                            step,
+                            view.as_ref(),
+                            now,
+                            partial,
+                            camera,
+                        );
+                    }
                 } else {
                     // A steady turn is kept and spun by the game, which lights it where it turns.
                     let phase = (f64::from(here) - anim * f64::from(rate)) % 360.0;
@@ -1255,6 +1506,67 @@ fn submit(
                 angles,
                 speeds,
                 since,
+                subs,
+            } if !subs.is_empty()
+                || view.is_some()
+                || hour.iter().chain(minute).any(|b| b.stabilizing) =>
+            {
+                // With stabilized structures riding them, the hands are posed each frame.
+                for (hand, blocks, angle, rate) in [
+                    (0, hour, angles.0, speeds.0),
+                    (1, minute, angles.1, speeds.1),
+                ] {
+                    let here = angle + rate * (now - since) as f32;
+                    draw.push();
+                    draw.rotate_about(*axis, here, [0.5; 3]);
+                    if hand == 0 {
+                        draw_bearing_top(draw, top);
+                    }
+                    let pose = Lighting::Sampled(WorldPose::turned(pos, *axis, here));
+                    // Its actors work where the hand has turned to.
+                    let frame = view.as_ref().map(|view| Frame {
+                        anchor: pos,
+                        view,
+                        motion: Motion::Turn {
+                            axis: axis_enum(*axis),
+                            angle: here,
+                            rate,
+                        },
+                        now,
+                        partial,
+                        camera,
+                        elevator: None,
+                    });
+                    draw_blocks(host, draw, pos, blocks, frame.as_ref(), pose);
+                    draw.pop();
+                    for b in blocks.iter().filter(|b| b.stabilizing) {
+                        draw_still_top(host, draw, pos, b, *axis, here);
+                    }
+                    for sub in subs.iter().filter(|s| s.hand == hand) {
+                        draw_stabilized(
+                            host,
+                            draw,
+                            pos,
+                            sub,
+                            *axis,
+                            here,
+                            rate,
+                            view.as_ref(),
+                            now,
+                            partial,
+                            camera,
+                        );
+                    }
+                }
+            }
+            Shape::Clock {
+                hour,
+                minute,
+                axis,
+                angles,
+                speeds,
+                since,
+                ..
             } => {
                 for (is_hour, blocks, angle, rate) in [
                     (true, hour, angles.0, speeds.0),
@@ -1385,6 +1697,72 @@ fn submit(
 /// (`ElevatorTargetFloorPacket`).
 pub const CONTROLS_CHANNEL: &str = "create:contraption_controls";
 
+/// The channel the server tells a client on of the contraption controls on the carts, what
+/// rides them on bearings, and the train carriages near its player, and where those structures
+/// stand (`actors::PosedControls`): every tick while there are any, once more with none when
+/// they are gone. Their blocks are block displays the server moves, so the client finds them
+/// with its ray from this (`ContraptionHandlerClient.rayTraceContraption`).
+pub const POSED_CHANNEL: &str = "create:posed_controls";
+
+/// How near a player (to any of them) a structure's contraption controls are sent to its
+/// client: well past the reach of a click.
+const POSED_RANGE: f64 = 16.0;
+
+thread_local! {
+    /// Server: the players whose clients were last sent some posed controls.
+    static POSED_SENT: RefCell<std::collections::HashSet<u128>> =
+        RefCell::new(std::collections::HashSet::new());
+    /// Client: the posed controls the server last sent.
+    static POSED: RefCell<Vec<create_engine::actors::PosedControls>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// Sends each player of `lv` the contraption controls on the carts and carriages near them.
+fn send_posed_controls(lv: &mut ServerLevel<'_>) {
+    use create_engine::actors::PosedControls;
+    let players = lv.players();
+    if players.is_empty() {
+        return;
+    }
+    let all = crate::glue::trains::posed_controls(lv);
+    if all.is_empty() && POSED_SENT.with_borrow(std::collections::HashSet::is_empty) {
+        return;
+    }
+    for p in players {
+        let Some(at) = p.entity().position(&*lv.host) else {
+            continue;
+        };
+        let near: Vec<PosedControls> = all
+            .iter()
+            .filter(|c| {
+                c.controls.iter().any(|o| {
+                    let w = c.pose.to_world(o.map(|v| f64::from(v) + 0.5));
+                    (0..3).map(|i| (w[i] - at[i]).powi(2)).sum::<f64>() <= POSED_RANGE.powi(2)
+                })
+            })
+            .cloned()
+            .collect();
+        let uuid = p.uuid();
+        let was = POSED_SENT.with_borrow(|s| s.contains(&uuid));
+        if near.is_empty() && !was {
+            continue;
+        }
+        super::super::net::send_to_player(
+            lv.host,
+            p,
+            POSED_CHANNEL,
+            &PosedControls::encode_all(&near),
+        );
+        POSED_SENT.with_borrow_mut(|s| {
+            if near.is_empty() {
+                s.remove(&uuid);
+            } else {
+                s.insert(uuid);
+            }
+        });
+    }
+}
+
 /// Reads a click sent on [`CONTROLS_CHANNEL`].
 pub fn decode_click(data: &[u8]) -> Option<([i32; 3], [i32; 3], Option<i32>)> {
     let v: Vec<i32> = data
@@ -1402,29 +1780,15 @@ pub fn decode_click(data: &[u8]) -> Option<([i32; 3], [i32; 3], Option<i32>)> {
 
 /// Where a ray from `eye` to `target` enters the unit box at `min`, as a fraction of the ray.
 fn ray_box(eye: [f64; 3], target: [f64; 3], min: [f64; 3]) -> Option<f64> {
-    let (mut lo, mut hi) = (0.0f64, 1.0f64);
-    for i in 0..3 {
-        let d = target[i] - eye[i];
-        let (a, b) = (min[i], min[i] + 1.0);
-        if d.abs() < 1e-9 {
-            if eye[i] < a || eye[i] > b {
-                return None;
-            }
-            continue;
-        }
-        let (t0, t1) = ((a - eye[i]) / d, (b - eye[i]) / d);
-        lo = lo.max(t0.min(t1));
-        hi = hi.min(t0.max(t1));
-        if lo > hi {
-            return None;
-        }
-    }
-    Some(lo)
+    create_engine::actors::ray_unit_box(eye, target, min)
 }
 
 /// A contraption controls block a client's ray meets on a structure it draws.
 struct Picked {
+    /// The key of the structure it is on, as the server names it.
     anchor: [i32; 3],
+    /// The anchor whose drawing shows it (its button pressed there).
+    drawn: [i32; 3],
     local: [i32; 3],
     /// Where the ray meets it, from the block's corner in the structure's own frame.
     hit: [f64; 3],
@@ -1432,12 +1796,12 @@ struct Picked {
 
 /// `ContraptionHandlerClient.getRayInputs` and `rayTraceContraption` for contraption controls:
 /// the nearest contraption controls block on a structure this client draws (gliding, turning
-/// or an elevator) that the player's ray (as far as they reach, or to the block the crosshair is
-/// on) meets, its ray turned back into the structure's own frame. None while the crosshair is on
-/// an entity.
+/// or an elevator), or on a cart or train carriage the server told it of ([`POSED_CHANNEL`]),
+/// that the player's ray (as far as they reach, or to what the crosshair is on) meets, its ray
+/// turned back into the structure's own frame.
 fn pick_controls(host: &dyn ClientHost) -> Option<Picked> {
     use mod_api::CrosshairTarget;
-    if SHOWN.with_borrow(HashMap::is_empty) {
+    if SHOWN.with_borrow(HashMap::is_empty) && POSED.with_borrow(Vec::is_empty) {
         return None;
     }
     let (player, camera) = (host.local_player()?, host.camera()?);
@@ -1456,49 +1820,132 @@ fn pick_controls(host: &dyn ClientHost) -> Option<Picked> {
     } else {
         4.5
     };
-    match host.crosshair_target() {
-        Some(CrosshairTarget::Block { hit, .. }) => {
-            let d: f64 = (0..3).map(|i| (hit.point[i] - eye[i]).powi(2)).sum();
-            reach = d.sqrt().min(reach);
-        }
-        Some(CrosshairTarget::Entity { .. }) => return None,
-        _ => {}
+    let point = match host.crosshair_target() {
+        Some(CrosshairTarget::Block { hit, .. }) => Some(hit.point),
+        Some(CrosshairTarget::Entity { point, .. }) => Some(point),
+        _ => None,
+    };
+    if let Some(point) = point {
+        let d: f64 = (0..3).map(|i| (point[i] - eye[i]).powi(2)).sum();
+        reach = d.sqrt().min(reach);
     }
     let target: [f64; 3] = std::array::from_fn(|i| eye[i] + look[i] * reach);
-    SHOWN.with_borrow(|s| {
+    // A cart's or carriage's, where the server last said it stands.
+    let posed = POSED.with_borrow(|all| {
         let mut best: Option<(f64, Picked)> = None;
+        for p in all {
+            if let Some((t, local, hit)) = p.pick(eye, target)
+                && best.as_ref().is_none_or(|b| t < b.0)
+            {
+                let anchor = p.key;
+                let drawn = anchor;
+                best = Some((
+                    t,
+                    Picked {
+                        anchor,
+                        drawn,
+                        local,
+                        hit,
+                    },
+                ));
+            }
+        }
+        best
+    });
+    // The game time, for where a clock's hands have turned to.
+    let now = host
+        .level(host.dimension())
+        .and_then(|l| l.game_time(host))
+        .map_or(0.0, |t| t as f64);
+    SHOWN.with_borrow(|s| {
+        let mut best: Option<(f64, Picked)> = posed;
         for (anchor, shown) in s {
-            // Offset 0 of the structure in the world, and the ray in its own frame.
-            let (blocks, at, ray) = match (&shown.shape, shown.drawn_at, shown.turned) {
+            // Each structure's key, offset 0 of it in the world, and the ray in its own frame; a
+            // stabilized structure riding a turning one (where it hangs, upright) by its key, a
+            // clock's minute hand by its own.
+            let mut parts: Vec<([i32; 3], &Vec<Drawn>, [f64; 3], ([f64; 3], [f64; 3]))> =
+                Vec::new();
+            match (&shown.shape, shown.drawn_at, shown.turned) {
                 (Shape::Glide { blocks, .. } | Shape::Elevator { blocks, .. }, Some(at), _) => {
-                    (blocks, at, (eye, target))
+                    parts.push((*anchor, blocks, at, (eye, target)));
                 }
-                (Shape::Turn { blocks, .. }, _, Some((axis, angle))) => {
+                (Shape::Turn { blocks, subs, .. }, _, Some((axis, angle))) => {
                     let c = anchor.map(|v| f64::from(v) + 0.5);
                     let back = |p: [f64; 3]| {
                         let r = [0, 1, 2].map(|i| p[i] - c[i]);
                         let t = create_engine::actors::turn_vec(r, axis, -f64::from(angle));
                         [0, 1, 2].map(|i| t[i] + c[i])
                     };
-                    (blocks, anchor.map(f64::from), (back(eye), back(target)))
+                    parts.push((*anchor, blocks, anchor.map(f64::from), (back(eye), back(target))));
+                    for (i, sub) in subs.iter().enumerate() {
+                        let front = add_i(sub.bearing, sub.facing.offset()).map(f64::from);
+                        let r = create_engine::actors::turn_vec(front, axis, f64::from(angle));
+                        let at = [0, 1, 2].map(|k| f64::from(anchor[k]) + r[k] - front[k]);
+                        let key = create_engine::contraption::sub_key(*anchor, i);
+                        parts.push((key, &sub.blocks, at, (eye, target)));
+                    }
+                }
+                // A clock's hands where they have turned to, and what hangs from them, each a
+                // structure with its own controls.
+                (
+                    Shape::Clock {
+                        hour,
+                        minute,
+                        axis,
+                        angles,
+                        speeds,
+                        since,
+                        subs,
+                    },
+                    _,
+                    _,
+                ) => {
+                    let c = anchor.map(|v| f64::from(v) + 0.5);
+                    let ax = axis_enum(*axis);
+                    let keys = [*anchor, create_engine::clock::minute_key(*anchor)];
+                    for (hand, blocks, angle, rate) in [
+                        (0, hour, angles.0, speeds.0),
+                        (1, minute, angles.1, speeds.1),
+                    ] {
+                        let here = f64::from(angle) + f64::from(rate) * (now - since);
+                        let back = |p: [f64; 3]| {
+                            let r = [0, 1, 2].map(|i| p[i] - c[i]);
+                            let t = create_engine::actors::turn_vec(r, ax, -here);
+                            [0, 1, 2].map(|i| t[i] + c[i])
+                        };
+                        let ray = (back(eye), back(target));
+                        parts.push((keys[usize::from(hand)], blocks, anchor.map(f64::from), ray));
+                        for (i, sub) in subs.iter().enumerate().filter(|(_, s)| s.hand == hand) {
+                            let front = add_i(sub.bearing, sub.facing.offset()).map(f64::from);
+                            let r = create_engine::actors::turn_vec(front, ax, here);
+                            let at = [0, 1, 2].map(|k| f64::from(anchor[k]) + r[k] - front[k]);
+                            let key = create_engine::contraption::sub_key(*anchor, i);
+                            parts.push((key, &sub.blocks, at, (eye, target)));
+                        }
+                    }
                 }
                 _ => continue,
-            };
-            for b in blocks.iter().filter(|b| is_controls(b)) {
-                let min = [0, 1, 2].map(|i| at[i] + f64::from(b.at[i]));
-                if let Some(t) = ray_box(ray.0, ray.1, min)
-                    && best.as_ref().is_none_or(|x| t < x.0)
-                {
-                    let hit = [0, 1, 2].map(|i| ray.0[i] + (ray.1[i] - ray.0[i]) * t - min[i]);
-                    let local = b.at.map(|v| v.round() as i32);
-                    best = Some((
-                        t,
-                        Picked {
-                            anchor: *anchor,
-                            local,
-                            hit,
-                        },
-                    ));
+            }
+            let drawn = *anchor;
+            for (anchor, blocks, at, ray) in parts {
+                for b in blocks.iter().filter(|b| is_controls(b)) {
+                    let min = [0, 1, 2].map(|i| at[i] + f64::from(b.at[i]));
+                    if let Some(t) = ray_box(ray.0, ray.1, min)
+                        && best.as_ref().is_none_or(|x| t < x.0)
+                    {
+                        let hit =
+                            [0, 1, 2].map(|i| ray.0[i] + (ray.1[i] - ray.0[i]) * t - min[i]);
+                        let local = b.at.map(|v| v.round() as i32);
+                        best = Some((
+                            t,
+                            Picked {
+                                anchor,
+                                drawn,
+                                local,
+                                hit,
+                            },
+                        ));
+                    }
                 }
             }
         }
@@ -1546,8 +1993,8 @@ pub fn use_key(
         return Flow::Continue;
     };
     let mut ints: Vec<i32> = p.anchor.iter().chain(&p.local).copied().collect();
-    let elevator = elevator_of(p.anchor, |view, _| {
-        actor_draw::with_controls(p.anchor, p.local, |a| {
+    let elevator = elevator_of(p.drawn, |view, _| {
+        actor_draw::with_controls(p.drawn, p.local, |a| {
             let sel = view.select(&mut a.index);
             (sel.target_y != view.target).then(|| {
                 a.press();
@@ -1558,7 +2005,7 @@ pub fn use_key(
     match elevator {
         Some(Some(y)) => ints.push(y),
         Some(None) => {}
-        None => actor_draw::with_controls(p.anchor, p.local, |a| a.press()),
+        None => actor_draw::with_controls(p.drawn, p.local, |a| a.press()),
     }
     let data: Vec<u8> = ints.iter().flat_map(|v| v.to_le_bytes()).collect();
     super::super::net::send_to_server(host, CONTROLS_CHANNEL, &data);

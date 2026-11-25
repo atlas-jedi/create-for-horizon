@@ -33,9 +33,10 @@ pub fn clear() {
 
 /// Turning drills and sideways saws (`BlockBreakingKineticBlockEntity.tick`): the block in front
 /// breaks in steps (`isBreakable`: not air, a fluid, unbreakable or `create:non_breakable`; for a
-/// saw also `isSawable`), its cracks showing (`destroyBlockProgress`), its drops left in its
-/// middle; a saw fells what stood on it (`TreeCutter`). A breaker that broke one looks again at
-/// its next lazy tick (every 10 ticks).
+/// saw also `isSawable`), its cracks showing (`destroyBlockProgress`) and each step tapping with
+/// the block's hit sound, its drops left still near its middle; a saw fells what stood on it
+/// (`TreeCutter`). A drill that has nothing to break looks again at its next lazy tick (every 10
+/// ticks) or when a neighbour changes (`neighbor_changed`); a sideways saw every other tick.
 pub fn tick_drills(lv: &mut ServerLevel<'_>) {
     let dim = lv.dim;
     let drills = with_world(|w| w.dims[dim].drilling.clone()).unwrap_or_default();
@@ -71,7 +72,8 @@ pub fn tick_drills(lv: &mut ServerLevel<'_>) {
         let speed = lv.speed(pos);
         let Some(step) = with_world(|w| {
             let d = w.dims[dim].drills.get_mut(&pos)?;
-            if lazy {
+            // `SawBlockEntity.tick`: `destroyNextTick` whenever it waits.
+            if lazy || saw {
                 d.lazy();
             }
             Some(d.tick(speed, hardness))
@@ -79,6 +81,22 @@ pub fn tick_drills(lv: &mut ServerLevel<'_>) {
         .flatten() else {
             continue;
         };
+        // `playSound(null, worldPosition, getHitSound(), BLOCKS, .25, 1)` on every step, the
+        // breaking one too.
+        if matches!(step, drill::Step::Progress(_) | drill::Step::Broken)
+            && let Some(sound) = lv
+                .block_state(at)
+                .and_then(|s| lv.host.block_states().sound(s))
+        {
+            lv.level.play_sound(
+                &mut *lv.host,
+                &sound.hit,
+                pos.map(|v| f64::from(v) + 0.5),
+                mod_api::SoundSource::Blocks,
+                0.25,
+                1.0,
+            );
+        }
         let breaker = breaker_id(pos);
         match step {
             drill::Step::Wait => {}
@@ -92,10 +110,20 @@ pub fn tick_drills(lv: &mut ServerLevel<'_>) {
             drill::Step::Broken => {
                 lv.level.set_break_progress(&mut *lv.host, breaker, at, -1);
                 let broken = cell(lv, at);
-                // `onBlockBroken`: the drops left at the block's middle, standing still.
-                let centre = at.map(|v| f64::from(v) + 0.5);
+                // `onBlockBroken`: the drops left still at one spot up to 1/8 off the block's
+                // middle (`offsetRandomly`), picked up after the default 10 ticks.
+                let mut spot = || f64::from((lv.random_float() - 0.5) * 2.0 * 0.125);
+                let drop_at: [f64; 3] = std::array::from_fn(|i| f64::from(at[i]) + 0.5 + spot());
                 for s in destroy_collect(lv, at) {
-                    lv.spawn_stack(centre, s, [0.0; 3]);
+                    let _ = lv.level.spawn_item_with_motion(
+                        &mut *lv.host,
+                        drop_at[0],
+                        drop_at[1],
+                        drop_at[2],
+                        s,
+                        [0.0; 3],
+                        10,
+                    );
                 }
                 if saw {
                     fell(lv, pos, at, broken);
@@ -103,6 +131,16 @@ pub fn tick_drills(lv: &mut ServerLevel<'_>) {
             }
         }
     }
+}
+
+/// `DrillBlock.neighborChanged`: the drill at `pos` looks at the block in front again on the
+/// tick after next (`destroyNextTick`), whatever it was waiting for.
+pub(super) fn neighbor_changed(dim: usize, pos: [i32; 3]) {
+    with_world(|w| {
+        if let Some(d) = w.dims[dim].drills.get_mut(&pos) {
+            d.destroy_next_tick();
+        }
+    });
 }
 
 /// A machine's stable negative breaker id for its cracks (`NEXT_BREAKER_ID` in Create).
@@ -216,11 +254,25 @@ pub fn saw_take(lv: &mut ServerLevel<'_>, pos: [i32; 3], stack: &mut Option<Item
     let Some(s) = stack.as_ref() else {
         return;
     };
-    let item = stacks::id(&*lv.host, s);
-    let progress = stacks::sequenced_progress(s);
+    let (item, progress) = saw_item(&*lv.host, s);
     if saw_put(lv, pos, &item, progress) {
         *stack = stack.take().and_then(|s| s.shrink(1));
     }
+}
+
+/// How the saw keeps a stack, as belts name it (`belt_name`): a sequenced assembly's item by its
+/// id with its progress aside, any other by its id with its components when it has some (a
+/// package's contents among them).
+fn saw_item(
+    host: &dyn mod_api::Host,
+    stack: &ItemStack,
+) -> (String, Option<create_engine::sequenced::Progress>) {
+    crate::glue::logistics::belt_name(host, stack)
+}
+
+/// `count` of the stack the saw names `item` (`saw_item`), its components back.
+fn saw_stack(host: &dyn mod_api::Host, item: &str, count: u32) -> Option<ItemStack> {
+    crate::glue::logistics::items::stack_of(host, item, count)
 }
 
 /// One `item` (a sequenced assembly's `progress` with it) into the saw at `pos` while it holds
@@ -306,7 +358,7 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for SawItems {
         index: usize,
     ) -> Option<mod_api::ItemResource> {
         let (item, n) = self.slot(index)?;
-        stacks::stack(&*host, &item, u32::from(n)).map(|s| mod_api::ItemResource::of(&s))
+        saw_stack(&*host, &item, u32::from(n)).map(|s| mod_api::ItemResource::of(&s))
     }
     fn amount(&self, _host: &mut dyn mod_api::ServerHost, index: usize) -> u32 {
         self.slot(index).map_or(0, |(_, n)| u32::from(n))
@@ -337,15 +389,10 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for SawItems {
         amount: u32,
     ) -> u32 {
         let stack = resource.as_stack();
-        if index != 0 || amount == 0 || stack.damage() != 0 {
+        if index != 0 || amount == 0 {
             return 0;
         }
-        let progress = stacks::sequenced_progress(stack);
-        // The engine keeps items by id, but for a sequenced assembly's progress.
-        if stack.components().is_some() && progress.is_none() {
-            return 0;
-        }
-        let item = stacks::id(&*host, stack);
+        let (item, progress) = saw_item(&*host, stack);
         let Some(mut lv) = ServerLevel::new(host, &self.dimension) else {
             return 0;
         };
@@ -371,7 +418,7 @@ pub fn tick_saws(lv: &mut ServerLevel<'_>) {
     // `destroy`: a broken saw's items scatter where it was (`ItemHelper.dropContents`).
     let drops = with_world(|w| std::mem::take(&mut w.dims[dim].saw_drops)).unwrap_or_default();
     for (pos, item, n) in drops {
-        if let Some(stack) = stacks::stack(&*lv.host, &item, u32::from(n)) {
+        if let Some(stack) = saw_stack(&*lv.host, &item, u32::from(n)) {
             let _ = lv.level.pop_resource(&mut *lv.host, pos, stack);
         }
     }
@@ -401,21 +448,49 @@ fn tick_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Step> {
         let speed = lv.speed(pos);
         let mut saw = with_world(|w| w.dims[dim].saws.get(&pos).cloned()).flatten()?;
         let item = saw.slots.first().map(|s| s.0.clone()).unwrap_or_default();
+        // `remainingTime` after this tick's cut, while the input still lies in slot 0: a crumb
+        // of it flies off the blade (`spawnParticles`).
+        let cutting = (speed != 0.0 && !saw.applied && saw.remaining != -1.0)
+            .then(|| saw.remaining - (speed.abs() / 24.0).clamp(1.0, 128.0))
+            .filter(|r| *r > 0.0);
         let step = saw.tick(speed);
+        if let Some(remaining) = cutting.filter(|_| matches!(step, Step::Wait | Step::Apply)) {
+            let duration = SAW_DURATION.with_borrow(|m| m.get(&(dim, pos)).copied().unwrap_or(0.0));
+            cutting_particle(lv, pos, &item, remaining, duration, along_first, speed);
+        }
         match step {
             Step::Wait => {}
             Step::Start => {
                 let list = cuts(lv, pos, &saw, &item);
                 saw.start(&list.iter().collect::<Vec<_>>());
             }
+            // `applyRecipe`: a package is opened, ahead of any recipe (and earns nothing).
+            Step::Apply if create_engine::package::is_package(create_engine::arm::item_id(&item)) => {
+                let host = &*lv.host;
+                let contents: Vec<(String, u8)> = saw_stack(host, &item, 1)
+                    .map(|p| crate::glue::packages::body::contents(host, &p))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .flatten()
+                    .map(|s| {
+                        let n = s.count().min(255) as u8;
+                        (crate::glue::logistics::items::key_of(host, &s), n)
+                    })
+                    .collect();
+                let max = |i: &str| stacks::limit(host, create_engine::arm::item_id(i));
+                saw.unpack(&contents, max);
+                cut_effects(lv, pos, &item);
+            }
             Step::Apply => {
                 let mut rng = Rng::new(lv.seed_at(pos));
                 let filter = super::filtering::filter_at(dim, pos);
                 let host = &*lv.host;
+                // Recipes take the item, whatever its components (`Ingredient.test`).
+                let id = create_engine::arm::item_id(&item);
                 let applied = recipes::with(|r| {
                     if let Some((a, _)) = sequenced::step_for(
                         &r.sequenced,
-                        &item,
+                        id,
                         saw.progress.as_ref(),
                         "create:cutting",
                     ) {
@@ -424,14 +499,18 @@ fn tick_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Step> {
                     }
                     let list: Vec<&Recipe> = r
                         .cutting
-                        .matching(&item)
+                        .matching(id)
                         .into_iter()
                         .map(|i| r.cutting.get(i))
                         .filter(|x| passes(host, filter.as_ref(), x))
                         .collect();
+                    // `applyRecipe`: an index past the list (the filter changed) starts over.
+                    if saw.index >= list.len() {
+                        saw.index = 0;
+                    }
                     let recipe = list.get(saw.index).copied();
                     // The input's crafting remainder comes out with each roll.
-                    let left = stacks::remainder(host, &item);
+                    let left = stacks::remainder(host, id);
                     saw.apply(
                         recipe,
                         |i: &str| stacks::limit(host, i),
@@ -443,6 +522,8 @@ fn tick_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Step> {
                 if applied == Some(true) {
                     crate::glue::advancements::award_placer(lv, pos, "saw_processing");
                 }
+                // `playEvent`: the cut's sound and burst of the input, recipe or not.
+                cut_effects(lv, pos, &item);
             }
             Step::Out => {
                 let m = saw::movement(along_first, speed);
@@ -453,7 +534,7 @@ fn tick_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Step> {
                 if let Some(moving) = moving {
                     for i in 0..saw.slots.len() {
                         let (item, count) = saw.slots[i].clone();
-                        let Some(stack) = stacks::stack(&*lv.host, &item, u32::from(count)) else {
+                        let Some(stack) = saw_stack(&*lv.host, &item, u32::from(count)) else {
                             continue;
                         };
                         let Some(left) =
@@ -500,7 +581,7 @@ fn tick_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Step> {
                         .map(|t| t.0);
                     let mut left = Vec::new();
                     for (item, count) in std::mem::take(&mut saw.slots) {
-                        let up = upright(&*lv.host, &item);
+                        let up = upright(&*lv.host, create_engine::arm::item_id(&item));
                         let mut one = belt::Item::new(&item, count, random_angle(lv, pos), up);
                         if transitional.as_deref() == Some(item.as_str()) {
                             one.progress = progress.clone();
@@ -533,7 +614,7 @@ fn tick_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Step> {
                 let v = [f64::from(m[0]) * 0.0625, 0.125, f64::from(m[2]) * 0.0625];
                 let transitional = saw.progress.as_ref().and_then(super::transitional_of);
                 for (item, count) in &saw.slots {
-                    let Some(mut stack) = stacks::stack(&*lv.host, item, u32::from(*count)) else {
+                    let Some(mut stack) = saw_stack(&*lv.host, item, u32::from(*count)) else {
                         continue;
                     };
                     // A transitional item keeps its progress.
@@ -565,12 +646,153 @@ fn tick_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Step> {
     }
 }
 
+/// The particle of `item` the saw throws (`spawnParticles`, `spawnEventParticles`): a block
+/// item's block, else the item; and how fast it flies (1 for a block, 1/8 for an item).
+fn saw_particle(
+    lv: &ServerLevel<'_>,
+    item: &str,
+) -> Option<(mod_api::ParticleOptions, Option<mod_api::BlockState>, f64)> {
+    let key = stacks::key(&*lv.host, create_engine::arm::item_id(item))?;
+    if let Some(state) = lv
+        .host
+        .item_block(key)
+        .and_then(|b| lv.host.block_state_default(b))
+    {
+        let block = super::air::KEYS.get()?.block;
+        return Some((mod_api::ParticleOptions::simple(block), Some(state), 1.0));
+    }
+    let particle = *super::deployer::ITEM_PARTICLE.get()?;
+    let stack = saw_stack(&*lv.host, item, 1)?;
+    Some((
+        mod_api::ParticleOptions::item_stack(particle, stack),
+        None,
+        0.125,
+    ))
+}
+
+/// `SawBlockEntity.spawnParticles` (Create's client, sent from here): one crumb of the input
+/// `item` a tick while it is cut, from where it lies on the blade (`remaining` of `duration`
+/// along the way it moves), flying against that way and up.
+fn cutting_particle(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    item: &str,
+    remaining: f32,
+    duration: f32,
+    along_first: bool,
+    speed: f32,
+) {
+    let Some((options, state, fly)) = saw_particle(lv, item) else {
+        return;
+    };
+    let m = saw::movement(along_first, speed).map(f64::from);
+    let offset = if duration != 0.0 {
+        f64::from(remaining / duration) / 2.0
+    } else {
+        0.0
+    };
+    let at = [
+        f64::from(pos[0]) + 0.5 - m[0] * offset,
+        f64::from(pos[1]) + 0.5 + 0.45,
+        f64::from(pos[2]) + 0.5 - m[2] * offset,
+    ];
+    let up = f64::from(lv.random_float());
+    let v = [-m[0] * fly, up * fly, -m[2] * fly];
+    let _ = lv
+        .level
+        .send_particles(&mut *lv.host, &options, state, at, v, 1.0, 0);
+}
+
+/// The cut (`tickAudio` with `playEvent`, on Create's client): `SAW_ACTIVATE_WOOD` for a block
+/// item with the wood sound type (Create's compound of the boat paddle landing at .75 and 1.5),
+/// else `SAW_ACTIVATE_STONE` (the stonecutter's take at .125 and 1.25), both at volume 3; and
+/// ten crumbs of the input bursting up from the blade (`spawnEventParticles`).
+fn cut_effects(lv: &mut ServerLevel<'_>, pos: [i32; 3], item: &str) {
+    let block_state = stacks::key(&*lv.host, create_engine::arm::item_id(item))
+        .and_then(|k| lv.host.item_block(k))
+        .and_then(|b| lv.host.block_state_default(b));
+    let wood = block_state
+        .and_then(|s| lv.host.block_states().sound(s))
+        .is_some_and(|s| &*s.break_sound == "minecraft:block.wood.break");
+    let (sound, volume, pitch) = if wood {
+        ("minecraft:entity.boat.paddle_land", 0.75, 1.5)
+    } else {
+        ("minecraft:ui.stonecutter.take_result", 0.125, 1.25)
+    };
+    lv.level.play_sound(
+        &mut *lv.host,
+        sound,
+        pos.map(|v| f64::from(v) + 0.5),
+        mod_api::SoundSource::Blocks,
+        volume * 3.0,
+        pitch,
+    );
+    let Some((options, state, _)) = saw_particle(lv, item) else {
+        return;
+    };
+    let at = [
+        f64::from(pos[0]) + 0.5,
+        f64::from(pos[1]) + 0.5 + 5.0 / 16.0,
+        f64::from(pos[2]) + 0.5,
+    ];
+    for _ in 0..10 {
+        // `offsetRandomly(new Vec3(0, .25, 0), r, .125)`, sent as `(m.x, m.y, m.y)`.
+        let mut r = || f64::from((lv.random_float() - 0.5) * 2.0 * 0.125);
+        let m = [r(), 0.25 + r(), r()];
+        let v = [m[0], m[1], m[1]];
+        let _ = lv
+            .level
+            .send_particles(&mut *lv.host, &options, state, at, v, 1.0, 0);
+    }
+}
+
+/// `SawBlock.useItemOn` with an empty hand on a saw facing up: what it holds goes to the
+/// player (`placeItemBackInInventory`) and it is emptied. True when the click was the saw's.
+pub fn use_saw(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    player: mod_api::PlayerRef,
+    stack: Option<&ItemStack>,
+) -> bool {
+    if stack.is_some() || lv.info(pos).and_then(|(_, i)| i.facing) != Some(Dir::Up) {
+        return false;
+    }
+    let dim = lv.dim;
+    let Some(saw) = with_world(|w| w.dims[dim].saws.remove(&pos)).flatten() else {
+        return true;
+    };
+    SAW_INDEX.with_borrow_mut(|m| m.insert((dim, pos), saw.index));
+    // The stack in assembly keeps its progress: the input before its cut, the transitional
+    // item after.
+    let transitional = saw.progress.as_ref().and_then(super::transitional_of);
+    for (i, (item, count)) in saw.slots.iter().enumerate() {
+        let Some(mut s) = saw_stack(&*lv.host, item, u32::from(*count)) else {
+            continue;
+        };
+        let carries = match &transitional {
+            Some((t, _, _)) if saw.applied => t == item,
+            _ => i == 0 && !saw.applied,
+        };
+        if let Some(p) = saw.progress.as_ref().filter(|_| carries) {
+            let fraction = transitional.as_ref().map_or(0.0, |t| t.2);
+            stacks::set_sequenced_progress(&mut s, &p.id, p.step, fraction);
+        }
+        lv.give(player, s);
+    }
+    with_world(|w| w.mark_unsaved(dim, pos));
+    show_saw(lv, pos);
+    true
+}
+
 /// `getRecipes` for `item` in the saw at `pos`: a sequenced assembly's cutting step alone, when
 /// the item is at one, for its processing time; else its cutting recipes whose first result
-/// passes the saw's filter (`outputMatchesFilter`).
+/// passes the saw's filter (`outputMatchesFilter`). None for a package, whose start is then
+/// the 10 ticks of an item no recipe takes.
 fn cuts(lv: &ServerLevel<'_>, pos: [i32; 3], saw: &saw::Saw, item: &str) -> Vec<Recipe> {
     let filter = super::filtering::filter_at(lv.dim, pos);
     let host = &*lv.host;
+    // Recipes take the item, whatever its components (`Ingredient.test`).
+    let item = create_engine::arm::item_id(item);
     recipes::with(|r| {
         if let Some((_, step)) =
             sequenced::step_for(&r.sequenced, item, saw.progress.as_ref(), "create:cutting")
@@ -615,12 +837,14 @@ fn show_saw(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
         } else {
             SAW_DURATION.with_borrow(|m| m.get(&(dim, pos)).copied().unwrap_or(0.0))
         };
+        // A stack with components goes whole (drawn with them), a package's long name as its id.
         let items = s
             .slots
             .iter()
             .map(|(id, n)| {
+                let shown = create_engine::arm::shown_name(id);
                 Tag::Compound(Compound::from([
-                    ("id".into(), Tag::String(id.as_str().into())),
+                    ("id".into(), Tag::String(shown.into())),
                     ("count".into(), Tag::Int(i32::from(*n))),
                 ]))
             })

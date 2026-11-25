@@ -250,20 +250,37 @@ pub fn cart_motion(
 pub type Blocks = Vec<([i32; 3], u32)>;
 
 /// `MountedContraption.assemble` from the assembler at `pos`: the structure above it (as any
-/// contraption gathers it) and the assembler itself as a minecart anchor at offset 0. None when
-/// nothing is above it (`blocks.size() == 1`).
+/// contraption gathers it, from the block above even a brittle one: `addToInitialFrontier`) and
+/// the assembler itself as a minecart anchor at offset 0. None when nothing is above it
+/// (`blocks.size() == 1`). Every mechanical bearing on it carries what it faces stabilized
+/// (`MountedContraption.canBeStabilized`): those bearings, by world position and facing.
 pub fn gather(
     pos: [i32; 3],
     anchor_state: u32,
     at: impl Fn([i32; 3]) -> Option<crate::contraption::Found>,
-) -> Result<Option<Blocks>, crate::contraption::Refused> {
+) -> Result<Option<(Blocks, Vec<([i32; 3], crate::kinetics::Dir)>)>, crate::contraption::Refused> {
     let above = [pos[0], pos[1] + 1, pos[2]];
-    let (mut blocks, _) = crate::contraption::gather_from(above, pos, |p| p == pos, at)?;
+    let found =
+        crate::contraption::gather_frontier_stabilizing(&[above], pos, |p| p == pos, at)?;
+    let mut blocks = found.blocks;
     if blocks.is_empty() {
         return Ok(None);
     }
     blocks.push(([0, 0, 0], anchor_state));
-    Ok(Some(blocks))
+    Ok(Some((blocks, found.subs)))
+}
+
+/// `OrientedContraptionEntity.updateOrientation` for a `StabilizedContraption` riding a cart's
+/// structure turned `cart_angle` about up (`-yaw + initialYaw`): the turn about up its blocks
+/// are drawn and put back at. Hanging on a vertical bearing it never turns (its yaw stays at
+/// its initial yaw); on a horizontal one it follows the cart's yaw
+/// (`initialYaw - parent.initialYaw - parent.getViewYRot`), never its pitch.
+pub fn stabilized_angle(facing: crate::kinetics::Dir, cart_angle: f32) -> f32 {
+    if facing.axis() == crate::kinetics::Axis::Y {
+        0.0
+    } else {
+        cart_angle
+    }
 }
 
 #[cfg(test)]
@@ -390,8 +407,43 @@ mod tests {
                 ..Default::default()
             })
         };
-        let got = gather([0, 0, 0], 99, at).unwrap().unwrap();
+        let (got, subs) = gather([0, 0, 0], 99, at).unwrap().unwrap();
         assert_eq!(got, vec![([0, 1, 0], 5), ([0, 2, 0], 5), ([0, 0, 0], 99)]);
+        assert!(subs.is_empty());
         assert_eq!(gather([0, 0, 0], 99, |_| None), Ok(None));
+    }
+
+    #[test]
+    fn a_bearing_on_a_cart_keeps_what_it_faces_apart_and_at_its_own_yaw() {
+        use crate::kinetics::Dir;
+        // A mechanical bearing facing up on the block above the assembler, a stone on it, and
+        // one facing east beside that stone (glued): every one of them is stabilized, whatever
+        // its axis, and what each faces stays out.
+        let at = |p: [i32; 3]| match p {
+            [0, 1, 0] => Some(Found {
+                state: 2,
+                movable: true,
+                bearing: Some(Dir::Up),
+                glued: Dir::East.bit(),
+                ..Default::default()
+            }),
+            [1, 1, 0] => Some(Found {
+                state: 2,
+                movable: true,
+                bearing: Some(Dir::East),
+                ..Default::default()
+            }),
+            [0, 2, 0] | [2, 1, 0] => Some(Found {
+                state: 5,
+                movable: true,
+                ..Default::default()
+            }),
+            _ => None,
+        };
+        let (blocks, subs) = gather([0, 0, 0], 99, at).unwrap().unwrap();
+        assert_eq!(blocks.len(), 3);
+        assert_eq!(subs, vec![([0, 1, 0], Dir::Up), ([1, 1, 0], Dir::East)]);
+        assert_eq!(stabilized_angle(Dir::Up, 135.0), 0.0);
+        assert_eq!(stabilized_angle(Dir::East, 135.0), 135.0);
     }
 }

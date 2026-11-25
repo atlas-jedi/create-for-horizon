@@ -507,6 +507,14 @@ impl Hooks for Create {
         until_cancel(|s| s.interaction_key(host, event))
     }
 
+    fn block_highlight(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::BlockHighlightEvent,
+    ) -> Flow {
+        until_cancel(|s| s.block_highlight(host, event))
+    }
+
     fn movement_input(&self, host: &dyn ClientHost, event: &mut mod_api::MovementInputEvent) {
         for s in SUBSYSTEMS {
             s.movement_input_update(host, event);

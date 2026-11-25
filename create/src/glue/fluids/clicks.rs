@@ -92,7 +92,7 @@ impl BlockPart for Clicks {
             return Flow::Continue;
         };
         if info_at(&lv, event.block_pos).map(|(b, _)| b) == Some(Block::ItemDrain) {
-            super::machines::drain_landed(&mut lv, event.block_pos, event.stack);
+            super::machines::drain_landed(&mut lv, event.block_pos, event.entity, event.stack);
         }
         Flow::Continue
     }

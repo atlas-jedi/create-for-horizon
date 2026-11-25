@@ -36,11 +36,16 @@ fn over_handler(lv: &ServerLevel<'_>, at: [i32; 3]) -> bool {
     )
 }
 
-/// The item entities on the ground in the block under the press at `at`
-/// (`new AABB(below)`, `isAlive() && onGround()`), and whether each has a pressing recipe.
-fn grounded_below(lv: &ServerLevel<'_>, at: [i32; 3]) -> Vec<(super::stacks::Dropped, bool)> {
-    let below = [at[0], at[1] - 1, at[2]].map(f64::from);
-    let hi = below.map(|v| v + 1.0);
+/// The item entities on the ground in the block under the press at `at`, shrunk by `shrink` on
+/// every side (`new AABB(below)`, `.deflate(.125f)` when idle and looking), `isAlive() &&
+/// onGround()`, and whether each has a pressing recipe.
+fn grounded_below(
+    lv: &ServerLevel<'_>,
+    at: [i32; 3],
+    shrink: f64,
+) -> Vec<(super::stacks::Dropped, bool)> {
+    let below = [at[0], at[1] - 1, at[2]].map(|v| f64::from(v) + shrink);
+    let hi = below.map(|v| v + 1.0 - 2.0 * shrink);
     lv.items_in(below, hi)
         .into_iter()
         .filter(|d| d.entity.on_ground(&*lv.host) == Some(true))
@@ -85,7 +90,7 @@ fn scan_world(lv: &mut ServerLevel<'_>) {
         if !due || over_handler(lv, at) {
             continue;
         }
-        if grounded_below(lv, at).iter().any(|(_, fits)| *fits) {
+        if grounded_below(lv, at, 0.125).iter().any(|(_, fits)| *fits) {
             with_world(|w| {
                 if let Some(p) = w.dims[dim].presses.get_mut(&at) {
                     p.start(press::Mode::World);
@@ -102,7 +107,7 @@ fn scan_world(lv: &mut ServerLevel<'_>) {
 /// (`RecipeApplier.applyRecipeOn(entity)`), a stack of more gives one item's results as new
 /// items, moving a little, and shrinks by one.
 fn press_in_world(lv: &mut ServerLevel<'_>, at: [i32; 3]) {
-    let Some((d, fits)) = grounded_below(lv, at).into_iter().next() else {
+    let Some((d, fits)) = grounded_below(lv, at, 0.0).into_iter().next() else {
         return;
     };
     SCAN.with_borrow_mut(|s| s.insert((lv.dim, at), 0));
@@ -120,6 +125,14 @@ fn press_in_world(lv: &mut ServerLevel<'_>, at: [i32; 3]) {
         return;
     };
     crate::glue::advancements::pressed(lv, at, results.first().map(|(i, n)| (&**i, *n)));
+    // `Mode.WORLD`'s crumbs: from the middle of the block under it, a quarter down (and a
+    // quarter more in `makePressingParticleEffect`).
+    let crumbs = [
+        f64::from(at[0]) + 0.5,
+        f64::from(at[1] - 1) + 0.25,
+        f64::from(at[2]) + 0.5,
+    ];
+    pressing_crumbs(lv, crumbs, &d.stack, seed);
     if d.stack.count() == 1 {
         let mut out = results.into_iter();
         let first = out
@@ -216,6 +229,17 @@ pub(crate) fn depot_turn(lv: &mut ServerLevel<'_>, depot: [i32; 3]) {
             });
         }
         Step::Process => {
+            // `Mode.BELT`'s crumbs of what is pressed: from half a block over the depot's
+            // middle (a quarter lower in `makePressingParticleEffect`).
+            let crumbs = [
+                f64::from(depot[0]) + 0.5,
+                f64::from(depot[1]) + 1.0,
+                f64::from(depot[2]) + 0.5,
+            ];
+            if fits {
+                let seed = lv.seed_at(depot);
+                pressing_crumbs(lv, crumbs, &stack, seed);
+            }
             held = match &sequenced {
                 Some((a, progress, _)) => {
                     held.fan.clear();
@@ -253,6 +277,25 @@ pub(crate) fn tick_press(lv: &mut ServerLevel<'_>, at: [i32; 3]) {
         }
         _ => {}
     }
+}
+
+/// `PressingBehaviour.makePressingParticleEffect` with the press's `getParticleAmount` (15):
+/// crumbs of `stack` thrown up at 1/8 a tick and out up to 1/8 across, a quarter block under
+/// `at`, on the clients of players near it (Create spawns them on each client when the press's
+/// data arrives with its `ParticleItems`).
+fn pressing_crumbs(lv: &mut ServerLevel<'_>, at: [f64; 3], stack: &mod_api::ItemStack, seed: u64) {
+    let at = [at[0], at[1] - 0.25, at[2]];
+    super::ambient::send_crumbs(
+        lv,
+        stack,
+        at,
+        15,
+        |rng| {
+            let o = super::ambient::offset_with(rng, 0.125);
+            [o[0], 0.125, o[2]]
+        },
+        seed,
+    );
 }
 
 /// `PressingBehaviour.tick` at the head's lowest point: `AllSoundEvents`
@@ -445,9 +488,25 @@ pub fn press_on_belt(
                 .collect()
         }
     };
+    // `whenItemHeld`: upright results stand facing the belt's way (180), the rest at random.
     for o in &mut outputs {
         o.locked = true;
-        o.angle = random_angle(lv, at);
+        o.angle = if upright(&*lv.host, &o.item) {
+            180
+        } else {
+            random_angle(lv, at)
+        };
+    }
+    // `Mode.BELT`'s crumbs of what was pressed: from half a block over the segment's middle (a
+    // quarter lower in `makePressingParticleEffect`).
+    if let Some(stack) = stacks::stack(&*lv.host, create_engine::arm::item_id(&item.item), 1) {
+        let crumbs = [
+            f64::from(at[0]) + 0.5,
+            f64::from(at[1]) + 1.0,
+            f64::from(at[2]) + 0.5,
+        ];
+        let seed = lv.seed_at(at);
+        pressing_crumbs(lv, crumbs, &stack, seed);
     }
     crate::glue::advancements::pressed(lv, above, outputs.first().map(|o| (&*o.item, o.count)));
     Some(Process::Convert {

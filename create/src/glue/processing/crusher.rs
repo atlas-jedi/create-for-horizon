@@ -199,6 +199,16 @@ fn tick_crusher(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
             w.mark_unsaved(dim, pos);
         }
     });
+    // What its clients crush (`tickAudio`: an entity drawn in, or an input not yet crushed;
+    // `spawnParticles` of that input), for their crumbs and noise (`ambient`).
+    let shown = if c.entity.is_some() {
+        Some((String::new(), false))
+    } else if !c.applied {
+        c.slots.first().map(|(item, _)| (item.clone(), false))
+    } else {
+        None
+    };
+    super::ambient::show_input(lv, pos, super::ambient::CRUSH_KEY, shown);
 }
 
 /// The controller's inventory taking `count` of `item` from a belt, a saw or another crusher

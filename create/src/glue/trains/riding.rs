@@ -106,7 +106,28 @@ fn seat_pending(lv: &mut ServerLevel<'_>) {
     }
 }
 
-/// The players seated on each train of level `dim` (`countPlayerPassengers`).
+/// The mobs (not players) seated on the trains of level `dim`, each train's seats taken by one
+/// (`CarriageContraptionEntity.checkConductors`' passengers): train, carriage and seat.
+pub fn mob_seats(host: &dyn ServerHost, dim: usize) -> Vec<(u32, u16, [i32; 3])> {
+    SEATED.with_borrow(|s| {
+        s.iter()
+            .filter(|s| s.dim == dim && host.player(s.rider).is_none())
+            .map(|s| (s.at.train, s.at.car, s.at.local))
+            .collect()
+    })
+}
+
+/// The carriages of level `dim` (train, carriage) whose saved riders are not all seated again
+/// yet (`Carriage.serialisedPassengers`).
+pub fn carriages_waiting_for_riders(dim: usize) -> std::collections::HashSet<(u32, u16)> {
+    PENDING.with_borrow(|p| {
+        p.iter()
+            .filter(|p| p.0 == dim)
+            .map(|p| (p.1.train, p.1.car))
+            .collect()
+    })
+}
+
 /// The players seated on each train of level `dim` (`countPlayerPassengers`).
 pub fn passengers(dim: usize) -> std::collections::HashMap<u32, i32> {
     let mut out = std::collections::HashMap::new();

@@ -39,7 +39,7 @@ mod clicks;
 pub(crate) mod cloth;
 mod copper;
 mod crates;
-mod doors;
+pub(crate) mod doors;
 mod girders;
 mod hatch;
 mod items;

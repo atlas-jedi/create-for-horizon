@@ -11,6 +11,9 @@ use std::collections::{HashSet, VecDeque};
 pub struct Found {
     pub state: u32,
     pub sail_facing: Option<Dir>,
+    /// In `create:windmill_sails` without being a `SailBlock` (wool, a copycat of wool:
+    /// `BearingContraption.getSailBlock`): it counts toward a windmill's sails, nothing more.
+    pub sail: bool,
     pub sticky: Option<Sticky>,
     pub movable: bool,
     /// A linear chassis (`LinearChassisBlock`) and what it holds on to.
@@ -28,12 +31,202 @@ pub struct Found {
     pub unsupportive: u8,
     /// A belt segment (`BeltBlock`): the whole belt moves with it (`moveBelt`).
     pub belt: Option<crate::belt::Segment>,
+    /// `BlockMovementChecks.isBrittle`: it hangs on to another block (a torch, a ladder, a
+    /// door, a carpet). Slime and honey never pull it in, a chassis stops at it and a search
+    /// does not start from it.
+    pub brittle: bool,
+    /// `PushReaction.PUSH_ONLY` (glazed terracotta, gearboxes): it sticks to no slime or honey
+    /// either way, and a retracting piston does not pull it.
+    pub push_only: bool,
+    /// What moving this block brings with it (`Contraption.moveBlock`), world positions joining
+    /// the search: the block a windmill bearing faces (`moveWindmillBearing`), the block under a
+    /// pulley's rope (`movePulley`), a piston's poles, head and the block it holds
+    /// (`moveMechanicalPiston`, `movePistonPole`, `movePistonHead`), a cart assembler under it,
+    /// the other half of a double chest, a gantry carriage's front and shafts and a gantry
+    /// shaft's line and carriages (`moveGantryPinion`, `moveGantryShaft`).
+    pub drags: Vec<[i32; 3]>,
+    /// Blocks it takes along as they are, with no checks (`movePulley`'s rope and magnet,
+    /// `addBlock`): world positions.
+    pub carries: Vec<[i32; 3]>,
+    /// A mechanical bearing's facing (`moveBearing`): the structure decides whether what it
+    /// faces rides on its own, stabilized (`canBeStabilized`), or joins this one.
+    pub bearing: Option<Dir>,
+    /// A mechanical piston head's facing (`isPistonHead`): an extending piston's line of blocks
+    /// stops at a head facing back at it (`PistonContraption.addToInitialFrontier`).
+    pub head: Option<Dir>,
+    /// A mechanical piston in the middle of moving (`moveMechanicalPiston` with `MOVING`): the
+    /// search gives up and nothing assembles (no assembly exception).
+    pub halts: bool,
 }
 
 /// `Contraption.moveBlock`'s extended sticker: the block it faces joins the frontier (an
 /// unmovable one there then refuses the structure).
 pub(crate) fn sticker_target(pos: [i32; 3], f: &Found) -> Option<[i32; 3]> {
     f.sticker.map(|d| add(pos, d.offset()))
+}
+
+/// How a kind of structure treats what it meets (`Contraption`'s overrides).
+pub struct Rules<'a> {
+    /// `forcedDirection`: the way it is pushed (a piston's), which takes the block ahead of
+    /// each of its blocks and refuses the structure when that block can't move; none for the
+    /// structures that turn or hang.
+    pub forced: Option<Dir>,
+    /// `isAnchoringBlockAt`: what it never takes (its bearing, its piston and poles).
+    pub skip: &'a dyn Fn([i32; 3]) -> bool,
+    /// `canBeStabilized(facing, localPos)` for a mechanical bearing on it at a world position
+    /// facing `facing`: what that bearing faces then rides on its own, stabilized
+    /// (`pendingSubContraptions`), instead of joining this structure.
+    pub stabilizes: &'a dyn Fn(Dir, [i32; 3]) -> bool,
+}
+
+/// Never stabilized (`TranslatingContraption.canBeStabilized` with the default
+/// `stabiliseStableContraptions` off, `StabilizedContraption`, `CarriageContraption`).
+pub fn never(_: Dir, _: [i32; 3]) -> bool {
+    false
+}
+
+/// What a search gathered: each block's offset from the origin and state, its sails
+/// (`BearingContraption.sailBlocks`), and the mechanical bearings on it whose faced structure
+/// rides on its own, stabilized (`pendingSubContraptions`: each bearing's world position and
+/// facing).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Searched {
+    pub blocks: Vec<([i32; 3], u32)>,
+    pub sails: u32,
+    pub subs: Vec<([i32; 3], Dir)>,
+}
+
+/// `Contraption.moveBlock`'s slime and honey: `!isBrittle(other) && canStickTo` both ways, and
+/// neither push-only nor facing the other with a face that pushes nothing. `d` goes from `a`
+/// to `b`.
+pub(crate) fn can_stick(a: &Found, b: &Found, d: Dir) -> bool {
+    !b.brittle
+        && sticks(a, b)
+        && !a.push_only
+        && !b.push_only
+        && !not_supportive(a, d)
+        && !not_supportive(b, d.opposite())
+}
+
+/// `searchMovedStructure`'s start: the block there unless it is brittle.
+fn starts_at(start: [i32; 3], at: &impl Fn([i32; 3]) -> Option<Found>) -> VecDeque<[i32; 3]> {
+    if at(start).is_some_and(|f| f.brittle) {
+        VecDeque::new()
+    } else {
+        VecDeque::from([start])
+    }
+}
+
+/// `Contraption.searchMovedStructure`'s loop over `frontier` (`moveBlock`): each block that
+/// needs moving joins, with what its chassis, sticker, belt, bearings, pulleys and pistons bring
+/// (`drags`, `carries`), and each neighbour that slime or honey holds, that hangs on to it, that
+/// glue holds to it, or that is ahead the way it is pushed (`rules.forced`). Offsets from
+/// `origin`.
+pub fn search(
+    mut frontier: VecDeque<[i32; 3]>,
+    origin: [i32; 3],
+    rules: &Rules<'_>,
+    at: &impl Fn([i32; 3]) -> Option<Found>,
+) -> Result<Searched, Refused> {
+    let mut visited: HashSet<[i32; 3]> = HashSet::new();
+    let mut taken: HashSet<[i32; 3]> = HashSet::new();
+    let mut out = Searched::default();
+    let skip = rules.skip;
+    let forced = rules.forced;
+    let local = |p: [i32; 3]| [p[0] - origin[0], p[1] - origin[1], p[2] - origin[2]];
+    while let Some(pos) = frontier.pop_front() {
+        if !visited.insert(pos) || skip(pos) {
+            continue;
+        }
+        let Some(found) = at(pos) else {
+            continue;
+        };
+        if !found.movable {
+            return Err(Refused::Unmovable(pos));
+        }
+        // `moveMechanicalPiston`: a moving piston ends the search, and nothing assembles.
+        if found.halts {
+            return Err(Refused::Empty);
+        }
+        let join = |p: [i32; 3], frontier: &mut VecDeque<[i32; 3]>| {
+            if !visited.contains(&p) && !skip(p) {
+                frontier.push_back(p);
+            }
+        };
+        if let Some(c) = found.chassis {
+            for p in chassis_reach(pos, c, forced, at) {
+                join(p, &mut frontier);
+            }
+        }
+        for p in belt_neighbours(pos, &found) {
+            join(p, &mut frontier);
+        }
+        // An extended sticker takes what it faces, unless that face of it pushes nothing.
+        if let (Some(p), Some(d)) = (sticker_target(pos, &found), found.sticker)
+            && at(p).is_none_or(|o| !not_supportive(&o, d.opposite()))
+        {
+            join(p, &mut frontier);
+        }
+        for &p in &found.drags {
+            join(p, &mut frontier);
+        }
+        // `moveBearing`: what a mechanical bearing faces joins, unless it rides stabilized.
+        if let Some(f) = found.bearing {
+            if (rules.stabilizes)(f, pos) {
+                if !out.subs.contains(&(pos, f)) {
+                    out.subs.push((pos, f));
+                }
+            } else {
+                join(add(pos, f.offset()), &mut frontier);
+            }
+        }
+        for d in Dir::ALL {
+            let next = add(pos, d.offset());
+            if skip(next) {
+                continue;
+            }
+            let Some(other) = at(next) else {
+                continue;
+            };
+            if !other.movable {
+                // `unmovableBlock(pos, state)`: named by the block pushing it.
+                if Some(d) == forced {
+                    return Err(Refused::Unmovable(pos));
+                }
+                continue;
+            }
+            if visited.contains(&next) {
+                continue;
+            }
+            if can_stick(&found, &other, d)
+                || attached_towards(&other, d.opposite())
+                || glued_toward(&found, d)
+                || (Some(d) == forced && !not_supportive(&found, d))
+            {
+                frontier.push_back(next);
+            }
+        }
+        // `addBlock`: a block already taken is replaced, not counted again.
+        if taken.insert(pos) {
+            // `BearingContraption.addBlock`: a block in `create:windmill_sails`.
+            if found.sail || found.sail_facing.is_some() {
+                out.sails += 1;
+            }
+            out.blocks.push((local(pos), found.state));
+        }
+        // `movePulley`: its rope and magnet go as they are.
+        for &p in &found.carries {
+            if let Some(r) = at(p)
+                && taken.insert(p)
+            {
+                out.blocks.push((local(p), r.state));
+            }
+        }
+        if out.blocks.len() > MAX_BLOCKS {
+            return Err(Refused::TooLarge);
+        }
+    }
+    Ok(out)
 }
 
 /// `Contraption.moveBelt`: a belt segment takes the segments before and after it.
@@ -109,7 +302,7 @@ fn radial_reach(
                 continue;
             }
             // `isMovementNecessary`, and nothing brittle.
-            let Some(f) = at(p).filter(|f| f.unsupportive != 0x3F) else {
+            let Some(f) = at(p).filter(|f| !f.brittle) else {
                 continue;
             };
             visited.insert(p);
@@ -196,7 +389,7 @@ pub fn chassis_reach(
         for i in 1..=c.range {
             let current = [pos[0] + o[0] * i, pos[1] + o[1] * i, pos[2] + o[2] * i];
             // Up to air, a brittle block, or a face that pushes nothing on.
-            let Some(f) = at(current).filter(|f| f.unsupportive != 0x3F) else {
+            let Some(f) = at(current).filter(|f| !f.brittle) else {
                 break;
             };
             out.push(current);
@@ -221,6 +414,15 @@ pub enum Refused {
     TooLarge,
     NotEnoughSails(u32),
     Empty,
+    /// A piston with no poles (`noPistonPoles`) or more than `maxPistonPoles`
+    /// (`tooManyPistonPoles`).
+    NoPistonPoles,
+    TooManyPistonPoles,
+    /// An elevator with no redstone contact facing sideways, more than one, or whose column
+    /// another elevator runs (`no_contacts`, `too_many_contacts`, `column_conflict`).
+    NoContacts,
+    TooManyContacts,
+    ColumnConflict,
 }
 
 /// A gathered structure: each block's offset from the bearing and state, and its sail count.
@@ -269,166 +471,286 @@ pub fn gather_windmill(
     gather_bearing(bearing, facing, MIN_SAILS, at)
 }
 
+/// [`gather_windmill`] with its stabilized bearings set apart ([`gather_bearing_stabilizing`]).
+pub fn gather_windmill_stabilizing(
+    bearing: [i32; 3],
+    facing: Dir,
+    at: impl Fn([i32; 3]) -> Option<Found>,
+) -> Result<Searched, Refused> {
+    gather_bearing_stabilizing(bearing, facing, MIN_SAILS, at)
+}
+
 /// `BearingContraption.assemble` for any bearing: a windmill needs `min_sails` (a mechanical
-/// bearing none).
+/// bearing none). A mechanical bearing on it is never stabilized here (what it faces joins):
+/// [`gather_bearing_with`] says which are.
 pub fn gather_bearing(
     bearing: [i32; 3],
     facing: Dir,
     min_sails: u32,
     at: impl Fn([i32; 3]) -> Option<Found>,
 ) -> Result<Gathered, Refused> {
-    let start = add(bearing, facing.offset());
-    let (blocks, sails) = gather_from(start, bearing, |p| p == bearing, at)?;
-    if sails < min_sails {
-        return Err(Refused::NotEnoughSails(sails));
+    let s = gather_bearing_with(bearing, facing, min_sails, &never, at)?;
+    Ok((s.blocks, s.sails))
+}
+
+/// `BearingContraption.canBeStabilized`: a mechanical bearing on a bearing's structure at
+/// `local` (from the block in front of the bearing) facing `facing` is stabilized on the
+/// bearing's own axis, unless it sits right in front of the bearing facing back at it.
+pub fn bearing_stabilizes(parent: Dir, facing: Dir, local: [i32; 3]) -> bool {
+    if facing.opposite() == parent && local == [0; 3] {
+        return false;
     }
-    if blocks.is_empty() {
+    facing.axis() == parent.axis()
+}
+
+/// `BearingContraption.assemble` (a mechanical or windmill bearing's): [`gather_bearing`] with
+/// the mechanical bearings on it that `canBeStabilized` set apart (`Searched::subs`): on its
+/// axis, but for one right in front of it facing back. Their positions are the world's.
+pub fn gather_bearing_stabilizing(
+    bearing: [i32; 3],
+    facing: Dir,
+    min_sails: u32,
+    at: impl Fn([i32; 3]) -> Option<Found>,
+) -> Result<Searched, Refused> {
+    let front = add(bearing, facing.offset());
+    let stabilizes = |f: Dir, p: [i32; 3]| {
+        bearing_stabilizes(facing, f, [p[0] - front[0], p[1] - front[1], p[2] - front[2]])
+    };
+    gather_bearing_with(bearing, facing, min_sails, &stabilizes, at)
+}
+
+/// `ClockworkContraption.canBeStabilized`: a mechanical bearing on a clock's hand at `local`
+/// (from the hand's anchor) facing `facing` is stabilized on the clock's axis, unless it is the
+/// anchor or faces it.
+pub fn clockwork_stabilizes(parent: Dir, facing: Dir, local: [i32; 3]) -> bool {
+    if local == [0; 3] || add(local, facing.offset()) == [0; 3] {
+        return false;
+    }
+    facing.axis() == parent.axis()
+}
+
+/// [`gather_from`] with `stabilizes` saying which mechanical bearings on it carry what they
+/// face stabilized (`Searched::subs`, world positions).
+pub fn gather_from_stabilizing(
+    start: [i32; 3],
+    origin: [i32; 3],
+    skip: impl Fn([i32; 3]) -> bool,
+    stabilizes: &dyn Fn(Dir, [i32; 3]) -> bool,
+    at: impl Fn([i32; 3]) -> Option<Found>,
+) -> Result<Searched, Refused> {
+    let rules = Rules {
+        forced: None,
+        skip: &skip,
+        stabilizes,
+    };
+    search(starts_at(start, &at), origin, &rules, &at)
+}
+
+/// `StabilizedContraption.assemble(level, pos)`: what the mechanical bearing at `bearing` faces
+/// (`searchMovedStructure` from the block in front, `canBeStabilized` false: a bearing on it
+/// takes what it faces along), offsets from `origin`. Create assembles none for an error or
+/// nothing found (`onEntityCreated` goes on to the next).
+pub fn gather_stabilized(
+    bearing: [i32; 3],
+    facing: Dir,
+    origin: [i32; 3],
+    at: impl Fn([i32; 3]) -> Option<Found>,
+) -> Option<Vec<([i32; 3], u32)>> {
+    let blocks = gather_from(add(bearing, facing.offset()), origin, |_| false, at)
+        .ok()?
+        .0;
+    (!blocks.is_empty()).then_some(blocks)
+}
+
+/// A `StabilizedContraption` riding a turning structure (`stabilizedSubContraptions`): what a
+/// mechanical bearing on it faces, kept upright as it turns. Offsets from the turning
+/// structure's anchor block (its bearing), as that structure's are.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Stabilized {
+    /// The bearing it hangs on (`BlockFace.pos`) and its facing (`getFace`).
+    pub bearing: [i32; 3],
+    pub facing: Dir,
+    pub blocks: Vec<([i32; 3], u32)>,
+    /// Its contraption controls, the kinds they turned off and its glue.
+    pub extras: crate::actors::Carried,
+}
+
+/// `StabilizedBearingMovementBehaviour.getCounterRotationAngle`'s test (`canBeStabilized`): the
+/// mechanical bearings of a turning structure (`blocks`, offsets from its bearing; `facing_of`
+/// a mechanical bearing state's facing) whose tops turn back against it, by its rule
+/// (`stabilizes`, offsets from its anchor `anchor`). A stabilized structure need not hang there.
+pub fn still_tops(
+    blocks: &[([i32; 3], u32)],
+    anchor: [i32; 3],
+    facing_of: impl Fn(u32) -> Option<Dir>,
+    stabilizes: impl Fn(Dir, [i32; 3]) -> bool,
+) -> Vec<[i32; 3]> {
+    blocks
+        .iter()
+        .filter(|(o, s)| {
+            facing_of(*s).is_some_and(|f| {
+                stabilizes(f, [o[0] - anchor[0], o[1] - anchor[1], o[2] - anchor[2]])
+            })
+        })
+        .map(|(o, _)| *o)
+        .collect()
+}
+
+/// How far apart the keys of a structure's stabilized structures are ([`sub_key`]): more than
+/// the height of any world, so no block and no other structure's key meets one.
+pub const SUB_KEY_STEP: i32 = 1 << 16;
+
+/// The key the `i`th stabilized structure riding the structure keyed `key` keeps what it
+/// carries under (its own `MountedStorageManager`, actors and block data): `key` moved up
+/// `i + 1` steps of [`SUB_KEY_STEP`].
+pub fn sub_key(key: [i32; 3], i: usize) -> [i32; 3] {
+    let up = SUB_KEY_STEP.wrapping_mul(i as i32 + 1);
+    [key[0], key[1].wrapping_add(up), key[2]]
+}
+
+/// The structure and index a [`sub_key`] stands for, for a key at a world height; None for a
+/// key that is no stabilized structure's (a block's own).
+pub fn sub_of_key(key: [i32; 3]) -> Option<([i32; 3], usize)> {
+    let k = (i64::from(key[1]) + i64::from(SUB_KEY_STEP / 2)).div_euclid(i64::from(SUB_KEY_STEP));
+    if k < 1 {
+        return None;
+    }
+    let y = i64::from(key[1]) - k * i64::from(SUB_KEY_STEP);
+    Some(([key[0], y as i32, key[2]], (k - 1) as usize))
+}
+
+impl Stabilized {
+    /// `BlockFace.getConnectedPos`: the block in front of its bearing, where it is anchored.
+    pub fn front(&self) -> [i32; 3] {
+        add(self.bearing, self.facing.offset())
+    }
+
+    /// Whether the block at offset `o` is one of its own.
+    pub fn holds(&self, o: [i32; 3]) -> bool {
+        self.blocks.iter().any(|(p, _)| *p == o)
+    }
+
+    /// `AbstractContraptionEntity.getPassengerPosition` for it: how far its blocks are from
+    /// where they were taken with the structure carrying it turned `deg` about `axis` through
+    /// its anchor's centre. Its front's centre turns; its blocks do not (its `yaw` stays at its
+    /// initial yaw).
+    pub fn shift(&self, axis: crate::kinetics::Axis, deg: f64) -> [f64; 3] {
+        let c = self.front().map(f64::from);
+        let r = crate::actors::turn_vec(c, axis, deg);
+        [0, 1, 2].map(|i| r[i] - c[i])
+    }
+
+    /// `disassemble` after the structure carrying it went back turned `quarter` about `axis`:
+    /// its anchor set at `transform.apply(connectedPos)`, its own turn none (`-yaw +
+    /// initialYaw`). The offset its block at `o` goes back to.
+    pub fn placed(&self, o: [i32; 3], axis: crate::kinetics::Axis, quarter: i32) -> [i32; 3] {
+        let c = self.front();
+        let r = rotate(c, quarter, axis);
+        [0, 1, 2].map(|i| r[i] + o[i] - c[i])
+    }
+}
+
+/// [`gather_bearing`], with `stabilizes` saying which mechanical bearings on it carry what they
+/// face stabilized (`Searched::subs`).
+pub fn gather_bearing_with(
+    bearing: [i32; 3],
+    facing: Dir,
+    min_sails: u32,
+    stabilizes: &dyn Fn(Dir, [i32; 3]) -> bool,
+    at: impl Fn([i32; 3]) -> Option<Found>,
+) -> Result<Searched, Refused> {
+    let start = add(bearing, facing.offset());
+    let skip = |p: [i32; 3]| p == bearing;
+    let rules = Rules {
+        forced: None,
+        skip: &skip,
+        stabilizes,
+    };
+    let s = search(starts_at(start, &at), bearing, &rules, &at)?;
+    if s.sails < min_sails {
+        return Err(Refused::NotEnoughSails(s.sails));
+    }
+    if s.blocks.is_empty() {
         return Err(Refused::Empty);
     }
-    Ok((blocks, sails))
+    Ok(s)
 }
 
 /// `Contraption.searchMovedStructure` from `start` with no forced direction: the block there
-/// and what holds on to it (slime, honey, sails in their plane, chassis), never a block `skip`
-/// names (`isAnchoringBlockAt`, a clock's other hand). Offsets from `origin`, and the sails.
+/// (unless it is brittle) and what holds on to it (slime, honey, sails in their plane, chassis,
+/// what bearings, pulleys and pistons on it bring), never a block `skip` names
+/// (`isAnchoringBlockAt`, a clock's other hand). Offsets from `origin`, and the sails.
 pub fn gather_from(
     start: [i32; 3],
     origin: [i32; 3],
     skip: impl Fn([i32; 3]) -> bool,
     at: impl Fn([i32; 3]) -> Option<Found>,
 ) -> Result<Gathered, Refused> {
-    let mut frontier = VecDeque::from([start]);
-    let mut visited: HashSet<[i32; 3]> = HashSet::new();
-    let mut blocks = Vec::new();
-    let mut sails = 0;
-    while let Some(pos) = frontier.pop_front() {
-        if !visited.insert(pos) {
-            continue;
-        }
-        if skip(pos) {
-            continue;
-        }
-        let Some(found) = at(pos) else {
-            continue;
-        };
-        if !found.movable {
-            return Err(Refused::Unmovable(pos));
-        }
-        if let Some(c) = found.chassis {
-            for p in chassis_reach(pos, c, None, &at) {
-                if !visited.contains(&p) && !skip(p) {
-                    frontier.push_back(p);
-                }
-            }
-        }
-        if let Some(p) = sticker_target(pos, &found).filter(|p| !visited.contains(p) && !skip(*p)) {
-            frontier.push_back(p);
-        }
-        for p in belt_neighbours(pos, &found) {
-            if !visited.contains(&p) && !skip(p) {
-                frontier.push_back(p);
-            }
-        }
-        for d in Dir::ALL {
-            let next = add(pos, d.offset());
-            if visited.contains(&next) || skip(next) {
-                continue;
-            }
-            let Some(other) = at(next) else {
-                continue;
-            };
-            if !other.movable {
-                continue;
-            }
-            if sticks(&found, &other)
-                || attached_towards(&other, d.opposite())
-                || glued_toward(&found, d)
-            {
-                frontier.push_back(next);
-            }
-        }
-        if found.sail_facing.is_some() {
-            sails += 1;
-        }
-        blocks.push((
-            [pos[0] - origin[0], pos[1] - origin[1], pos[2] - origin[2]],
-            found.state,
-        ));
-        if blocks.len() > MAX_BLOCKS {
-            return Err(Refused::TooLarge);
-        }
-    }
-    Ok((blocks, sails))
+    let rules = Rules {
+        forced: None,
+        skip: &skip,
+        stabilizes: &never,
+    };
+    let s = search(starts_at(start, &at), origin, &rules, &at)?;
+    Ok((s.blocks, s.sails))
 }
 
-/// `GantryContraption.assemble` (`searchMovedStructure` from the carriage, `moveGantryPinion`):
-/// the carriage, the block in front of it and what holds on to them, never the shaft it rides
-/// on (`isAnchoringBlockAt`); a chassis reaches along the way it moves. Offsets from the carriage.
+/// [`gather_from`] from a frontier taken as it is (`addToInitialFrontier` clearing it: a
+/// cart's block above it, even a brittle one).
+pub fn gather_frontier(
+    frontier: &[[i32; 3]],
+    origin: [i32; 3],
+    skip: impl Fn([i32; 3]) -> bool,
+    at: impl Fn([i32; 3]) -> Option<Found>,
+) -> Result<Gathered, Refused> {
+    let rules = Rules {
+        forced: None,
+        skip: &skip,
+        stabilizes: &never,
+    };
+    let s = search(frontier.iter().copied().collect(), origin, &rules, &at)?;
+    Ok((s.blocks, s.sails))
+}
+
+/// [`gather_frontier`] with every mechanical bearing on it carrying what it faces stabilized
+/// (`MountedContraption.canBeStabilized` is always true): `Searched::subs` in world positions.
+pub fn gather_frontier_stabilizing(
+    frontier: &[[i32; 3]],
+    origin: [i32; 3],
+    skip: impl Fn([i32; 3]) -> bool,
+    at: impl Fn([i32; 3]) -> Option<Found>,
+) -> Result<Searched, Refused> {
+    let rules = Rules {
+        forced: None,
+        skip: &skip,
+        stabilizes: &|_, _| true,
+    };
+    search(frontier.iter().copied().collect(), origin, &rules, &at)
+}
+
+/// `GantryContraption.assemble` (`searchMovedStructure(level, carriage, null)`, the carriage's
+/// `moveGantryPinion` bringing the block in front of it): the carriage and what holds on to it,
+/// never the shaft it rides on (`isAnchoringBlockAt`); no forced direction, so a chassis on it
+/// reaches only its glued ends. `moving` is the way it will move (unused by the search).
+/// Offsets from the carriage.
 pub fn gather_gantry(
     carriage: [i32; 3],
     facing: Dir,
     moving: Dir,
     at: impl Fn([i32; 3]) -> Option<Found>,
 ) -> Result<Vec<([i32; 3], u32)>, Refused> {
+    let _ = moving;
     let shaft = add(carriage, facing.opposite().offset());
-    let mut frontier = VecDeque::from([carriage, add(carriage, facing.offset())]);
-    let mut visited: HashSet<[i32; 3]> = HashSet::new();
-    let mut blocks = Vec::new();
-    while let Some(pos) = frontier.pop_front() {
-        if pos == shaft || !visited.insert(pos) {
-            continue;
-        }
-        let Some(found) = at(pos) else {
-            continue;
-        };
-        if !found.movable {
-            return Err(Refused::Unmovable(pos));
-        }
-        if let Some(c) = found.chassis {
-            for p in chassis_reach(pos, c, Some(moving), &at) {
-                if !visited.contains(&p) && p != shaft {
-                    frontier.push_back(p);
-                }
-            }
-        }
-        if let Some(p) = sticker_target(pos, &found).filter(|p| !visited.contains(p) && *p != shaft)
-        {
-            frontier.push_back(p);
-        }
-        for p in belt_neighbours(pos, &found) {
-            if !visited.contains(&p) && p != shaft {
-                frontier.push_back(p);
-            }
-        }
-        for d in Dir::ALL {
-            let next = add(pos, d.offset());
-            if visited.contains(&next) || next == shaft {
-                continue;
-            }
-            let Some(other) = at(next) else {
-                continue;
-            };
-            if other.movable
-                && (sticks(&found, &other)
-                    || attached_towards(&other, d.opposite())
-                    || glued_toward(&found, d))
-            {
-                frontier.push_back(next);
-            }
-        }
-        blocks.push((
-            [
-                pos[0] - carriage[0],
-                pos[1] - carriage[1],
-                pos[2] - carriage[2],
-            ],
-            found.state,
-        ));
-        if blocks.len() > MAX_BLOCKS {
-            return Err(Refused::TooLarge);
-        }
-    }
-    Ok(blocks)
+    let skip = |p: [i32; 3]| p == shaft;
+    let rules = Rules {
+        forced: None,
+        skip: &skip,
+        stabilizes: &never,
+    };
+    // The carriage's pinion side (`moveGantryPinion`) whether or not its block says so.
+    let mut frontier = starts_at(carriage, &at);
+    frontier.push_back(add(carriage, facing.offset()));
+    Ok(search(frontier, carriage, &rules, &at)?.blocks)
 }
 
 /// `WindmillBearingBlockEntity.getGeneratedSpeed`: a sail per 8 gives an rpm, 1 to 16,
@@ -802,6 +1124,245 @@ mod tests {
             gather_windmill([0, 0, 0], Dir::North, stuck),
             Err(Refused::Unmovable([0, 0, -1]))
         );
+    }
+
+    fn block(state: u32) -> Found {
+        Found {
+            state,
+            movable: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn slime_holds_neither_brittle_nor_push_only_blocks_nor_faces_that_push_nothing() {
+        // A slime block at the origin with, around it: a brittle block hanging on to something
+        // else east, glazed terracotta (push-only) west, a drill whose head faces the slime
+        // north, and stones south and above.
+        let at = |p: [i32; 3]| match p {
+            [0, 0, 0] => Some(Found {
+                sticky: Some(Sticky::Slime),
+                ..block(1)
+            }),
+            [1, 0, 0] => Some(Found {
+                brittle: true,
+                unsupportive: 0x3F,
+                ..block(2)
+            }),
+            [-1, 0, 0] => Some(Found {
+                push_only: true,
+                ..block(3)
+            }),
+            [0, 0, -1] => Some(Found {
+                unsupportive: Dir::South.bit(),
+                ..block(4)
+            }),
+            [0, 0, 1] | [0, 1, 0] => Some(block(5)),
+            _ => None,
+        };
+        let (mut blocks, _) = gather_from([0, 0, 0], [0, 0, 0], |_| false, at).unwrap();
+        blocks.sort();
+        assert_eq!(
+            blocks,
+            vec![([0, 0, 0], 1), ([0, 0, 1], 5), ([0, 1, 0], 5)],
+            "only the stones stick"
+        );
+        // A brittle block is no search's start, but a cart takes the block above it as it is.
+        let torch = |p: [i32; 3]| {
+            (p == [0, 0, 0]).then(|| Found {
+                brittle: true,
+                ..block(6)
+            })
+        };
+        assert_eq!(
+            gather_from([0, 0, 0], [0, 0, 0], |_| false, torch),
+            Ok((vec![], 0))
+        );
+        assert_eq!(
+            gather_frontier(&[[0, 0, 0]], [0, 0, 0], |_| false, torch),
+            Ok((vec![([0, 0, 0], 6)], 0))
+        );
+    }
+
+    #[test]
+    fn bearings_pulleys_and_pistons_on_a_structure_bring_theirs() {
+        // A stone at the origin glued to what is above it: a windmill bearing (y 1) whose
+        // faced stone it drags, a mechanical bearing facing west (y 2), and a rope pulley (y 3)
+        // whose rope (x 5, y 1..2) rides as it is, with the stone under it (x 5, y 0).
+        let at = |p: [i32; 3]| match p {
+            [0, 0, 0] => Some(Found {
+                glued: Dir::Up.bit(),
+                ..block(1)
+            }),
+            [0, 1, 0] => Some(Found {
+                drags: vec![[1, 1, 0]],
+                glued: Dir::Up.bit(),
+                ..block(2)
+            }),
+            [0, 2, 0] => Some(Found {
+                bearing: Some(Dir::West),
+                glued: Dir::Up.bit(),
+                ..block(3)
+            }),
+            [0, 3, 0] => Some(Found {
+                carries: vec![[5, 2, 0], [5, 1, 0]],
+                drags: vec![[5, 0, 0]],
+                ..block(4)
+            }),
+            [1, 1, 0] | [-1, 2, 0] | [5, 0, 0] => Some(block(5)),
+            [5, 1, 0] | [5, 2, 0] => Some(Found {
+                movable: false,
+                brittle: true,
+                ..block(6)
+            }),
+            _ => None,
+        };
+        let (mut blocks, _) = gather_from([0, 0, 0], [0, 0, 0], |_| false, at).unwrap();
+        blocks.sort();
+        assert_eq!(
+            blocks,
+            vec![
+                ([-1, 2, 0], 5),
+                ([0, 0, 0], 1),
+                ([0, 1, 0], 2),
+                ([0, 2, 0], 3),
+                ([0, 3, 0], 4),
+                ([1, 1, 0], 5),
+                ([5, 0, 0], 5),
+                ([5, 1, 0], 6),
+                ([5, 2, 0], 6),
+            ]
+        );
+        // On a bearing turning about x (facing east), a bearing facing west is stabilized: what
+        // it faces stays out of the structure (`pendingSubContraptions`).
+        let s = gather_bearing_with(
+            [0, -1, 0],
+            Dir::Up,
+            0,
+            &|f, p| bearing_stabilizes(Dir::East, f, p),
+            at,
+        )
+        .unwrap();
+        assert_eq!(s.subs, vec![([0, 2, 0], Dir::West)]);
+        assert!(!s.blocks.iter().any(|(o, _)| *o == [-1, 3, 0]));
+        assert!(bearing_stabilizes(Dir::Up, Dir::Down, [0, 1, 0]));
+        assert!(
+            !bearing_stabilizes(Dir::Up, Dir::Down, [0, 0, 0]),
+            "right in front, facing back"
+        );
+        assert!(!bearing_stabilizes(Dir::Up, Dir::East, [0, 3, 0]), "across");
+        // A moving piston ends the search with nothing assembled.
+        let moving = |p: [i32; 3]| {
+            (p == [0, 0, 0]).then(|| Found {
+                halts: true,
+                ..block(7)
+            })
+        };
+        assert_eq!(
+            gather_from([0, 0, 0], [0, 0, 0], |_| false, moving),
+            Err(Refused::Empty)
+        );
+    }
+
+    #[test]
+    fn a_ferris_wheel_s_cabins_hang_upright_and_go_back_where_it_stops() {
+        // A bearing at the origin facing east (axis x) with an arm up from the block in front:
+        // stone at (1, 0..2, 0), a mechanical bearing facing west at (1, 3, 0) on top of it
+        // (glued), and a cabin: stone at (0, 3, 0) and (0, 2, 0) under it, glued together.
+        let at = |p: [i32; 3]| match p {
+            [1, 0..=2, 0] => Some(Found {
+                glued: Dir::Up.bit(),
+                ..block(1)
+            }),
+            [1, 3, 0] => Some(Found {
+                bearing: Some(Dir::West),
+                ..block(2)
+            }),
+            [0, 3, 0] => Some(Found {
+                glued: Dir::Down.bit(),
+                ..block(3)
+            }),
+            [0, 2, 0] => Some(block(3)),
+            _ => None,
+        };
+        let s = gather_bearing_stabilizing([0, 0, 0], Dir::East, 0, at).unwrap();
+        assert_eq!(s.subs, vec![([1, 3, 0], Dir::West)]);
+        assert_eq!(s.blocks.len(), 4, "the arm and the bearing, not the cabin");
+        let cabin = gather_stabilized([1, 3, 0], Dir::West, [0, 0, 0], at).unwrap();
+        assert_eq!(cabin, vec![([0, 3, 0], 3), ([0, 2, 0], 3)]);
+        // A bearing right in front facing back is not stabilized.
+        let facing_back = |p: [i32; 3]| {
+            (p == [1, 0, 0]).then(|| Found {
+                bearing: Some(Dir::West),
+                ..block(2)
+            })
+        };
+        assert!(
+            gather_bearing_stabilizing([0, 0, 0], Dir::East, 0, facing_back)
+                .unwrap()
+                .subs
+                .is_empty()
+        );
+        let sub = Stabilized {
+            bearing: [1, 3, 0],
+            facing: Dir::West,
+            blocks: cabin,
+            extras: Default::default(),
+        };
+        // Turned a quarter about x, its front (0, 3, 0) goes to (0, 0, 3): its blocks slide
+        // there, upright.
+        let shift = sub.shift(crate::kinetics::Axis::X, 90.0);
+        assert!(shift[0].abs() < 1e-9 && (shift[1] + 3.0).abs() < 1e-9);
+        assert!((shift[2] - 3.0).abs() < 1e-9);
+        assert_eq!(sub.placed([0, 2, 0], crate::kinetics::Axis::X, 90), [0, -1, 3]);
+        assert_eq!(sub.placed([0, 2, 0], crate::kinetics::Axis::X, 0), [0, 2, 0]);
+        assert!(sub.holds([0, 3, 0]) && !sub.holds([1, 3, 0]));
+        // Nothing in front: no cabin.
+        assert_eq!(gather_stabilized([1, 3, 0], Dir::East, [0; 3], at), None);
+        // Each cabin keeps what it carries under its own key, found back from it.
+        for (bearing, i) in [([3, -60, 7], 0), ([-5, 300, 2], 4)] {
+            let k = sub_key(bearing, i);
+            assert_ne!(k, bearing);
+            assert_eq!(sub_of_key(k), Some((bearing, i)));
+        }
+        assert_eq!(sub_of_key([3, -60, 7]), None);
+        // Its bearing's top turns back against the wheel; so would an on-axis bearing's with
+        // nothing in front, not one across the axis.
+        let tops = still_tops(
+            &[([1, 3, 0], 2), ([1, 1, 0], 4), ([1, 2, 0], 1)],
+            [1, 0, 0],
+            |s| match s {
+                2 => Some(Dir::West),
+                4 => Some(Dir::Up),
+                _ => None,
+            },
+            |f, l| bearing_stabilizes(Dir::East, f, l),
+        );
+        assert_eq!(tops, vec![[1, 3, 0]]);
+    }
+
+    #[test]
+    fn a_sticker_takes_what_it_faces_unless_that_face_pushes_nothing() {
+        let at = |faces_back: bool| {
+            move |p: [i32; 3]| match p {
+                [0, 0, 0] => Some(Found {
+                    sticker: Some(Dir::Up),
+                    ..block(1)
+                }),
+                [0, 1, 0] => Some(Found {
+                    unsupportive: if faces_back { Dir::Down.bit() } else { 0 },
+                    ..block(2)
+                }),
+                _ => None,
+            }
+        };
+        let taken = |faces_back| {
+            gather_from([0, 0, 0], [0, 0, 0], |_| false, at(faces_back))
+                .unwrap()
+                .0
+                .len()
+        };
+        assert_eq!((taken(false), taken(true)), (2, 1));
     }
 
     #[test]

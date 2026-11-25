@@ -76,6 +76,13 @@ fn provide(
             Some(Box::new(VaultItems { at, parts }))
         }
         Block::Chute | Block::SmartChute => Some(Box::new(ChuteItems(at))),
+        // `ItemDrainBlockEntity.registerCapabilities`: only on a horizontal face.
+        Block::ItemDrain => {
+            let face = side
+                .side
+                .filter(|d| !matches!(d, mod_api::Direction::Up | mod_api::Direction::Down))?;
+            Some(Box::new(DrainItems { at, face }))
+        }
         Block::BrassTunnel => Some(Box::new(TunnelItems(at))),
         Block::Packager | Block::Repackager | Block::PackageFrogport => {
             crate::glue::packages::packager_items(side, dim)
@@ -232,6 +239,8 @@ impl DepotItems {
         let key = super::items::key_of(&*lv.host, &stack);
         let motion = super::depot::handler_motion(&lv, self.0.pos, &key);
         with_world(|w| w.depot_put(self.0.dim, self.0.pos, Some(motion)));
+        // Its `DEPOT_PLOP` once the transaction is known to have kept the stack.
+        super::depot::landed_later(self.0.dim, self.0.pos);
     }
 }
 
@@ -625,6 +634,126 @@ fn accepts(host: &dyn mod_api::Host, at: At, stack: &ItemStack) -> bool {
                 .unwrap_or(false)
         }
         _ => false,
+    }
+}
+
+/// `ItemDrainItemHandler` (`ItemDrainBlockEntity.registerCapabilities`: one for each horizontal
+/// face, none up or down): one slot, the stack crossing the drain. In only while it holds
+/// none: one of a stack that can be emptied, else up to a stack (`drain_offer`), set off from
+/// the edge away from the face it came in by (`insertedFrom = side.getOpposite()`); out of what
+/// it holds (`extractItem`), mid-emptying too. The stack is the engine's (a drain's `held`), so
+/// an insert a transaction later aborts is not taken back (as with a belt's handler;
+/// `items::insert_room` answers drains from the engine).
+struct DrainItems {
+    at: At,
+    face: mod_api::Direction,
+}
+
+/// What a drain's handler is offered of `stack`: its name as drains name what they hold
+/// (`items::key_of`) and its count up to its stack size (`ItemHelper.limitCountToMaxStackSize`).
+pub(super) fn drain_offer(host: &dyn mod_api::Host, stack: &ItemStack) -> (String, u8) {
+    let count = stack
+        .count()
+        .min(limit(host, &ItemResource::of(stack)))
+        .min(u32::from(u8::MAX));
+    (super::items::key_of(host, stack), count as u8)
+}
+
+impl DrainItems {
+    /// The stack the drain holds, as an item stack.
+    fn held(&self, host: &dyn mod_api::Host) -> Option<ItemStack> {
+        let held = with_world(|w| {
+            w.dims[self.at.dim]
+                .drains
+                .get(&self.at.pos)
+                .and_then(|d| d.held.clone())
+        })
+        .flatten()?;
+        super::items::stack_of(host, &held.item, u32::from(held.count))
+    }
+}
+
+impl ResourceHandler<ItemResource> for DrainItems {
+    fn size(&self, _host: &mut dyn ServerHost) -> usize {
+        1
+    }
+    fn resource(&self, host: &mut dyn ServerHost, index: usize) -> Option<ItemResource> {
+        (index == 0)
+            .then(|| self.held(&*host).map(|s| ItemResource::of(&s)))
+            .flatten()
+    }
+    fn amount(&self, host: &mut dyn ServerHost, index: usize) -> u32 {
+        if index != 0 {
+            return 0;
+        }
+        self.held(&*host).map_or(0, |s| s.count())
+    }
+    fn capacity(
+        &self,
+        host: &mut dyn ServerHost,
+        _index: usize,
+        resource: &ItemResource,
+    ) -> u32 {
+        limit(&*host, resource)
+    }
+    fn is_valid(&self, _host: &mut dyn ServerHost, index: usize, _: &ItemResource) -> bool {
+        index == 0
+    }
+    fn insert(
+        &self,
+        host: &mut dyn ServerHost,
+        _tx: &Transaction,
+        index: usize,
+        resource: &ItemResource,
+        amount: u32,
+    ) -> u32 {
+        if index != 0 {
+            return 0;
+        }
+        let Some(stack) = resource.to_stack(amount.min(u32::from(u8::MAX))) else {
+            return 0;
+        };
+        let Some(i) = mod_api::Direction::ALL.iter().position(|d| *d == self.face) else {
+            return 0;
+        };
+        let Some(dimension) = self.at.level.dimension().id(&*host) else {
+            return 0;
+        };
+        let Some(mut lv) = super::super::server::ServerLevel::new(host, &dimension) else {
+            return 0;
+        };
+        let (key, count) = drain_offer(&*lv.host, &stack);
+        let travel = create_engine::kinetics::Dir::ALL[i].opposite();
+        crate::glue::fluids::insert_into_drain_sim(&mut lv, self.at.pos, travel, &key, count, false)
+            .map_or(0, |left| u32::from(count - left))
+    }
+    fn extract(
+        &self,
+        host: &mut dyn ServerHost,
+        _tx: &Transaction,
+        index: usize,
+        resource: &ItemResource,
+        amount: u32,
+    ) -> u32 {
+        if index != 0 || !self.held(&*host).is_some_and(|s| resource.matches(&s)) {
+            return 0;
+        }
+        let (dim, pos) = (self.at.dim, self.at.pos);
+        with_world(|w| {
+            let d = w.dims[dim].drains.get_mut(&pos)?;
+            let h = d.held.as_mut()?;
+            let n = h.count.min(amount.min(u32::from(u8::MAX)) as u8);
+            h.count -= n;
+            if h.count == 0 {
+                d.held = None;
+            }
+            if n > 0 {
+                w.mark_unsaved(dim, pos);
+            }
+            Some(u32::from(n))
+        })
+        .flatten()
+        .unwrap_or(0)
     }
 }
 

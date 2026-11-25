@@ -437,16 +437,22 @@ pub enum Order {
     NavigateTo(Vec<[i32; 3]>),
     /// `ChangeThrottleInstruction`: the train's throttle is now this many percent.
     Throttle(i32),
+    /// A station instruction with no conductor aboard facing either way
+    /// (`train.status.missingConductor`): it waits and looks again.
+    MissingConductor,
+    /// `DeliverPackagesInstruction.start`: no postbox takes the packages aboard
+    /// (`failedPackageNoTarget`, the first package's address): it waits and looks again.
+    NoPackageTarget(String),
 }
 
 /// What the glue measured for one train before the tick, for its current entry: each probed
 /// condition's measure by (group, row) (items or full stacks, fluid in millibuckets, 1 for a
 /// powered link network or an unloaded station, else 0), and for a package instruction the
-/// stations it may go to and whether the train carries any package.
+/// stations it may go to and the address of the first package the train carries, if any.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Probes {
     pub measures: Vec<((usize, usize), i32)>,
-    pub packages: Option<(Vec<[i32; 3]>, bool)>,
+    pub packages: Option<(Vec<[i32; 3]>, Option<String>)>,
 }
 
 impl Probes {
@@ -469,6 +475,9 @@ pub struct Inputs {
     pub players: i32,
     /// The station it stands at has a redstone signal.
     pub powered: bool,
+    /// A conductor sits behind controls facing either way (`hasForwardConductor ||
+    /// hasBackwardConductor`): a station instruction needs one.
+    pub conductor: bool,
 }
 
 /// `ScheduleRuntime`: where the train is in its schedule.
@@ -696,7 +705,7 @@ impl Runtime {
                 self.tick_conditions(schedule, inputs, probes);
                 Order::Nothing
             }
-            State::PreTransit => self.start_current(schedule, probes),
+            State::PreTransit => self.start_current(schedule, inputs, probes),
         }
     }
 
@@ -735,21 +744,32 @@ impl Runtime {
 
     /// `startCurrentInstruction`: a station is looked for; a title or throttle takes effect
     /// and the next entry follows.
-    fn start_current(&mut self, schedule: &Schedule, probes: &Probes) -> Order {
+    fn start_current(&mut self, schedule: &Schedule, inputs: Inputs, probes: &Probes) -> Order {
         if self.end_reached(schedule) {
             return Order::Nothing;
         }
-        match &schedule.entries[self.current].instruction {
+        let instruction = &schedule.entries[self.current].instruction;
+        // `DestinationInstruction.start` and the package instructions': nothing to drive the
+        // train either way, it waits and looks again (`startCooldown`).
+        if instruction.supports_conditions() && !inputs.conductor {
+            self.no_path();
+            return Order::MissingConductor;
+        }
+        match instruction {
             Instruction::Destination(filter) => Order::Navigate(filter.clone()),
             // `DeliverPackagesInstruction.start`: no station takes the packages aboard: wait
             // and look again, or with none aboard, on to the next entry.
             Instruction::DeliverPackages => match &probes.packages {
                 Some((stations, _)) if !stations.is_empty() => Order::NavigateTo(stations.clone()),
-                Some((_, true)) | None => {
+                Some((_, Some(address))) => {
+                    self.no_path();
+                    Order::NoPackageTarget(address.clone())
+                }
+                None => {
                     self.no_path();
                     Order::Nothing
                 }
-                Some((_, false)) => {
+                Some((_, None)) => {
                     self.current += 1;
                     Order::Nothing
                 }
@@ -998,6 +1018,7 @@ mod tests {
     fn idle(n: i32) -> Inputs {
         Inputs {
             idle_cargo: n,
+            conductor: true,
             ..Inputs::default()
         }
     }
@@ -1125,6 +1146,7 @@ mod tests {
         assert_eq!(r.current, 2);
         let on = Inputs {
             powered: true,
+            conductor: true,
             ..Inputs::default()
         };
         r.tick(&s, false, on, &none());
@@ -1156,6 +1178,7 @@ mod tests {
         let at = |day_time, players| Inputs {
             day_time,
             players,
+            conductor: true,
             ..Inputs::default()
         };
         let mut r = Runtime::new();
@@ -1272,16 +1295,17 @@ mod tests {
             cyclic: true,
             saved_progress: 0,
         };
-        let found = |stations: Vec<[i32; 3]>, any| Probes {
+        let found = |stations: Vec<[i32; 3]>, any: bool| Probes {
             measures: Vec::new(),
-            packages: Some((stations, any)),
+            packages: Some((stations, any.then(|| "Home".to_owned()))),
         };
         let mut r = Runtime::new();
         assert!(r.packages_wanted(&s));
-        // Packages aboard but no postbox for them: it waits and looks again.
+        // Packages aboard but no postbox for them: it waits and looks again, telling the
+        // first package's address.
         assert_eq!(
             r.tick(&s, false, idle(0), &found(vec![], true)),
-            Order::Nothing
+            Order::NoPackageTarget("Home".into())
         );
         assert_eq!((r.current, r.cooldown), (0, INTERVAL));
         r.cooldown = 0;
@@ -1403,5 +1427,34 @@ mod tests {
             ..Whereabouts::default()
         };
         assert_eq!(r.predict(&s2, &at).len(), 1, "no stay is known after A");
+    }
+
+    #[test]
+    fn a_station_instruction_waits_for_a_conductor() {
+        // `DestinationInstruction.start`: no conductor either way, `missingConductor` and a
+        // wait (`startCooldown`) before it looks again.
+        let s = shuttle(true);
+        let mut r = Runtime::new();
+        let alone = Inputs::default();
+        assert_eq!(r.tick(&s, false, alone, &none()), Order::MissingConductor);
+        assert_eq!((r.current, r.cooldown), (0, INTERVAL));
+        for _ in 0..INTERVAL {
+            assert_eq!(r.tick(&s, false, idle(0), &none()), Order::Nothing);
+        }
+        assert_eq!(
+            r.tick(&s, false, idle(0), &none()),
+            Order::Navigate("Depot".into())
+        );
+        // A title or a throttle needs none.
+        let s = Schedule {
+            entries: vec![Entry {
+                instruction: Instruction::Throttle(50),
+                conditions: Vec::new(),
+            }],
+            cyclic: false,
+            saved_progress: 0,
+        };
+        let mut r = Runtime::new();
+        assert_eq!(r.tick(&s, false, alone, &none()), Order::Throttle(50));
     }
 }

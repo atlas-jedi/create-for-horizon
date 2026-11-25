@@ -247,12 +247,18 @@ pub(crate) fn max_stack(lv: &ServerLevel<'_>, stack: &ItemStack) -> u32 {
 }
 
 /// Every slot of the item handler at `pos`, whatever its sides (`bypassSidedness`): each one's
-/// item, count and largest stack there. None when there is none.
+/// item, count and largest stack there (an empty one's `getSlotLimit` for an item that stacks to
+/// 64, read with stone). None when there is none.
 fn container_slots(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Vec<Slot<ItemStack>>> {
     let handler = lv
         .level
         .capability(&mut *lv.host, &mod_api::ITEMS, pos, None)?;
     let size = handler.size(&mut *lv.host);
+    let probe = mod_api::Identifier::parse("minecraft:stone")
+        .ok()
+        .and_then(|i| lv.host.item_key(&i))
+        .and_then(|k| ItemStack::new(k, 1))
+        .map(|s| mod_api::ItemResource::of(&s));
     let mut slots = Vec::with_capacity(size);
     for i in 0..size {
         let amount = handler.amount(&mut *lv.host, i);
@@ -269,7 +275,13 @@ fn container_slots(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> Option<Vec<Slot<I
             _ => Slot {
                 item: None,
                 count: 0,
-                max_stack: 64,
+                // None for stone (a slot that refuses it, as a furnace's fuel slot): 64, as
+                // `getSlotLimit` does not ask what the slot accepts.
+                max_stack: probe
+                    .as_ref()
+                    .map(|p| handler.capacity(&mut *lv.host, i, p))
+                    .filter(|&c| c > 0)
+                    .map_or(64, |c| c.min(64)),
             },
         };
         slots.push(slot);
@@ -496,6 +508,16 @@ pub(crate) fn switch_seen(lv: &mut ServerLevel<'_>, target: [i32; 3]) -> (Seen, 
                 ..Seen::default()
             };
             (seen, Watch::Lazy)
+        }
+        // `isSuitableInventory`: not a stock ticker's inventory, nor a `ProcessingInventory`
+        // (a saw's, a crushing wheel controller's); a fluid handler there is still read.
+        Some((Block::StockTicker | Block::MechanicalSaw | Block::CrushingWheelController, _)) => {
+            let (seen, watch) = seen_at(lv, target, false);
+            let seen = Seen {
+                inventory: None,
+                ..seen.map_inventory(|stack| item_id(lv, &stack))
+            };
+            (seen, watch)
         }
         _ => {
             let (seen, watch) = seen_at(lv, target, false);
@@ -782,8 +804,8 @@ fn set_threshold(lv: &mut ServerLevel<'_>, pos: [i32; 3], values: &str) -> Strin
 }
 
 /// `ConfigureThresholdSwitchPacket.applySettings` on the switch at `pos`: its thresholds,
-/// `setInverted` (the output follows at once) and `inStacks`; it looks at its target again.
-/// False when there is no switch.
+/// `setInverted` (the output follows at once) and `inStacks`; the new thresholds apply at its
+/// next `lazyTick` (`updateCurrentLevel` is not called). False when there is no switch.
 pub(super) fn configure(
     lv: &mut ServerLevel<'_>,
     pos: [i32; 3],
@@ -803,7 +825,6 @@ pub(super) fn configure(
             s.inverted = inverted;
             s.power_after_delay()
         };
-        d.detectors.checks.push(pos);
         Some(follows)
     })
     .flatten();

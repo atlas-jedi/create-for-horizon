@@ -34,6 +34,23 @@ fn keep_extras(dim: usize, key: [i32; 3], c: Carried) {
     }
 }
 
+/// What carriage `key` carries besides its blocks: its glue, contraption controls and the kinds
+/// they turned off (`Contraption.disabledActors`).
+pub fn extras_of(dim: usize, key: [i32; 3]) -> Carried {
+    EXTRAS
+        .with_borrow(|m| m.get(&(dim, key)).cloned())
+        .unwrap_or_default()
+}
+
+/// Carriage `key`'s contraption controls and the kinds they turned off, changed by a click.
+pub fn set_controls(dim: usize, key: [i32; 3], carried: &Carried) {
+    let mut c = extras_of(dim, key);
+    c.controls.clone_from(&carried.controls);
+    c.disabled.clone_from(&carried.disabled);
+    c.actors.clear();
+    EXTRAS.with_borrow_mut(|m| m.insert((dim, key), c));
+}
+
 /// The mounted storage key of carriage `car` of train `train` (no piston, bearing or gantry
 /// keys its contraption at x = `i32::MIN`).
 pub fn key(train: u32, car: usize) -> [i32; 3] {

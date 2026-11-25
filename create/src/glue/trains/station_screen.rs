@@ -434,6 +434,8 @@ pub fn client_message(host: &mut dyn ServerHost, player: PlayerRef, data: &[u8])
         }
         Edit::Assemble { .. } => {
             if assembly::assembling(dim, pos) && assembly::assemble(&mut lv, pos) {
+                // `assemble(player.getUUID())`: the train is theirs (`Train.owner`).
+                super::status::set_owner(dim, pos, player.uuid());
                 assembly::exit_assembly(&mut lv, pos);
             }
         }

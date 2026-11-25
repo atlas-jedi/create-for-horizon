@@ -6,15 +6,17 @@
 //! each chunk line, as Create's); the straight runs between nodes are straight edges, curves are
 //! curved ones. Built once when track changes, never per tick.
 //!
-//! Stations and signals become points on the edges of the track beside them (`EdgePointStorage`,
-//! `TrackTargetingBehaviour`), and signals split the graph into sections (`SignalEdgeGroup`,
-//! `SignalPropagator`): the track between signals, joined through nodes. Signal blocks beside the
-//! same track block are one boundary (`SignalBoundary`, `canMerge`) with two sides, one for each
-//! way a train runs past it. A signal placed with its item keeps the track and the way it picked
-//! (`TrackTargetingBehaviour.targetTrack`, `targetDirection`: a [`Target`]) and stands for the
-//! trains running the way the player looked; one with none (placed by a command, or saved before
-//! signals kept their own) binds to the track beside it and stands for the trains that have it on
-//! their right.
+//! Stations, signals and track observers become points on the edges of the track they picked
+//! (`EdgePointStorage`, `TrackTargetingBehaviour`), and signals split the graph into sections
+//! (`SignalEdgeGroup`, `SignalPropagator`): the track between signals, joined through nodes.
+//! Signals picking the same place are one boundary (`SignalBoundary`, `canMerge`) with two sides,
+//! one for each way a train runs past it. Each block placed with its item keeps the track and the
+//! way it picked (`TrackTargetingBehaviour.targetTrack`, `targetDirection`, and on a curve
+//! `targetBezier`: a [`Target`]), on any track a train runs (straight, diagonal, sloped, or a
+//! curve's segment: `TrackGraphHelper.getGraphLocationAt`, `getBezierGraphLocationAt`), and
+//! stands for the trains running the way the player looked. One with none (placed by a command,
+//! or saved before blocks kept their own) binds to the straight track beside it, a signal
+//! standing for the trains that have it on their right.
 
 use crate::bezier::{Curve, Vec3};
 use crate::graph::{Graph, Point};
@@ -24,6 +26,14 @@ use std::collections::HashMap;
 
 /// A node's place: `TrackNodeLocation`'s half-block x and z, and twice its floored y.
 pub type Key = [i32; 3];
+
+/// `EdgeGroupColor`: the colours a signal section is shown in while a signal is held (yellow,
+/// green, blue, orange, lavender, red, cyan, brown, white), RGB.
+pub const SECTION_COLOURS: [u32; 9] = [
+    0xEBC255, 0x51C054, 0x5391E1, 0xE36E36, 0xCB92BA, 0xA43538, 0x6EDAD9, 0xA17C58, 0xE5E1DC,
+];
+/// `EdgeGroupColor.WHITE`, the colour left when the other eight are taken.
+const WHITE: usize = 8;
 
 fn sub(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] - b[0], a[1] - b[1], a[2] - b[2]]
@@ -97,42 +107,123 @@ pub enum SignalType {
     Cross,
 }
 
-/// What a signal block picked with its item (`TrackTargetingBehaviour`): its track block
-/// (`targetTrack`, here where it is, not from the signal) and `targetDirection` (`front`: true
-/// for `POSITIVE`, picked looking against the track's first axis).
+/// A place on a curve (`BezierTrackPointLocation`): the curve's other track block
+/// (`curveTarget`, the key of the curve in its first block's connections) and the segment
+/// picked (`segment`, half a block each).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct BezierPoint {
+    pub to: [i32; 3],
+    pub segment: i32,
+}
+
+/// What a station, signal or track observer picked with its item (`TrackTargetingBehaviour`): its
+/// track block (`targetTrack`, here where it is, not from the block), `targetDirection` (`front`:
+/// true for `POSITIVE`, picked looking against the track's first axis, or against a curve's run)
+/// and, on a curve, `targetBezier` (`track` is then the curve's first block).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Target {
     pub track: [i32; 3],
     pub front: bool,
+    pub bezier: Option<BezierPoint>,
 }
 
 impl Target {
-    /// The way along the track (x and z) the trains it stands for run: against the track's first
-    /// axis when `front` (`getGraphLocationAt` puts the point on the edge running against the
-    /// axis, and a `front` block takes the boundary's first side, the trains running toward that
-    /// edge's end), else along it; the way the player looked. None when the track is not straight
-    /// along x or z.
-    pub fn travel(self, shape: TrackShape) -> Option<[i32; 2]> {
-        let axis = match shape {
-            TrackShape::Xo => [1, 0],
-            TrackShape::Zo => [0, 1],
-            _ => return None,
-        };
-        let s = if self.front { -1 } else { 1 };
-        Some([axis[0] * s, axis[1] * s])
+    /// `TrackTargetingBlockItem.useOn`'s pick on track `shape` looked at along `look`
+    /// (`getNearestTrackAxis`): `front` when the look runs against its axis' horizontal part.
+    /// None on a junction (`no_junctions`).
+    pub fn pick(track: [i32; 3], shape: TrackShape, look: [f64; 3]) -> Option<Target> {
+        if shape.is_junction() {
+            return None;
+        }
+        let axis = shape.axes()[0];
+        let flat = normalize([axis[0], 0.0, axis[2]]);
+        let front = dot(look, flat) < 0.0;
+        Some(Target {
+            track,
+            front,
+            bezier: None,
+        })
     }
 
-    /// `TrackTargetingBlockItem.useOn`'s pick on straight track `shape` looked at along `look`
-    /// (`getNearestTrackAxis`): `front` when the look runs against its axis.
-    pub fn pick(track: [i32; 3], shape: TrackShape, look: [f64; 3]) -> Option<Target> {
-        let axis = match shape {
-            TrackShape::Xo => [1.0, 0.0],
-            TrackShape::Zo => [0.0, 1.0],
-            _ => return None,
-        };
-        let front = look[0] * axis[0] + look[2] * axis[1] < 0.0;
-        Some(Target { track, front })
+    /// `useOnCurve`'s pick on segment `segment` of the curve from `track` to `to`: `front` when
+    /// the look runs against the curve there.
+    pub fn on_curve(track: [i32; 3], to: [i32; 3], segment: i32, front: bool) -> Target {
+        Target {
+            track,
+            front,
+            bezier: Some(BezierPoint { to, segment }),
+        }
     }
+}
+
+/// `EdgePointType`: what a track-targeting block puts on the track.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PointKind {
+    Station,
+    Signal,
+    Observer,
+}
+
+/// `TrackTargetingBlockItem.OverlapResult`: whether a pick can take a point, and the
+/// `track_target.*` key saying why not.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Overlap {
+    Valid,
+    Occupied,
+    Junction,
+    NoTrack,
+}
+
+impl Overlap {
+    /// `feedback`: the lang key's last part (`create.track_target.` + this).
+    pub fn feedback(self) -> Option<&'static str> {
+        match self {
+            Overlap::Valid => None,
+            Overlap::Occupied => Some("occupied"),
+            Overlap::Junction => Some("no_junctions"),
+            Overlap::NoTrack => Some("invalid"),
+        }
+    }
+}
+
+/// `StationBlockEntity`'s track to assemble on (`edgePoint.isOrthogonal`): the track its pick is
+/// on when that is straight along x or z (none on a curve or a slope), or with no pick the
+/// straight track beside it.
+pub fn station_track(
+    tracks: &HashMap<[i32; 3], TrackShape>,
+    targets: &HashMap<[i32; 3], Target>,
+    pos: [i32; 3],
+) -> Option<[i32; 3]> {
+    match targets.get(&pos) {
+        Some(t) => (t.bezier.is_none()
+            && matches!(tracks.get(&t.track), Some(TrackShape::Xo | TrackShape::Zo)))
+        .then_some(t.track),
+        None => target_track(tracks, pos),
+    }
+}
+
+/// `StationBlockEntity.getAssemblyDirection` for a station that picked straight track `shape`:
+/// the nearest direction (x and z) to the track's axis times its target direction.
+pub fn assembly_direction(shape: TrackShape, target: &Target) -> [i32; 3] {
+    let axis = shape.axes()[0];
+    let s = if target.front { 1.0 } else { -1.0 };
+    nearest_horizontal([axis[0] * s, axis[1] * s, axis[2] * s])
+}
+
+/// `Direction.getNearest(x, 0, z)` as a unit along x or z (`getNearest`'s first best wins: north,
+/// south, west, east in its order; north when none is ahead at all).
+pub fn nearest_horizontal(v: Vec3) -> [i32; 3] {
+    let mut best = [0, 0, -1];
+    // `Float.MIN_VALUE`.
+    let mut best_dot = f64::from(f32::from_bits(1));
+    for d in [[0, 0, -1], [0, 0, 1], [-1, 0, 0], [1, 0, 0]] {
+        let p = v[0] * f64::from(d[0]) + v[2] * f64::from(d[2]);
+        if p > best_dot {
+            best_dot = p;
+            best = d;
+        }
+    }
+    best
 }
 
 /// A signal boundary (`SignalBoundary`): where it stands (on the piece's even edge), and for each
@@ -159,6 +250,8 @@ pub fn side_of(edge: usize) -> usize {
 struct Segment {
     ends: [Key; 2],
     turn: Option<Curve>,
+    /// A curve's first track block and its other (`bePositions`).
+    curve: Option<([i32; 3], [i32; 3])>,
     block: Option<[i32; 3]>,
     direction: Vec3,
 }
@@ -173,13 +266,16 @@ pub struct Network {
     pub blocks: HashMap<[i32; 3], Location>,
     /// Stations bound to the graph: their block and where on it.
     pub stations: Vec<([i32; 3], Location)>,
-    /// Signal boundaries (`SignalBoundary`), each where its track block's centre is.
+    /// Signal boundaries (`SignalBoundary`), each where the track it picked is.
     pub signals: Vec<Boundary>,
-    /// Each signal block on a boundary: its track block and the way (x and z) the trains it stands
-    /// for run.
-    pub signal_ways: HashMap<[i32; 3], ([i32; 3], [i32; 2])>,
+    /// Each station, signal and observer bound to the graph: the track and way it stands for
+    /// (its own pick, or for a signal or observer with none, the one it was given beside its
+    /// track).
+    pub bound: HashMap<[i32; 3], Target>,
     /// Track observers bound to the graph: their block and where on the piece's even edge.
     pub observers: Vec<([i32; 3], Location)>,
+    /// Each curve's edge from its first track block's end to its other's, by the two blocks.
+    pub curve_edges: HashMap<([i32; 3], [i32; 3]), usize>,
     /// Per edge, what stands on it, by how far along it.
     pub marks: Vec<Vec<(f64, Mark)>>,
     /// Signal sections: each piece of track's first slot (its stretches between signals are
@@ -265,6 +361,7 @@ impl Network {
                 segments.push(Segment {
                     ends: [key(sub(centre, half)), key(add(centre, half))],
                     turn: None,
+                    curve: None,
                     block: Some(*p),
                     direction: normalize(*axis),
                 });
@@ -274,6 +371,7 @@ impl Network {
                         segments.push(Segment {
                             ends: [key(centre), key(add(centre, scale(*axis, side)))],
                             turn: None,
+                            curve: None,
                             block: None,
                             direction: normalize(*axis),
                         });
@@ -288,10 +386,11 @@ impl Network {
             .filter(|(p, c)| tracks.contains_key(*p) && tracks.contains_key(&c.to))
             .collect();
         turns.sort_unstable_by_key(|(p, c)| (**p, c.to));
-        for (_, c) in turns {
+        for (p, c) in turns {
             segments.push(Segment {
                 ends: [key(c.curve.starts[0]), key(c.curve.starts[1])],
                 turn: Some(c.curve.clone()),
+                curve: Some((*p, c.to)),
                 block: None,
                 direction: [0.0; 3],
             });
@@ -364,6 +463,10 @@ impl Network {
                 });
                 let e = net.graph.edges.len();
                 net.graph.connect(a, b, turn);
+                if let Some(blocks) = segments[first].curve {
+                    let forward = segments[first].ends[0] == start;
+                    net.curve_edges.insert(blocks, if forward { e } else { e ^ 1 });
+                }
                 for &(block, along) in &on {
                     net.blocks.insert(
                         block,
@@ -377,46 +480,56 @@ impl Network {
         }
         net.marks = vec![Vec::new(); net.graph.edges.len()];
         for &pos in stations {
-            if let Some(loc) = target_track(tracks, pos).and_then(|t| net.blocks.get(&t)) {
-                let mark = Mark::Station(net.stations.len());
-                net.stations.push((pos, *loc));
-                net.mark(*loc, mark);
+            // Its own pick (`createEdgePoint` on `determineGraphLocation`), else the track beside
+            // it.
+            let loc = match targets.get(&pos) {
+                Some(t) => net.place(tracks, t),
+                None => target_track(tracks, pos).and_then(|t| net.blocks.get(&t).copied()),
+            };
+            // `createEdgePoint`: another point exactly there keeps it off the graph.
+            let Some(loc) = loc.filter(|l| !net.taken(*l)) else {
+                continue;
+            };
+            if let Some(t) = targets.get(&pos) {
+                net.bound.insert(pos, *t);
             }
+            let mark = Mark::Station(net.stations.len());
+            net.stations.push((pos, loc));
+            net.mark(loc, mark);
         }
         let mut signals: Vec<([i32; 3], SignalType)> = signals.to_vec();
         signals.sort_unstable_by_key(|s| s.0);
         for &(pos, kind) in &signals {
-            // Its own pick (`targetTrack`, `targetDirection`), else the track beside it.
-            let picked = targets.get(&pos).and_then(|t| {
-                let way = t.travel(*tracks.get(&t.track)?)?;
-                Some((t.track, way))
-            });
-            let Some(track) = picked.map(|p| p.0).or_else(|| target_track(tracks, pos)) else {
+            // Its own pick (`targetTrack`, `targetDirection`, `targetBezier`), else the track
+            // beside it, for the trains that have it on their right: the place on the edge the
+            // trains it stands for run along, and the pick it stands for.
+            let placed = match targets.get(&pos) {
+                Some(t) => net.place(tracks, t).map(|l| (l, *t)),
+                None => net.beside(tracks, pos, true),
+            };
+            let Some((place, target)) = placed else {
                 continue;
             };
-            let Some(&loc) = net.blocks.get(&track) else {
-                continue;
-            };
-            // On the piece's even edge, facing its way.
-            let at = if loc.edge.is_multiple_of(2) {
-                loc
+            // On the piece's even edge, side 0 for the trains running along it.
+            let (at, side) = if place.edge.is_multiple_of(2) {
+                (place, 0)
             } else {
-                Location {
-                    edge: loc.edge ^ 1,
-                    position: net.graph.length(loc.edge) - loc.position,
-                }
+                let at = Location {
+                    edge: place.edge ^ 1,
+                    position: net.graph.length(place.edge) - place.position,
+                };
+                (at, 1)
             };
-            let d = net.graph.direction(at.edge, true);
-            // Side 0 for the trains running along the even edge.
-            let way = picked.map_or_else(|| net.facing(at.edge, track, pos), |p| p.1);
-            let side = usize::from(f64::from(way[0]) * d[0] + f64::from(way[1]) * d[2] < 0.0);
-            net.signal_ways.insert(pos, (track, way));
             let b =
                 match net.signals.iter().position(|b| {
                     b.at.edge == at.edge && (b.at.position - at.position).abs() < 1.0e-6
                 }) {
                     Some(b) => b,
                     None => {
+                        // A station or observer exactly there keeps a new signal off it.
+                        if net.taken(at) {
+                            continue;
+                        }
                         net.signals.push(Boundary {
                             at,
                             ..Boundary::default()
@@ -425,6 +538,7 @@ impl Network {
                         net.signals.len() - 1
                     }
                 };
+            net.bound.insert(pos, target);
             let boundary = &mut net.signals[b];
             // `blockEntityAdded`: the side takes its first block's type.
             if boundary.blocks[side].is_empty() {
@@ -440,15 +554,20 @@ impl Network {
         net
     }
 
-    /// Track observers on the track beside them (`TrackTargetingBehaviour`, as stations are
-    /// placed), each on its piece's even edge; they split no section.
+    /// Track observers on the track they picked (`targets`), else the straight track beside
+    /// them, each on its piece's even edge; they split no section.
     pub fn bind_observers(
         &mut self,
         tracks: &HashMap<[i32; 3], TrackShape>,
         observers: &[[i32; 3]],
+        targets: &HashMap<[i32; 3], Target>,
     ) {
         for &pos in observers {
-            let Some(&loc) = target_track(tracks, pos).and_then(|t| self.blocks.get(&t)) else {
+            let placed = match targets.get(&pos) {
+                Some(t) => self.place(tracks, t).map(|l| (l, *t)),
+                None => self.beside(tracks, pos, false),
+            };
+            let Some((loc, target)) = placed.filter(|(l, _)| !self.taken(*l)) else {
                 continue;
             };
             let at = if loc.edge.is_multiple_of(2) {
@@ -459,6 +578,7 @@ impl Network {
                     position: self.graph.length(loc.edge) - loc.position,
                 }
             };
+            self.bound.insert(pos, target);
             let mark = Mark::Observer(self.observers.len());
             self.observers.push((pos, at));
             self.mark(at, mark);
@@ -466,6 +586,139 @@ impl Network {
         for m in &mut self.marks {
             m.sort_by(|a, b| a.0.total_cmp(&b.0));
         }
+    }
+
+    /// `TrackGraphHelper.getGraphLocationAt` (straight, diagonal or sloped track) and
+    /// `getBezierGraphLocationAt` (a curve's segment) for `target`, as `createEdgePoint` puts its
+    /// point: the place on the edge the trains it stands for run along. On straight track that is
+    /// the block's centre on the edge running against the track's first axis when `front`, along
+    /// it otherwise; on a curve, `(segment + 1) / 2` from the curve's first end on the edge from
+    /// it, or as far from the first end on the edge toward it when `front`. None when the track
+    /// is a junction or not on the graph, or the curve is gone.
+    pub fn place(
+        &self,
+        tracks: &HashMap<[i32; 3], TrackShape>,
+        target: &Target,
+    ) -> Option<Location> {
+        if let Some(b) = target.bezier {
+            if !tracks.contains_key(&target.track) {
+                return None;
+            }
+            let &e = self.curve_edges.get(&(target.track, b.to))?;
+            let length = self.graph.length(e);
+            let along = f64::from((b.segment + 1) as f32 / 2.0);
+            return Some(if target.front {
+                Location {
+                    edge: e ^ 1,
+                    position: length - along,
+                }
+            } else {
+                Location {
+                    edge: e,
+                    position: along,
+                }
+            });
+        }
+        let shape = *tracks.get(&target.track)?;
+        if shape.is_junction() || shape == TrackShape::None {
+            return None;
+        }
+        let loc = *self.blocks.get(&target.track)?;
+        let axis = shape.axes()[0];
+        let travel = if target.front {
+            scale(axis, -1.0)
+        } else {
+            axis
+        };
+        Some(if dot(self.graph.direction(loc.edge, true), travel) < 0.0 {
+            Location {
+                edge: loc.edge ^ 1,
+                position: self.graph.length(loc.edge) - loc.position,
+            }
+        } else {
+            loc
+        })
+    }
+
+    /// `TrackTargetingBlockItem.withGraphLocation` for a `kind` picking `target`: a junction (on
+    /// no curve) refused, a place off the graph `NO_TRACK`, and `OCCUPIED` when another point of
+    /// its edge is within 0.75 of it, save a signal within 0.25 of a new signal
+    /// (`canCoexistWith`), which it joins.
+    pub fn overlap(
+        &self,
+        tracks: &HashMap<[i32; 3], TrackShape>,
+        target: &Target,
+        kind: PointKind,
+    ) -> Overlap {
+        let Some(shape) = tracks.get(&target.track) else {
+            return Overlap::NoTrack;
+        };
+        if target.bezier.is_none() && shape.is_junction() {
+            return Overlap::Junction;
+        }
+        let Some(loc) = self.place(tracks, target) else {
+            return Overlap::NoTrack;
+        };
+        let occupied = self.marks[loc.edge].iter().any(|&(at, mark)| {
+            let d = (at - loc.position).abs();
+            d <= 0.75
+                && !(kind == PointKind::Signal && matches!(mark, Mark::Signal(_)) && d < 0.25)
+        });
+        if occupied {
+            Overlap::Occupied
+        } else {
+            Overlap::Valid
+        }
+    }
+
+    /// Whether a point stands exactly at `loc` (`EdgeData.get`, within `Mth.equal`).
+    fn taken(&self, loc: Location) -> bool {
+        self.marks[loc.edge]
+            .iter()
+            .any(|&(at, _)| (at - loc.position).abs() < 1.0e-5)
+    }
+
+    /// A block with no pick of its own, on the straight track beside it: the place of the track
+    /// block's centre on the edge running the way it is given (for a signal, the way of the
+    /// trains having it on their right; for an observer, the way it looks), and that as a pick.
+    fn beside(
+        &self,
+        tracks: &HashMap<[i32; 3], TrackShape>,
+        pos: [i32; 3],
+        signal: bool,
+    ) -> Option<(Location, Target)> {
+        let track = target_track(tracks, pos)?;
+        let loc = *self.blocks.get(&track)?;
+        let even = if loc.edge.is_multiple_of(2) {
+            loc
+        } else {
+            Location {
+                edge: loc.edge ^ 1,
+                position: self.graph.length(loc.edge) - loc.position,
+            }
+        };
+        let way = self.facing(even.edge, track, pos);
+        let axis = tracks[&track].axes()[0];
+        let along = f64::from(way[0]) * axis[0] + f64::from(way[1]) * axis[2];
+        // A signal's marker faces against its trains, an observer's the way it looks
+        // (`prepareTrackOverlay` turns it to the axis times the target direction).
+        let front = if signal { along < 0.0 } else { along > 0.0 };
+        let target = Target {
+            track,
+            front,
+            bezier: None,
+        };
+        let d = self.graph.direction(even.edge, true);
+        let runs_along = f64::from(way[0]) * d[0] + f64::from(way[1]) * d[2] >= 0.0;
+        let place = if !signal || runs_along {
+            even
+        } else {
+            Location {
+                edge: even.edge ^ 1,
+                position: self.graph.length(even.edge) - even.position,
+            }
+        };
+        Some((place, target))
     }
 
     /// Whether the train whose wheel points are `points` (front first, all facing its front)
@@ -543,18 +796,6 @@ impl Network {
         n
     }
 
-    /// `TrackTargetingBlockItem.withGraphLocation`'s overlap for a signal picking the straight
-    /// track block `track`: None when it is on no edge (`NO_TRACK`); Some(true) when another
-    /// point stands within 0.75 of its centre (`OCCUPIED`), save a signal at the same place
-    /// (within 0.25, `canCoexistWith`), which the new one joins.
-    pub fn signal_overlap(&self, track: [i32; 3]) -> Option<bool> {
-        let loc = self.blocks.get(&track)?;
-        Some(self.marks[loc.edge].iter().any(|&(at, mark)| {
-            let d = (at - loc.position).abs();
-            d <= 0.75 && !(matches!(mark, Mark::Signal(_)) && d < 0.25)
-        }))
-    }
-
     /// The way along the track a block beside it at `pos` looks, from the track block `track`
     /// it targets, on even edge `edge`: the edge's way when the block is on its right, else
     /// back (the trains a signal with no pick of its own stands for), snapped to x or z.
@@ -570,14 +811,13 @@ impl Network {
         [(d[0] * s).round() as i32, (d[2] * s).round() as i32]
     }
 
-    /// `TrackTargetingBehaviour.render` for the signal at `pos`: its track block, the way the
-    /// marker's model is turned to (`prepareTrackOverlay`'s `diff`, the track's axis times the
-    /// target direction: against the trains it stands for, as the model's arrow points back
-    /// along it), and how its marker shows (`SignalBoundary.getOverlayFor`: the first block of
-    /// the boundary's first side with one draws it, `DUAL` when the other side has blocks too;
-    /// the rest skip). None when it is on no boundary or skips.
-    pub fn signal_marker(&self, pos: [i32; 3]) -> Option<([i32; 3], [i32; 2], bool)> {
-        let &(track, way) = self.signal_ways.get(&pos)?;
+    /// `TrackTargetingBehaviour.render` for the signal at `pos`: the pick it stands for (its
+    /// track, target direction and curve point, from which `prepareTrackOverlay` turns the
+    /// marker), and how its marker shows (`SignalBoundary.getOverlayFor`: the first block of the
+    /// boundary's first side with one draws it, `DUAL` when the other side has blocks too; the
+    /// rest skip). None when it is on no boundary or skips.
+    pub fn signal_marker(&self, pos: [i32; 3]) -> Option<(Target, bool)> {
+        let &target = self.bound.get(&pos)?;
         let b = self
             .signals
             .iter()
@@ -587,19 +827,19 @@ impl Network {
             return None;
         }
         let dual = first == 0 && !b.blocks[1].is_empty();
-        Some((track, [-way[0], -way[1]], dual))
+        Some((target, dual))
     }
 
-    /// `TrackTargetingBehaviour.render` for the track observer at `pos`: its track block and the
-    /// way it looks.
-    pub fn observer_marker(
-        &self,
-        tracks: &HashMap<[i32; 3], TrackShape>,
-        pos: [i32; 3],
-    ) -> Option<([i32; 3], [i32; 2])> {
-        let track = target_track(tracks, pos)?;
-        let (_, at) = self.observers.iter().find(|o| o.0 == pos)?;
-        Some((track, self.facing(at.edge, track, pos)))
+    /// `TrackTargetingBehaviour.render` for the track observer at `pos`: the pick it stands for.
+    pub fn observer_marker(&self, pos: [i32; 3]) -> Option<Target> {
+        self.observers.iter().find(|o| o.0 == pos)?;
+        self.bound.get(&pos).copied()
+    }
+
+    /// The pick a station bound to the graph stands for (None for one with no pick of its own).
+    pub fn station_marker(&self, pos: [i32; 3]) -> Option<Target> {
+        self.stations.iter().find(|s| s.0 == pos)?;
+        self.bound.get(&pos).copied()
     }
 
     fn mark(&mut self, loc: Location, mark: Mark) {
@@ -687,6 +927,125 @@ impl Network {
         } else {
             self.section(at.edge ^ 1, self.graph.length(at.edge) - at.position)
         }
+    }
+
+    /// `SignalEdgeGroup.resolveColor` for every section: the `EdgeGroupColor` (an index into
+    /// [`SECTION_COLOURS`]) of each section by its id, the first colour none of the sections
+    /// across its signals has (`findNextAvailable`; white when all eight are taken). Create
+    /// resolves a section's colour as its signal is placed and keeps it; here each section takes
+    /// its colour as the boundaries come, in order, against those already coloured, so sections
+    /// side by side still differ. Track with no signal on its network is the graph's fallback
+    /// section (`putGraphWithDefaultGroup`), which keeps the default yellow.
+    pub fn section_colours(&self) -> HashMap<usize, usize> {
+        let mut order: Vec<usize> = Vec::new();
+        let mut adjacent: HashMap<usize, Vec<usize>> = HashMap::new();
+        for b in 0..self.signals.len() {
+            let sides = [self.beyond(b, 0), self.beyond(b, 1)];
+            for (k, s) in sides.into_iter().enumerate() {
+                if !order.contains(&s) {
+                    order.push(s);
+                }
+                let other = sides[1 - k];
+                if other != s {
+                    let list = adjacent.entry(s).or_default();
+                    if !list.contains(&other) {
+                        list.push(other);
+                    }
+                }
+            }
+        }
+        let mut colours: HashMap<usize, usize> = HashMap::new();
+        for s in order {
+            // `strikeFrom`: white strikes nothing.
+            let mask = adjacent
+                .get(&s)
+                .into_iter()
+                .flatten()
+                .filter_map(|a| colours.get(a))
+                .filter(|&&c| c != WHITE)
+                .fold(0u32, |m, &c| m | 1 << c);
+            let colour = (0..SECTION_COLOURS.len())
+                .find(|&c| mask & (1 << c) == 0)
+                .unwrap_or(WHITE);
+            colours.insert(s, colour);
+        }
+        colours
+    }
+
+    /// `TrackGraphVisualizer.visualiseSignalEdgeGroups`, as a signal in hand shows it: every
+    /// piece of track with an end within 50 blocks of `eye`, drawn 5/64 above the track in the
+    /// colour of the section each stretch of it is in (`SignalEdgeGroup.color`), with a gap at
+    /// each signal (1/16 block each side on straight track, 1/8 on a curve, which is drawn as its
+    /// segments' chords). Each line: its ends and its colour (RGB).
+    pub fn signal_overlay(&self, eye: Vec3) -> Vec<(Vec3, Vec3, u32)> {
+        let colours = self.section_colours();
+        let rgb = |section: usize| SECTION_COLOURS[colours.get(&section).copied().unwrap_or(0)];
+        let lift = [0.0, f64::from(5.0f32 / 64.0), 0.0];
+        let mut out = Vec::new();
+        let mut line = |a: Vec3, b: Vec3, colour: u32| {
+            if a != b {
+                out.push((add(a, lift), add(b, lift), colour));
+            }
+        };
+        let g = &self.graph;
+        for u in 0..g.edges.len() / 2 {
+            let e = u * 2;
+            let (from, to) = (g.nodes[g.edges[e].from], g.nodes[g.edges[e].to]);
+            if length(sub(from, eye)) > 50.0 && length(sub(to, eye)) > 50.0 {
+                continue;
+            }
+            let mut signals: Vec<f64> = self.marks[e]
+                .iter()
+                .filter(|(_, m)| matches!(m, Mark::Signal(_)))
+                .map(|(p, _)| *p)
+                .collect();
+            signals.sort_by(f64::total_cmp);
+            let stretch = |k: usize| rgb(self.section_of[self.slot_base[u] + k]);
+            let len = g.length(e);
+            let at = |t: f64| g.position(e, t);
+            match &g.edges[e].turn {
+                None if signals.is_empty() => line(at(0.0), at(1.0), stretch(0)),
+                None => {
+                    let gap = f64::from(1.0f32 / 16.0) / len;
+                    let mut prev = 0.0;
+                    for (k, p) in signals.iter().enumerate() {
+                        let start = prev + if prev == 0.0 { 0.0 } else { gap };
+                        prev = p / len;
+                        line(at(start), at(prev - gap), stretch(k));
+                    }
+                    line(at(prev + gap), at(1.0), stretch(signals.len()));
+                }
+                Some(curve) => {
+                    let width = f64::from(1.0f32 / 8.0);
+                    let count = curve.segments.max(1);
+                    let mut next = signals.iter().copied().enumerate();
+                    let mut boundary = next.next();
+                    let mut colour = stretch(0);
+                    let mut previous: Option<Vec3> = None;
+                    for i in 0..=count {
+                        let f = f64::from(i as f32 / count as f32);
+                        let position = f * curve.length;
+                        let mut current = at(f);
+                        if let Some(prev) = previous {
+                            let mut from = prev;
+                            if let Some((k, b)) = boundary
+                                && position > b
+                            {
+                                current = at((b - width) / curve.length);
+                                line(from, current, colour);
+                                current = at((b + width) / curve.length);
+                                from = current;
+                                colour = stretch(k + 1);
+                                boundary = next.next();
+                            }
+                            line(from, current, colour);
+                        }
+                        previous = Some(current);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// `SignalPropagator.collectChainedSignals` for every cross signal side: the boundaries a
@@ -907,6 +1266,77 @@ mod tests {
     }
 
     #[test]
+    fn a_network_with_no_signal_shows_in_the_fallback_yellow() {
+        let mut t = HashMap::new();
+        line(&mut t, [0, 64, 0], [1, 0, 0], 10, TrackShape::Xo);
+        let n = Network::build(&t, &Curves::default(), &[], &[]);
+        let lines = n.signal_overlay([5.0, 65.6, 0.5]);
+        assert_eq!(lines.len(), 1);
+        let (a, b, rgb) = lines[0];
+        assert_eq!(rgb, SECTION_COLOURS[0]);
+        let lift = f64::from(5.0f32 / 64.0);
+        assert_eq!(a, [0.0, 64.0 + lift, 0.5]);
+        assert_eq!(b, [10.0, 64.0 + lift, 0.5]);
+        // Out of reach: nothing.
+        assert!(n.signal_overlay([200.0, 64.0, 0.5]).is_empty());
+    }
+
+    #[test]
+    fn signals_split_the_overlay_into_sections_of_their_own_colours() {
+        let mut t = HashMap::new();
+        line(&mut t, [0, 64, 0], [1, 0, 0], 15, TrackShape::Xo);
+        let n = Network::build(
+            &t,
+            &Curves::default(),
+            &[],
+            &[
+                ([5, 64, 1], SignalType::Entry),
+                ([10, 64, -1], SignalType::Entry),
+            ],
+        );
+        let colours = n.section_colours();
+        let e = n.blocks[&[0, 64, 0]].edge;
+        let (a, b, c) = (n.section(e, 2.0), n.section(e, 7.0), n.section(e, 13.0));
+        // Each section differs from the one across its signal.
+        assert_ne!(colours[&a], colours[&b]);
+        assert_ne!(colours[&b], colours[&c]);
+        let lines = n.signal_overlay([7.0, 65.6, 0.5]);
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        // A gap of 1/16 either side of each signal (at x = 5.5 and 10.5).
+        let gap = f64::from(1.0f32 / 16.0);
+        let xs: Vec<(f64, f64)> = lines.iter().map(|(p, q, _)| (p[0], q[0])).collect();
+        assert!((xs[0].0 - 0.0).abs() < 1e-6 && (xs[0].1 - (5.5 - gap)).abs() < 1e-4, "{xs:?}");
+        assert!((xs[1].0 - (5.5 + gap)).abs() < 1e-4 && (xs[1].1 - (10.5 - gap)).abs() < 1e-4);
+        assert!((xs[2].0 - (10.5 + gap)).abs() < 1e-4 && (xs[2].1 - 15.0).abs() < 1e-6);
+        let rgb: Vec<u32> = lines.iter().map(|l| l.2).collect();
+        assert_eq!(rgb[0], SECTION_COLOURS[colours[&a]]);
+        assert_eq!(rgb[1], SECTION_COLOURS[colours[&b]]);
+        assert_eq!(rgb[2], SECTION_COLOURS[colours[&c]]);
+    }
+
+    #[test]
+    fn a_curve_shows_as_its_segments_chords() {
+        let mut t = HashMap::new();
+        t.insert([0, 64, 0], TrackShape::Xo);
+        t.insert([8, 64, 8], TrackShape::Zo);
+        let mut c = Curves::default();
+        c.add(Saved {
+            from: [0, 64, 0],
+            to: [8, 64, 8],
+            starts: [[1.0, 64.0, 0.5], [8.5, 64.0, 8.0]],
+            axes: [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+            normals: [UP, UP],
+            girder: false,
+        });
+        let n = Network::build(&t, &c, &[], &[]);
+        let curve = n.graph.edges.iter().find_map(|e| e.turn.clone()).unwrap();
+        let lines = n.signal_overlay([4.0, 65.0, 4.0]);
+        // The curve's segments, plus the two track blocks' own runs.
+        assert_eq!(lines.len(), curve.segments + 2, "{}", lines.len());
+        assert!(lines.iter().all(|l| l.2 == SECTION_COLOURS[0]));
+    }
+
+    #[test]
     fn signals_split_the_track_into_sections() {
         let mut t = HashMap::new();
         line(&mut t, [0, 64, 0], [1, 0, 0], 15, TrackShape::Xo);
@@ -1002,9 +1432,8 @@ mod tests {
         let east = Target::pick([5, 64, 0], TrackShape::Xo, [1.0, -0.5, 0.1]).unwrap();
         let west = Target::pick([10, 64, 0], TrackShape::Xo, [-1.0, -0.5, 0.1]).unwrap();
         assert!(!east.front && west.front);
-        assert_eq!(east.travel(TrackShape::Xo), Some([1, 0]));
-        assert_eq!(west.travel(TrackShape::Xo), Some([-1, 0]));
-        assert_eq!(Target::pick([0; 3], TrackShape::Pd, [1.0, 0.0, 0.0]), None);
+        assert!(Target::pick([0; 3], TrackShape::Pd, [1.0, 0.0, 0.0]).is_some());
+        assert_eq!(Target::pick([0; 3], TrackShape::CrO, [1.0, 0.0, 0.0]), None);
         // North of the track (where the rule of the right would make them westbound) and one
         // further away, and a signal with no pick beside x = 15.
         let targets = HashMap::from([([5, 64, -1], east), ([10, 64, -3], west)]);
@@ -1038,18 +1467,207 @@ mod tests {
         assert_eq!(at(5.5).blocks[east_side], [[5, 64, -1]]);
         assert_eq!(at(10.5).blocks[1 - east_side], [[10, 64, -3]]);
         assert_eq!(at(15.5).blocks[1 - east_side], [[15, 64, -1]]);
-        // The marker's model turned against the trains it stands for.
-        assert_eq!(
-            n.signal_marker([5, 64, -1]),
-            Some(([5, 64, 0], [-1, 0], false))
+        // The marker stands for each pick; the one with none for the westbound trains, its
+        // model turned east (the axis, `front`).
+        assert_eq!(n.signal_marker([5, 64, -1]), Some((east, false)));
+        assert_eq!(n.signal_marker([10, 64, -3]), Some((west, false)));
+        let legacy = Target {
+            track: [15, 64, 0],
+            front: true,
+            bezier: None,
+        };
+        assert_eq!(n.signal_marker([15, 64, -1]), Some((legacy, false)));
+    }
+
+    /// The direction of edge `e` at its start.
+    fn heading(n: &Network, e: usize) -> Vec3 {
+        n.graph.direction(e, true)
+    }
+
+    fn at_place(n: &Network, l: Location) -> Vec3 {
+        let span = n.graph.length(l.edge);
+        n.graph.position(l.edge, l.position / span)
+    }
+
+    fn near(a: Vec3, b: Vec3) -> bool {
+        (0..3).all(|k| (a[k] - b[k]).abs() < 1e-4)
+    }
+
+    #[test]
+    fn points_go_on_diagonal_and_sloped_track() {
+        let mut t = HashMap::new();
+        line(&mut t, [0, 64, 0], [1, 0, 1], 10, TrackShape::Pd);
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        // Looking along the diagonal (+x +z): the trains running that way.
+        let along = Target::pick([4, 64, 4], TrackShape::Pd, [h, -0.3, h]).unwrap();
+        assert!(!along.front);
+        let back = Target::pick([6, 64, 6], TrackShape::Pd, [-h, -0.3, -h]).unwrap();
+        assert!(back.front);
+        let targets = HashMap::from([
+            ([4, 64, 5], along),
+            ([6, 64, 7], back),
+            ([2, 64, 3], Target::pick([2, 64, 2], TrackShape::Pd, [h, 0.0, h]).unwrap()),
+        ]);
+        let n = Network::build_targeted(
+            &t,
+            &Curves::default(),
+            &[[2, 64, 3]],
+            &[
+                ([4, 64, 5], SignalType::Entry),
+                ([6, 64, 7], SignalType::Entry),
+            ],
+            &targets,
         );
-        assert_eq!(
-            n.signal_marker([10, 64, -3]),
-            Some(([10, 64, 0], [1, 0], false))
+        let l = n.place(&t, &along).unwrap();
+        assert!(near(at_place(&n, l), [4.5, 64.0, 4.5]), "{l:?}");
+        assert!(dot(heading(&n, l.edge), [1.0, 0.0, 1.0]) > 0.0);
+        let l = n.place(&t, &back).unwrap();
+        assert!(near(at_place(&n, l), [6.5, 64.0, 6.5]));
+        assert!(dot(heading(&n, l.edge), [1.0, 0.0, 1.0]) < 0.0);
+        // Both signals on the diagonal, for opposite ways; the station too.
+        assert_eq!(n.signals.len(), 2);
+        let sides: Vec<usize> = n
+            .signals
+            .iter()
+            .map(|b| if b.blocks[0].is_empty() { 1 } else { 0 })
+            .collect();
+        assert_ne!(sides[0], sides[1]);
+        assert_eq!(n.stations.len(), 1);
+        assert!(near(at_place(&n, n.stations[0].1), [2.5, 64.0, 2.5]));
+
+        // A ramp rising south: its centre half a block up.
+        let mut t = HashMap::new();
+        line(&mut t, [0, 64, 0], [0, 1, 1], 4, TrackShape::As);
+        let up = Target::pick([0, 65, 1], TrackShape::As, [0.0, 0.0, 1.0]).unwrap();
+        assert!(!up.front);
+        let n = Network::build_targeted(
+            &t,
+            &Curves::default(),
+            &[],
+            &[([1, 65, 1], SignalType::Entry)],
+            &HashMap::from([([1, 65, 1], up)]),
         );
-        assert_eq!(
-            n.signal_marker([15, 64, -1]),
-            Some(([15, 64, 0], [1, 0], false))
+        let l = n.place(&t, &up).unwrap();
+        assert!(near(at_place(&n, l), [0.5, 65.5, 1.5]), "{:?}", at_place(&n, l));
+        assert!(dot(heading(&n, l.edge), [0.0, 1.0, 1.0]) > 0.0);
+        assert_eq!(n.signals.len(), 1);
+        assert_eq!(n.signal_marker([1, 65, 1]), Some((up, false)));
+    }
+
+    #[test]
+    fn points_go_on_curves() {
+        let (t, c) = l_shape();
+        let from = [2, 64, 0];
+        let to = [10, 64, 8];
+        let on = |segment: i32, front: bool| Target::on_curve(from, to, segment, front);
+        let n = Network::build(&t, &c, &[], &[]);
+        let e = n.curve_edges[&(from, to)];
+        assert!(n.graph.edges[e].turn.is_some());
+        let len = n.graph.length(e);
+        // Segment 5: three blocks from the curve's first end, along it; `front` the other way,
+        // the same place.
+        let a = n.place(&t, &on(5, false)).unwrap();
+        assert_eq!(a.edge, e);
+        assert!((a.position - 3.0).abs() < 1e-9);
+        let b = n.place(&t, &on(5, true)).unwrap();
+        assert_eq!(b.edge, e ^ 1);
+        assert!((b.position - (len - 3.0)).abs() < 1e-9);
+        assert!(near(at_place(&n, a), at_place(&n, b)));
+        // The curve's first end runs east, so the place is beyond x = 3, short of the turn's end.
+        let p = at_place(&n, a);
+        assert!(p[0] > 3.0 && p[0] < 10.5 && p[2] > 0.5 && p[2] < 8.0, "{p:?}");
+        // Off a curve that is gone, or its other end's copy: nowhere.
+        assert_eq!(n.place(&t, &Target::on_curve(to, from, 5, false)), None);
+        assert_eq!(n.place(&t, &Target::on_curve(from, [99, 64, 0], 5, false)), None);
+
+        // A station, a signal and an observer on the curve.
+        let targets = HashMap::from([
+            ([4, 64, 3], on(3, false)),
+            ([6, 64, 5], on(9, true)),
+            ([8, 64, 6], on(15, false)),
+        ]);
+        let mut n = Network::build_targeted(
+            &t,
+            &c,
+            &[[4, 64, 3]],
+            &[([6, 64, 5], SignalType::Entry)],
+            &targets,
         );
+        n.bind_observers(&t, &[[8, 64, 6]], &targets);
+        assert_eq!(n.stations.len(), 1);
+        assert_eq!(n.stations[0].1.edge, e);
+        assert_eq!(n.signals.len(), 1);
+        assert_eq!(n.observers.len(), 1);
+        assert!(n.observers[0].1.edge.is_multiple_of(2));
+        assert_eq!(n.station_marker([4, 64, 3]), Some(on(3, false)));
+        assert_eq!(n.signal_marker([6, 64, 5]), Some((on(9, true), false)));
+        assert_eq!(n.observer_marker([8, 64, 6]), Some(on(15, false)));
+        // The signal splits the track into sections at the curve.
+        let before = n.section(n.blocks[&[0, 64, 0]].edge, 0.0);
+        let after = n.section(n.blocks[&[10, 64, 20]].edge, 0.0);
+        assert_ne!(before, after);
+
+        // Overlaps: the station's segment is taken; a signal half a block from the signal is too
+        // close, the same segment joins it, a block on is clear.
+        use PointKind::{Signal, Station};
+        assert_eq!(n.overlap(&t, &on(3, false), Station), Overlap::Occupied);
+        assert_eq!(n.overlap(&t, &on(3, true), Signal), Overlap::Occupied);
+        assert_eq!(n.overlap(&t, &on(9, false), Signal), Overlap::Valid);
+        assert_eq!(n.overlap(&t, &on(9, true), Station), Overlap::Occupied);
+        assert_eq!(n.overlap(&t, &on(10, true), Signal), Overlap::Occupied);
+        assert_eq!(n.overlap(&t, &on(11, true), Signal), Overlap::Valid);
+        assert_eq!(
+            n.overlap(&t, &Target::on_curve(to, from, 5, false), Station),
+            Overlap::NoTrack
+        );
+    }
+
+    #[test]
+    fn junctions_and_missing_track_are_refused() {
+        let mut t = HashMap::new();
+        line(&mut t, [0, 64, 5], [1, 0, 0], 5, TrackShape::Xo);
+        t.insert([5, 64, 5], TrackShape::CrO);
+        let n = Network::build(&t, &Curves::default(), &[], &[]);
+        let cross = Target {
+            track: [5, 64, 5],
+            front: false,
+            bezier: None,
+        };
+        assert_eq!(n.overlap(&t, &cross, PointKind::Station), Overlap::Junction);
+        let none = Target {
+            track: [5, 70, 5],
+            ..cross
+        };
+        assert_eq!(n.overlap(&t, &none, PointKind::Signal), Overlap::NoTrack);
+        let ok = Target {
+            track: [2, 64, 5],
+            ..cross
+        };
+        assert_eq!(n.overlap(&t, &ok, PointKind::Observer), Overlap::Valid);
+        assert_eq!(Overlap::Junction.feedback(), Some("no_junctions"));
+        assert_eq!(Overlap::NoTrack.feedback(), Some("invalid"));
+        assert_eq!(Overlap::Valid.feedback(), None);
+    }
+
+    #[test]
+    fn a_station_assembles_on_its_straight_pick_only() {
+        let (mut t, _) = l_shape();
+        line(&mut t, [0, 64, 20], [0, 1, 1], 3, TrackShape::As);
+        let x = Target::pick([0, 64, 0], TrackShape::Xo, [1.0, 0.0, 0.0]).unwrap();
+        let targets = HashMap::from([
+            ([0, 64, 1], x),
+            ([3, 64, 1], Target::on_curve([2, 64, 0], [10, 64, 8], 2, false)),
+            ([1, 65, 21], Target::pick([0, 65, 21], TrackShape::As, [0.0, 0.0, 1.0]).unwrap()),
+        ]);
+        assert_eq!(station_track(&t, &targets, [0, 64, 1]), Some([0, 64, 0]));
+        assert_eq!(station_track(&t, &targets, [3, 64, 1]), None);
+        assert_eq!(station_track(&t, &targets, [1, 65, 21]), None);
+        // With no pick, the straight track beside it.
+        assert_eq!(station_track(&t, &targets, [-5, 64, 1]), Some([-5, 64, 0]));
+        // Looking east (not `front`): bogeys go west of it, against the trains it stands for.
+        assert_eq!(assembly_direction(TrackShape::Xo, &x), [-1, 0, 0]);
+        let front = Target { front: true, ..x };
+        assert_eq!(assembly_direction(TrackShape::Xo, &front), [1, 0, 0]);
+        assert_eq!(nearest_horizontal([0.7, 0.0, 0.7]), [0, 0, 1]);
     }
 }

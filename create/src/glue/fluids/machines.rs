@@ -2,16 +2,24 @@
 //! with processing's recipes, from the same store). A sequenced assembly's filling
 //! step comes first (`SequencedAssemblyRecipe.getRecipe`): the assemblies and the progress on a
 //! stack are processing's.
+//!
+//! A spout also fills the block two below it (`BlockSpoutingBehaviour`, `tick_spout_blocks`):
+//! cauldrons, dirt to mud and farmland. It plays its sound as a cycle over a belt or depot
+//! starts, and each fill tells its clients to splash (`spouted::SPLASH`).
 
+#[allow(unused_imports)]
+use mod_api::RandomSource as _;
 use super::super::processing::{self, recipes};
 use super::super::redstone::analog_touched;
-use super::super::server::ServerLevel;
+use super::super::server::{ServerLevel, update_all};
 use super::super::world::with_world;
 use crate::glue::names::Named as _;
-use create_engine::spout::{self, Filling};
+use create_engine::spout::{self, BlockFill, Filling};
 use create_engine::tank::Fluid;
 use create_engine::{belt, sequenced};
-use mod_api::{Compound, HostTransaction, ItemStack, ServerHost, Tag};
+use mod_api::{BlockState, Compound, HostBlockStates, HostTransaction, ItemStack, ServerHost, Tag};
+use std::cell::RefCell;
+use std::collections::HashSet;
 
 /// `count` of `item`; a potion named with its contents (`tank::potion_item`, as a filled water
 /// bottle, `spout::WATER_BOTTLE`) holds them (`PotionContents` of its potion), and a stack a
@@ -103,6 +111,7 @@ pub(crate) fn spout_on_depot(lv: &mut ServerLevel<'_>, depot: [i32; 3]) {
     if let (Some(out), Some(_)) = (&filled, &held) {
         crate::glue::advancements::spouted(lv, pos, out);
     }
+    spout_effects(lv, pos, before, s, filled.is_some());
     match (filled, &sequenced, held, entity) {
         (Some(_), Some((a, progress, _, _)), Some((_, count)), _) => {
             let state = with_world(|w| w.dims[dim].depots.get(&depot).copied().flatten()).flatten();
@@ -172,6 +181,132 @@ fn put_spout(dim: usize, pos: [i32; 3], s: spout::Spout, before: spout::Spout) {
     }
 }
 
+/// What players notice of a spout's belt or depot callback (it was `before`, it is `s`): a cycle
+/// starting plays the spout's sound (`SPOUTING.playOnServer(level, pos, 0.75, 0.9 + 0.2 *
+/// random)`), a fill splashes on its clients (`sendSplash`).
+fn spout_effects(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    before: spout::Spout,
+    s: spout::Spout,
+    filled: bool,
+) {
+    if before.processing == -1 && s.processing == spout::FILLING_TIME {
+        let random = lv
+            .level
+            .with_random(&mut *lv.host, |r| r.next_float())
+            .unwrap_or(0.5);
+        let (sound, volume, pitch) = spout::sound(random);
+        lv.play_block_sound(sound, pos, volume, pitch);
+    }
+    if filled {
+        splash(lv, pos);
+    }
+}
+
+/// `sendSplash = true; notifyUpdate()`: the spout's clients splash its fluid on what it filled
+/// (`SpoutBlockEntity.spawnSplash`), told by the game time of the fill.
+fn splash(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    let time = lv.game_time();
+    if let Some(entity) = lv.host.block_entity(lv.level, pos) {
+        let data = Compound::from([(super::spouted::SPLASH.into(), Tag::Long(time))]);
+        let _ = entity.merge_data(&mut *lv.host, data);
+    }
+}
+
+thread_local! {
+    /// Spouts whose cycle fills the block two below them (`customProcess`), by level.
+    static BLOCK_FILLS: RefCell<HashSet<(usize, [i32; 3])>> = RefCell::new(HashSet::new());
+}
+
+/// What spouting the block at `at` with `have` of `fluid` would take and do
+/// (`BlockSpoutingBehaviour.get(level, pos).fillBlock(.., simulate)`).
+fn block_fill_at(
+    lv: &ServerLevel<'_>,
+    at: [i32; 3],
+    fluid: Fluid,
+    have: u32,
+) -> Option<(u32, BlockFill)> {
+    let state = lv.block_state(at)?;
+    let name = lv.block_name(at)?;
+    let facts = lv.host.block_states();
+    let property = |p: &str| {
+        state
+            .property(&facts, p)
+            .ok()
+            .flatten()
+            .and_then(|v| v.parse::<i32>().ok())
+    };
+    spout::block_fill(&name, property, fluid, have)
+}
+
+/// `level.setBlockAndUpdate(pos, ..)` with what the spout made of the block at `at`.
+fn apply_block_fill(lv: &mut ServerLevel<'_>, at: [i32; 3], fill: BlockFill) -> bool {
+    let next = {
+        let facts = lv.host.block_states();
+        match fill {
+            BlockFill::Become(block) => lv
+                .host
+                .block_key(block)
+                .and_then(|k| BlockState::of(&facts, k, &[]).ok()),
+            BlockFill::Raise(property) => lv.block_state(at).and_then(|s| {
+                let v: i32 = s.property(&facts, property).ok().flatten()?.parse().ok()?;
+                s.with(&facts, property, &(v + 1).to_string()).ok()
+            }),
+        }
+    };
+    next.is_some_and(|state| lv.set_state(at, state, update_all()))
+}
+
+/// `SpoutBlockEntity.tick`'s block spouting, before the transport walk runs the spouts' timers
+/// (`tick`): an idle spout holding fluid over a block it can fill (`AllBlockSpoutingBehaviours`:
+/// a cauldron, dirt, farmland) starts its 20-tick cycle, and at the cycle's 5th-last tick fills
+/// the block if it still can, the fluid leaving its tank. The walk takes the timer from 6 to 5
+/// later this tick, so the fill lands on the tick Create's does.
+pub(crate) fn tick_spout_blocks(lv: &mut ServerLevel<'_>) {
+    let dim = lv.dim;
+    let due: Vec<([i32; 3], spout::Spout)> = with_world(|w| {
+        w.dims[dim]
+            .spouts
+            .iter()
+            .filter(|(_, s)| s.fluid.is_some() && matches!(s.processing, -1 | 6))
+            .map(|(p, s)| (*p, *s))
+            .collect()
+    })
+    .unwrap_or_default();
+    for (pos, mut s) in due {
+        let custom = BLOCK_FILLS.with_borrow_mut(|c| c.remove(&(dim, pos)));
+        if s.processing == 6 && !custom {
+            continue;
+        }
+        let below = [pos[0], pos[1] - 2, pos[2]];
+        if !lv.is_loaded(below) {
+            continue;
+        }
+        let Some((fluid, have)) = s.fluid else {
+            continue;
+        };
+        let fill = block_fill_at(lv, below, fluid, have);
+        let before = s;
+        if s.processing == -1 {
+            if spout::start_block_fill(&mut s, fill) {
+                BLOCK_FILLS.with_borrow_mut(|c| c.insert((dim, pos)));
+                put_spout(dim, pos, s, before);
+            }
+            continue;
+        }
+        // `customProcess.fillBlock(.., false)`: the block may have changed since.
+        let Some((amount, change)) = fill else {
+            continue;
+        };
+        if apply_block_fill(lv, below, change) {
+            spout::finish_block_fill(&mut s, amount);
+            put_spout(dim, pos, s, before);
+            splash(lv, pos);
+        }
+    }
+}
+
 /// The spout's belt callbacks (`SpoutBlockEntity`'s `BeltProcessingBehaviour`) for a stack on
 /// the belt segment two under the spout `above`: None without a spout there; held while it can
 /// be filled, one of it filled at the cycle's end (a sequenced assembly's filling step first,
@@ -199,6 +334,7 @@ pub(super) fn spout_on_belt(
         None => spout::on_belt(&mut s, &item.item, &r.filling, locked),
     })?;
     put_spout(dim, above, s, before);
+    spout_effects(lv, above, before, s, matches!(result, OnBelt::Fill(_)));
     Some(match result {
         OnBelt::Pass => Process::Pass,
         OnBelt::Hold => Process::Hold,
@@ -346,8 +482,9 @@ pub(crate) fn tick_drain(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
     };
     let left = match left {
         Some(left) => left,
-        // No input there: thrown off over an open side, else it waits.
-        None if !crate::glue::logistics::has_collision(lv, next) => {
+        // No input there: thrown off unless the block there turns a full face to the drain
+        // (`BlockHelper.hasBlockSolidSide`), else it waits.
+        None if !solid_side(lv, next, side.opposite()) => {
             if let Some(stack) = stack_of(&*lv.host, &held.item, u32::from(held.count)) {
                 let o = side.offset().map(f64::from);
                 let at = [
@@ -380,6 +517,37 @@ pub(crate) fn tick_drain(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
             }
             w.mark_unsaved(dim, pos);
         });
+    }
+}
+
+/// `BlockHelper.hasBlockSolidSide(state, level, pos, face)`: the block at `pos` is not leaves
+/// and its collision shape fills its `face` side (`Block.isFaceFull`). A block the host can't
+/// tell the shape of answers by its full-face support; an unloaded one holds the stack.
+fn solid_side(lv: &ServerLevel<'_>, pos: [i32; 3], face: create_engine::kinetics::Dir) -> bool {
+    let Some(state) = lv.block_state(pos) else {
+        return true;
+    };
+    if lv.host.block_in_tag(state.block(), "minecraft:leaves") == Some(true) {
+        return false;
+    }
+    match lv
+        .level
+        .block_shape(&*lv.host, state, pos, mod_api::BlockShapeKind::Collision)
+    {
+        Some(boxes) => create_engine::drain::face_full(&boxes, face),
+        None => {
+            let face = match face {
+                create_engine::kinetics::Dir::Down => mod_api::BlockFace::Down,
+                create_engine::kinetics::Dir::Up => mod_api::BlockFace::Up,
+                create_engine::kinetics::Dir::North => mod_api::BlockFace::North,
+                create_engine::kinetics::Dir::South => mod_api::BlockFace::South,
+                create_engine::kinetics::Dir::West => mod_api::BlockFace::West,
+                create_engine::kinetics::Dir::East => mod_api::BlockFace::East,
+            };
+            lv.level
+                .block_face_sturdy(&*lv.host, pos, face, mod_api::SupportType::Full)
+                == Some(true)
+        }
     }
 }
 
@@ -425,15 +593,26 @@ pub(crate) fn insert_into_drain(
 }
 
 /// `ItemDrainBlock.updateEntityAfterFallOn`: a stack landing on a drain goes in travelling the
-/// way the item moved, north for one that fell straight (`Direction.getNearest` of no motion,
-/// which is what the landing event gives); what it can't take stays an item.
-pub(super) fn drain_landed(lv: &mut ServerLevel<'_>, pos: [i32; 3], stack: &mut Option<ItemStack>) {
+/// way the item entity `entity` moves (`drain::landing_side`), north for one that fell straight
+/// or whose motion the host can't tell; what it can't take stays an item.
+pub(super) fn drain_landed(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    entity: u32,
+    stack: &mut Option<ItemStack>,
+) {
     let Some(s) = stack.as_ref() else {
         return;
     };
     // Any stack, named with its components as the belts name it (a potion with its contents).
     let id = crate::glue::logistics::items::key_of(&*lv.host, s);
-    let side = create_engine::kinetics::Dir::North;
+    let side = lv
+        .host
+        .entity(entity)
+        .and_then(|e| e.velocity(&*lv.host))
+        .map_or(create_engine::kinetics::Dir::North, |v| {
+            create_engine::drain::landing_side(v)
+        });
     let count = s.count().min(64) as u8;
     let Some(left) = insert_into_drain(lv, pos, side, &id, count) else {
         return;

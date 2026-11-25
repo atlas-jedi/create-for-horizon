@@ -276,6 +276,30 @@ pub struct Present {
     pub held_position: Option<f32>,
 }
 
+/// A sound an ejector's tick plays at its block (`level.playSound(null, worldPosition, ...)`,
+/// `SoundSource.BLOCKS`).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Sound {
+    /// `activateDeferred`: `WOODEN_TRAPDOOR_CLOSE` at .35 and pitch 1, then `CHEST_OPEN` at .1
+    /// and pitch 1.4.
+    Launch,
+    /// The plate winding down (`RETRACTING`): `WOODEN_BUTTON_CLICK_OFF` at .125 and this pitch.
+    Click { pitch: f32 },
+}
+
+impl Sound {
+    /// The vanilla sounds it is: (event, volume, pitch).
+    pub fn events(self) -> Vec<(&'static str, f32, f32)> {
+        match self {
+            Sound::Launch => vec![
+                ("minecraft:block.wooden_trapdoor.close", 0.35, 1.0),
+                ("minecraft:block.chest.open", 0.1, 1.4),
+            ],
+            Sound::Click { pitch } => vec![("minecraft:block.wooden_button.click_off", 0.125, pitch)],
+        }
+    }
+}
+
 /// What an ejector's tick reaches in the world.
 pub trait World {
     /// Its depot's contents.
@@ -301,6 +325,23 @@ pub trait World {
     fn funnel_on_top_takes(&mut self) -> Option<bool> {
         None
     }
+    /// Plays `sound` at the ejector.
+    fn sound(&mut self, _sound: Sound) {}
+    /// `level.getGameTime()`, which paces the winding clicks.
+    fn game_time(&mut self) -> i64 {
+        0
+    }
+}
+
+/// The winding click's pitch on a retracting tick, if one plays: every `soundRate` ticks of game
+/// time (`(int) (1 / (windUp * 5)) + 1`, Java's int arithmetic: a stopped ejector's rate
+/// overflows and it all but never clicks), at `1.5 - lid`.
+fn click_pitch(wind_up: f32, lid: f32, game_time: i64) -> Option<f32> {
+    let rate = ((1.0 / (wind_up * 5.0)) as i32).wrapping_add(1);
+    if rate == 0 || (game_time as i32).wrapping_rem(rate) != 0 {
+        return None;
+    }
+    Some(1.5 - lid)
 }
 
 fn distance(a: [f64; 3], b: [f64; 3]) -> f64 {
@@ -416,8 +457,12 @@ impl Ejector {
                     self.state = State::Charged;
                     self.lid.set(0.0);
                 }
-                let v = (self.lid.value - self.wind_up(speed)).clamp(0.0, 1.0);
+                let wind_up = self.wind_up(speed);
+                let v = (self.lid.value - wind_up).clamp(0.0, 1.0);
                 self.lid.set(v);
+                if let Some(pitch) = click_pitch(wind_up, self.lid.value, world.game_time()) {
+                    world.sound(Sound::Click { pitch });
+                }
             }
         }
         changed || self.state != prev
@@ -433,6 +478,7 @@ impl Ejector {
         }
         self.lid.chase(1.0, 0.8);
         self.state = State::Launching;
+        world.sound(Sound::Launch);
         true
     }
 
@@ -1036,6 +1082,86 @@ mod tests {
         };
         e.tick(pos, Dir::East, speed, &mut w);
         assert!(!e.launch && w.held.is_some());
+    }
+
+    /// A target that takes everything, hearing the sounds at game time `time`.
+    #[derive(Default)]
+    struct Heard {
+        spot: Spot,
+        time: i64,
+        sounds: Vec<(i64, Sound)>,
+    }
+
+    impl World for Heard {
+        fn present(&mut self) -> Present {
+            self.spot.present()
+        }
+        fn target_refuses(&mut self, t: [i32; 3]) -> bool {
+            self.spot.target_refuses(t)
+        }
+        fn take_all(&mut self) -> Vec<(String, u8)> {
+            self.spot.take_all()
+        }
+        fn insert(&mut self, target: [i32; 3], item: &str, count: u8) -> Option<u8> {
+            self.spot.insert(target, item, count)
+        }
+        fn drop_item(&mut self, at: [f64; 3], v: [f64; 3], item: &str, count: u8) {
+            self.spot.drop_item(at, v, item, count)
+        }
+        fn clip(&mut self, from: [f64; 3], to: [f64; 3]) -> Option<([f64; 3], [i32; 3], Dir)> {
+            self.spot.clip(from, to)
+        }
+        fn extracting_funnel(&mut self, p: [i32; 3]) -> bool {
+            self.spot.extracting_funnel(p)
+        }
+        fn sound(&mut self, sound: Sound) {
+            self.sounds.push((self.time, sound));
+        }
+        fn game_time(&mut self) -> i64 {
+            self.time
+        }
+    }
+
+    #[test]
+    fn an_ejector_clicks_while_winding_and_clacks_as_it_throws() {
+        // 16 rpm over 4 blocks: windUp 1/64, soundRate (int) (1 / (5/64)) + 1 = 13.
+        assert_eq!(click_pitch(1.0 / 64.0, 0.5, 26), Some(1.0));
+        assert_eq!(click_pitch(1.0 / 64.0, 0.5, 27), None);
+        // Stopped: the rate overflows to Integer.MIN_VALUE and it does not click.
+        assert_eq!(click_pitch(0.0, 0.5, 13), None);
+        let mut e = Ejector::default();
+        e.set_target(4, 0);
+        let pos = [0, 64, 0];
+        let mut w = Heard {
+            spot: Spot {
+                takes: true,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let speed = 16.0;
+        while e.state != State::Charged {
+            e.tick(pos, Dir::North, speed, &mut w);
+            w.time += 1;
+        }
+        // Every 13th tick of game time it clicked, at 1.5 less the plate's height after the
+        // tick's winding.
+        let clicks: Vec<i64> = w.sounds.iter().map(|s| s.0).collect();
+        assert_eq!(clicks, [0, 13, 26, 39, 52]);
+        assert_eq!(w.sounds[1].1, Sound::Click { pitch: 1.5 - (1.0 - 14.0 / 64.0) });
+        w.sounds.clear();
+        w.spot.held = Some(("minecraft:iron_ingot".into(), 3, 0.5));
+        e.tick(pos, Dir::North, speed, &mut w);
+        e.tick(pos, Dir::North, speed, &mut w);
+        assert_eq!(e.state, State::Launching);
+        assert_eq!(w.sounds, [(w.time, Sound::Launch)]);
+        assert_eq!(
+            Sound::Launch.events(),
+            [
+                ("minecraft:block.wooden_trapdoor.close", 0.35, 1.0),
+                ("minecraft:block.chest.open", 0.1, 1.4)
+            ]
+        );
     }
 
     #[test]

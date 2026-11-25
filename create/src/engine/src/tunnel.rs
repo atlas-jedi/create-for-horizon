@@ -275,6 +275,9 @@ pub struct Brass {
     pub connected_right: bool,
     /// `distributionTargets`.
     pub targets: Targets,
+    /// The stack its clients were last told it holds (`sendData`, for `addToGoggleTooltip`);
+    /// None until told (not saved).
+    pub shown: Option<Option<(String, u8)>>,
 }
 
 /// `BrassTunnelBlockEntity.distributionTargets`: Java hands out to the outputs found at the
@@ -343,6 +346,7 @@ impl Brass {
             connected_left: saved.connected_left,
             connected_right: saved.connected_right,
             targets: saved.targets,
+            shown: None,
         }
     }
 
@@ -557,6 +561,34 @@ pub fn filter_slot(axis: Axis, shape: Shape, side: Dir) -> Option<[f64; 3]> {
     sides(axis, shape)
         .contains(&side)
         .then(|| crate::board::sided_offset([0.5, 13.0 / 16.0, 15.5 / 16.0], side))
+}
+
+/// `BrassTunnelBlockEntity.addToGoggleTooltip` for a group of brass tunnels holding `stacks`
+/// (each its item's name and count, in `grabAllStacksOfGroup` order), in the game's language:
+/// `tr` gives a lang key's text (`CreateLang.translate`), en_us where it gives none. Nothing
+/// when the group holds nothing.
+pub fn goggle_lines(
+    stacks: &[(String, u32)],
+    tr: &dyn Fn(&str) -> Option<String>,
+) -> Vec<crate::gauge::Line> {
+    use crate::gauge::goggles;
+    if stacks.is_empty() {
+        return Vec::new();
+    }
+    let t = |key: &str, english: &str| {
+        tr(&format!("create.tooltip.brass_tunnel.{key}")).unwrap_or_else(|| english.to_owned())
+    };
+    // ChatFormatting WHITE, GRAY and DARK_GRAY.
+    let mut lines = vec![goggles(0, vec![(t("contains", "Currently distributing:"), 0xFFFFFF)])];
+    let entry = t("contains_entry", "> %1$s x%2$s");
+    for (name, count) in stacks {
+        let text = entry
+            .replace("%1$s", name)
+            .replace("%2$s", &count.to_string());
+        lines.push(goggles(0, vec![(text, 0xAAAAAA)]));
+    }
+    lines.push(goggles(0, vec![(t("retrieve", "Right-Click to retrieve"), 0x555555)]));
+    lines
 }
 
 /// `brassTunnelTimer`: ticks between distributions.
@@ -987,6 +1019,36 @@ mod tests {
     }
 
     #[test]
+    fn goggles_list_what_a_brass_tunnel_group_distributes() {
+        let none = |_: &str| None;
+        assert!(goggle_lines(&[], &none).is_empty());
+        let lines = goggle_lines(
+            &[("Iron Ingot".into(), 16), ("Gold Ingot".into(), 3)],
+            &none,
+        );
+        let text: Vec<String> = lines
+            .iter()
+            .map(|l| l.iter().map(|p| p.0.as_str()).collect())
+            .collect();
+        assert_eq!(
+            text,
+            [
+                "    Currently distributing:",
+                "    > Iron Ingot x16",
+                "    > Gold Ingot x3",
+                "    Right-Click to retrieve",
+            ]
+        );
+        assert_eq!(lines[1].last().map(|p| p.1), Some(0xAAAAAA));
+        // In the game's language.
+        let tr = |k: &str| {
+            (k == "create.tooltip.brass_tunnel.contains_entry").then(|| "%2$s × %1$s".to_owned())
+        };
+        let lines = goggle_lines(&[("Stone".into(), 2)], &tr);
+        assert_eq!(lines[1].last().map(|p| p.0.as_str()), Some("2 × Stone"));
+    }
+
+    #[test]
     fn non_distributing_tunnel_passes_handler_inserts_to_belt() {
         // Observed in t7-brass-item-handler-belt: a straight brass tunnel with nothing beside it
         // (`hasDistributionBehaviour() == false`) delegates item-handler inserts to its belt
@@ -1084,8 +1146,11 @@ mod tests {
                 filtered: Vec::new(),
                 plain: vec![([1, 8, 2], Dir::East)],
             },
+            shown: Some(None),
         };
         let restored = Brass::from_saved(mid.to_saved());
+        // What its clients were told is not saved: a loaded tunnel tells them again.
+        assert_eq!(restored.shown, None);
         assert_eq!(restored.targets, mid.targets);
         assert_eq!(restored.progress, 7);
         assert_eq!(restored.previous_output, 2);

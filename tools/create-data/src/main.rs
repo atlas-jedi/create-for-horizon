@@ -1,6 +1,7 @@
 //! `create-data compile`: reads Create's MIT data (`src/generated/`) and registration Java once,
 //! and writes the mod's committed outputs, under `create/`: its block, item and fluid declarations
-//! (`data/create/sunrise/`), the partial models' block states (`assets/create/`) and the engine's
+//! (`data/create/horizon/`), the block states of the partial models, the blaze burner and the
+//! sliding doors (`assets/create/`) and the engine's
 //! typed block table (`src/engine/src/generated.rs`).
 //!
 //! `create-data registry`: converts the pinned jar's MIT data to 26.3, and writes item definitions
@@ -188,8 +189,8 @@ fn compile(create: &Path, repo: &Path) {
     let all = blocks::read_blocks(&generated, &block_java);
     let shapes = BTreeMap::new();
 
-    let _ = fs::remove_dir_all(out.join("data/create/horizon"));
-    let decl_dir = out.join("data/create/sunrise");
+    // Horizon reads a content mod's declarations from `data/<id>/horizon/`.
+    let decl_dir = out.join("data/create/horizon");
     let _ = fs::remove_dir_all(&decl_dir);
     let mut pending: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut declared = Vec::new();
@@ -244,6 +245,13 @@ fn compile(create: &Path, repo: &Path) {
         &states_dir.join("blaze_burner.json"),
         &pretty(&blocks::blaze_burner_states()),
     );
+    // The sliding doors draw nothing of their own while hidden (`getRenderShape`).
+    for door in blocks::SLIDING_DOORS {
+        write(
+            &states_dir.join(format!("{door}.json")),
+            &pretty(&blocks::sliding_door_states(door)),
+        );
+    }
     let models_dir = out.join("assets/create/models/block");
     for (name, model) in blocks::fluid_models() {
         write(&models_dir.join(format!("{name}.json")), &pretty(&model));

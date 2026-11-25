@@ -7,7 +7,6 @@ use super::super::server::ServerLevel;
 use super::super::world::with_world;
 use create_engine::display::{Arrival, Config};
 use create_engine::schedule::Whereabouts;
-use create_engine::trains::{TOP_SPEED, TURN_TOP_SPEED};
 use std::cell::RefCell;
 use std::collections::HashMap;
 
@@ -54,7 +53,8 @@ pub(super) fn tick(lv: &ServerLevel<'_>) {
                             n.started_at,
                         ))
                     }),
-                    speed: (t.train.throttle * TOP_SPEED).min((TOP_SPEED + TURN_TOP_SPEED) / 2.0),
+                    speed: (t.train.throttle * t.train.max_speed())
+                        .min((t.train.max_speed() + t.train.max_turn_speed()) / 2.0),
                 };
                 let name = if t.name.is_empty() {
                     "Unnamed Train".to_owned()

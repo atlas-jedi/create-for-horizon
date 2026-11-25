@@ -38,6 +38,15 @@ pub enum Kind {
         soul: bool,
         signal: bool,
     },
+    /// An andesite or brass funnel (`FunnelMovementBehaviour`): extracting, it drops what its
+    /// filter passes out of the contraption's storage into the blocks it reaches; else it takes
+    /// in the items lying there. `near`: extracting and not facing up, it reaches .15 out of its
+    /// block instead of .65 (`getActiveAreaOffset`).
+    Funnel {
+        brass: bool,
+        extracting: bool,
+        near: bool,
+    },
 }
 
 impl Kind {
@@ -54,6 +63,21 @@ impl Kind {
             crate::Block::PortableStorageInterface => Kind::Interface { fluid: false },
             crate::Block::PortableFluidInterface => Kind::Interface { fluid: true },
             _ => return None,
+        })
+    }
+
+    /// The actor of a Create block of state `info` (`MovementBehaviour.REGISTRY`): as [`Kind::of`],
+    /// and a funnel's, which its state's `extracting` and facing shape.
+    pub fn of_state(block: crate::Block, info: &crate::parts::StateInfo) -> Option<Kind> {
+        let brass = match block {
+            crate::Block::AndesiteFunnel => false,
+            crate::Block::BrassFunnel => true,
+            _ => return Kind::of(block),
+        };
+        Some(Kind::Funnel {
+            brass,
+            extracting: info.extracting,
+            near: info.extracting && info.facing != Some(Dir::Up),
         })
     }
 
@@ -80,6 +104,13 @@ impl Kind {
             Kind::Contact => 0.65,
             Kind::Interface { .. } => crate::psi::REACH,
             Kind::Campfire { .. } => 0.0,
+            Kind::Funnel { near, .. } => {
+                if near {
+                    0.15
+                } else {
+                    0.65
+                }
+            }
         }
     }
 
@@ -97,6 +128,8 @@ impl Kind {
             Kind::Interface { fluid: true } => "create:portable_fluid_interface",
             Kind::Campfire { soul: false, .. } => "minecraft:campfire",
             Kind::Campfire { soul: true, .. } => "minecraft:soul_campfire",
+            Kind::Funnel { brass: false, .. } => "create:andesite_funnel",
+            Kind::Funnel { brass: true, .. } => "create:brass_funnel",
         }
     }
 
@@ -271,6 +304,9 @@ pub enum Effect {
     /// `CampfireMovementBehaviour.tick`: a campfire's smoke (signal smoke for a signal fire)
     /// rising from where it is now.
     Smoke { at: [f64; 3], signal: bool },
+    /// `FunnelMovementBehaviour.visitNewPosition` at a block: an extracting funnel drops what
+    /// its filter passes out of the storage there, another takes in the items lying there.
+    Funnel([i32; 3]),
     /// `BlockBreakingMovementBehaviour.damageEntities` in the block at `pos`: each entity there
     /// (but items and the contraption's own) is hurt by `damage` (drills, saws, rollers; none
     /// for a plough) and thrown by `boost` (`throwEntity`).
@@ -490,7 +526,9 @@ impl Actor {
     pub fn active(&self) -> bool {
         match self.kind {
             Kind::Roller => !self.disabled && pointing_towards(self.relative_motion, self.facing),
-            Kind::Interface { .. } | Kind::Campfire { .. } => !self.disabled,
+            Kind::Interface { .. } | Kind::Campfire { .. } | Kind::Funnel { .. } => {
+                !self.disabled
+            }
             _ => !self.disabled && !pointing_towards(self.relative_motion, self.facing.opposite()),
         }
     }
@@ -739,6 +777,10 @@ impl Actor {
         }
         if self.kind == Kind::Deployer {
             effects.push(Effect::Deploy(pos));
+            return;
+        }
+        if let Kind::Funnel { .. } = self.kind {
+            effects.push(Effect::Funnel(pos));
             return;
         }
         if self.kind == Kind::Contact {
@@ -1338,10 +1380,167 @@ pub fn set_active(actors: &mut [Actor], filter: &Filter, enable: bool, effects: 
     }
 }
 
+/// Where a ray from `eye` to `target` enters the unit box at `min`, as a fraction of the ray.
+pub fn ray_unit_box(eye: [f64; 3], target: [f64; 3], min: [f64; 3]) -> Option<f64> {
+    let (mut lo, mut hi) = (0.0f64, 1.0f64);
+    for i in 0..3 {
+        let d = target[i] - eye[i];
+        let (a, b) = (min[i], min[i] + 1.0);
+        if d.abs() < 1e-9 {
+            if eye[i] < a || eye[i] > b {
+                return None;
+            }
+            continue;
+        }
+        let (t0, t1) = ((a - eye[i]) / d, (b - eye[i]) / d);
+        lo = lo.max(t0.min(t1));
+        hi = hi.min(t0.max(t1));
+        if lo > hi {
+            return None;
+        }
+    }
+    Some(lo)
+}
+
+/// The contraption controls of a structure the server poses for its clients (a cart's, what
+/// rides a cart's on a bearing, a train carriage's: their blocks are block displays the server
+/// moves, so a client knows nothing of the structure), sent to the players near it so their
+/// clients find them with their ray as `ContraptionHandlerClient.rayTraceContraption` does.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PosedControls {
+    /// What a click on them names to the server.
+    pub key: [i32; 3],
+    /// Where the structure stands this tick.
+    pub pose: crate::collider::Pose,
+    /// Its contraption controls blocks, by their offsets.
+    pub controls: Vec<[i32; 3]>,
+}
+
+impl PosedControls {
+    /// `rayTraceContraption`: the controls block the ray from `eye` to `target` meets first,
+    /// the ray turned back into the structure's blocks' space: how far along the ray, the
+    /// block's offset, and where the ray meets it from its corner in that space.
+    pub fn pick(&self, eye: [f64; 3], target: [f64; 3]) -> Option<(f64, [i32; 3], [f64; 3])> {
+        let (e, t) = (self.pose.to_local(eye), self.pose.to_local(target));
+        let mut best: Option<(f64, [i32; 3], [f64; 3])> = None;
+        for o in &self.controls {
+            let min = o.map(f64::from);
+            let Some(f) = ray_unit_box(e, t, min) else {
+                continue;
+            };
+            if best.as_ref().is_none_or(|b| f < b.0) {
+                let hit = [0, 1, 2].map(|i| e[i] + (t[i] - e[i]) * f - min[i]);
+                best = Some((f, *o, hit));
+            }
+        }
+        best
+    }
+
+    /// The structures' controls as the server sends them.
+    pub fn encode_all(all: &[PosedControls]) -> Vec<u8> {
+        let mut out = Vec::new();
+        let int = |out: &mut Vec<u8>, v: i32| out.extend_from_slice(&v.to_le_bytes());
+        int(&mut out, all.len() as i32);
+        for p in all {
+            p.key.iter().for_each(|v| int(&mut out, *v));
+            p.pose
+                .centre
+                .iter()
+                .for_each(|v| out.extend_from_slice(&v.to_le_bytes()));
+            for (axis, deg) in p.pose.turns {
+                int(&mut out, axis as i32);
+                out.extend_from_slice(&deg.to_le_bytes());
+            }
+            int(&mut out, p.controls.len() as i32);
+            p.controls.iter().flatten().for_each(|v| int(&mut out, *v));
+        }
+        out
+    }
+
+    /// Reads what [`PosedControls::encode_all`] wrote.
+    pub fn decode_all(d: &[u8]) -> Option<Vec<PosedControls>> {
+        use crate::kinetics::Axis;
+        let int = |at: &mut usize| {
+            let v = i32::from_le_bytes(d.get(*at..*at + 4)?.try_into().ok()?);
+            *at += 4;
+            Some(v)
+        };
+        let double = |at: &mut usize| {
+            let v = f64::from_le_bytes(d.get(*at..*at + 8)?.try_into().ok()?);
+            *at += 8;
+            Some(v)
+        };
+        let mut at = 0usize;
+        let n = usize::try_from(int(&mut at)?).ok()?;
+        let mut all = Vec::with_capacity(n.min(256));
+        for _ in 0..n {
+            let key = [int(&mut at)?, int(&mut at)?, int(&mut at)?];
+            let centre = [double(&mut at)?, double(&mut at)?, double(&mut at)?];
+            let mut turns = NO_TURNS;
+            for t in &mut turns {
+                let axis = match int(&mut at)? {
+                    0 => Axis::X,
+                    1 => Axis::Y,
+                    2 => Axis::Z,
+                    _ => return None,
+                };
+                *t = (axis, double(&mut at)?);
+            }
+            let count = usize::try_from(int(&mut at)?).ok()?;
+            let mut controls = Vec::with_capacity(count.min(256));
+            for _ in 0..count {
+                controls.push([int(&mut at)?, int(&mut at)?, int(&mut at)?]);
+            }
+            all.push(PosedControls {
+                key,
+                pose: crate::collider::Pose { centre, turns },
+                controls,
+            });
+        }
+        Some(all)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    #[test]
+    fn a_ray_finds_the_controls_of_a_turned_structure_the_server_sent() {
+        use crate::kinetics::Axis;
+        // A structure turned a quarter about up: its controls at offset (1, 0, 0) stand at
+        // (0, 0, -1) from its anchor's centre.
+        let posed = PosedControls {
+            key: [i32::MIN, 7, 1],
+            pose: crate::collider::Pose {
+                centre: [10.5, 64.5, 10.5],
+                turns: one_turn(Axis::Y, 90.0),
+            },
+            controls: vec![[1, 0, 0], [-2, 0, 0]],
+        };
+        let back = posed.pose.to_local(posed.pose.to_world([1.25, 0.5, 0.75]));
+        assert!((0..3).all(|i| (back[i] - [1.25, 0.5, 0.75][i]).abs() < 1e-9));
+        // Looking along z at the blocks' height: it meets the one before it.
+        let (f, o, hit) = posed
+            .pick([10.5, 64.5, 5.0], [10.5, 64.5, 9.6])
+            .expect("met");
+        assert_eq!(o, [1, 0, 0]);
+        assert!(f > 0.0 && f < 1.0);
+        assert!((0..3).all(|i| (-1e-9..=1.0 + 1e-9).contains(&hit[i])));
+        // From the far side it meets the other first; looking away, or short of it, none.
+        let far = posed.pick([10.5, 64.5, 15.0], [10.5, 64.5, 5.0]);
+        assert_eq!(far.map(|p| p.1), Some([-2, 0, 0]));
+        assert!(posed.pick([10.5, 64.5, 5.0], [10.5, 64.5, 8.9]).is_none());
+        assert!(posed.pick([10.5, 64.5, 5.0], [10.5, 64.5, 1.0]).is_none());
+        let wire = PosedControls::encode_all(std::slice::from_ref(&posed));
+        assert_eq!(PosedControls::decode_all(&wire), Some(vec![posed]));
+        assert_eq!(PosedControls::decode_all(&wire[..wire.len() - 1]), None);
+        assert_eq!(
+            PosedControls::decode_all(&PosedControls::encode_all(&[])),
+            Some(Vec::new())
+        );
+    }
 
     /// Stone (hardness 1.5) and sand (0.5, falling) by position; drills break both.
     struct World(HashMap<[i32; 3], (f32, bool)>);
@@ -1948,6 +2147,33 @@ mod tests {
         e.clear();
         a.cancel(&mut e);
         assert_eq!(e, vec![Effect::ContactLeft([2, 0, 1])]);
+    }
+
+    #[test]
+    fn a_moving_funnel_works_each_block_it_reaches() {
+        use crate::parts::StateInfo;
+        let info = |facing, extracting| StateInfo {
+            facing: Some(facing),
+            extracting,
+            ..StateInfo::default()
+        };
+        // `getActiveAreaOffset`: .15 extracting (but facing up), else .65.
+        let k = Kind::of_state(crate::Block::BrassFunnel, &info(Dir::North, true)).unwrap();
+        assert_eq!(k.reach(), 0.15);
+        assert_eq!(k.item(), "create:brass_funnel");
+        let up = Kind::of_state(crate::Block::AndesiteFunnel, &info(Dir::Up, true)).unwrap();
+        assert_eq!(up.reach(), 0.65);
+        let world = World(HashMap::new());
+        let mut a = Actor::new([0; 3], k, Dir::North, -1);
+        let mut e = Vec::new();
+        // It works where it starts too (`visitNewPosition` on its first move), whichever way
+        // it moves.
+        a.tick([0.5, 0.5, 0.35], Dir::North, 0.0, &world, &mut e);
+        a.tick([0.5, 0.5, 0.45], Dir::North, 0.0, &world, &mut e);
+        assert_eq!(e, vec![Effect::Funnel([0, 0, 0])]);
+        e.clear();
+        a.tick([0.5, 0.5, 1.35], Dir::North, 0.0, &world, &mut e);
+        assert_eq!(e, vec![Effect::Funnel([0, 0, 1])]);
     }
 
     #[test]

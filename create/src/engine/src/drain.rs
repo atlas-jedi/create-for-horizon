@@ -64,6 +64,26 @@ pub fn contents(item: &str, recipes: &[(String, Emptying)]) -> Option<Emptying> 
     })
 }
 
+/// `ItemDrainBlock.updateEntityAfterFallOn`: an item landing on the drain goes in travelling
+/// the way it moved (`Direction.getNearest` of its horizontal motion, normalised), north when it
+/// fell straight down (`getNearest` of no motion: `Vec3.normalize` gives zero under 1e-5).
+pub fn landing_side(motion: [f64; 3]) -> Dir {
+    let len = (motion[0] * motion[0] + motion[2] * motion[2]).sqrt();
+    if len < 1.0e-5 {
+        return Dir::North;
+    }
+    let (x, z) = ((motion[0] / len) as f32, (motion[2] / len) as f32);
+    let mut best = (Dir::North, f32::MIN_POSITIVE);
+    for d in Dir::ALL {
+        let o = d.offset();
+        let dot = x * o[0] as f32 + z * o[2] as f32;
+        if dot > best.1 {
+            best = (d, dot);
+        }
+    }
+    best.0
+}
+
 /// `tryInsertingFromSide`: `count` of `item` coming in travelling toward `side`. Only while the
 /// drain holds nothing; of a stack that can be emptied it takes one. How many it took.
 pub fn insert(
@@ -178,9 +198,145 @@ pub fn moving(d: &Drain) -> bool {
         .is_some_and(|h| h.position != h.prev || d.processing > 0)
 }
 
+/// `Block.isFaceFull(shape, face)` for a shape given as block-local boxes (`[min x, y, z, max
+/// x, y, z]`): the slice of the shape just inside its `face` side (`VoxelShape.getFaceShape`)
+/// covers the whole face. With `BlockHelper.hasBlockSolidSide` (leaves aside), what makes an
+/// item drain hold a stack at its edge instead of throwing it off.
+pub fn face_full(boxes: &[[f64; 6]], face: Dir) -> bool {
+    let a = match face.axis() {
+        crate::kinetics::Axis::X => 0,
+        crate::kinetics::Axis::Y => 1,
+        crate::kinetics::Axis::Z => 2,
+    };
+    let (u, v) = match a {
+        0 => (1, 2),
+        1 => (0, 2),
+        _ => (0, 1),
+    };
+    let at = if face.positive() { 1.0 - 1.0e-7 } else { 1.0e-7 };
+    let rects: Vec<[f64; 4]> = boxes
+        .iter()
+        .filter(|b| b[a] <= at && at < b[a + 3])
+        .map(|b| {
+            [
+                b[u].max(0.0),
+                b[v].max(0.0),
+                b[u + 3].min(1.0),
+                b[v + 3].min(1.0),
+            ]
+        })
+        .collect();
+    let mut us = vec![0.0, 1.0];
+    let mut vs = vec![0.0, 1.0];
+    for r in &rects {
+        us.extend([r[0], r[2]].into_iter().filter(|c| (0.0..=1.0).contains(c)));
+        vs.extend([r[1], r[3]].into_iter().filter(|c| (0.0..=1.0).contains(c)));
+    }
+    us.sort_by(f64::total_cmp);
+    vs.sort_by(f64::total_cmp);
+    us.dedup();
+    vs.dedup();
+    // Every cell of the grid the rectangles' edges make is covered by one of them.
+    us.windows(2).all(|du| {
+        vs.windows(2).all(|dv| {
+            let (cu, cv) = ((du[0] + du[1]) / 2.0, (dv[0] + dv[1]) / 2.0);
+            du[1] - du[0] < 1.0e-9
+                || dv[1] - dv[0] < 1.0e-9
+                || rects
+                    .iter()
+                    .any(|r| r[0] <= cu && cu <= r[2] && r[1] <= cv && cv <= r[3])
+        })
+    })
+}
+
+/// `ItemDrainRenderer.renderFluid`'s stream from the emptied item into the basin at
+/// `processingTicks - partialTicks` = `pt`: a column from 1/4 to the top, thickest halfway
+/// through the cycle (`radius = (2 * progress - 1)^2 - 1`, the box `inflate(radius / 32)`).
+/// Its corners, block-local, or None while it has no width.
+pub fn stream(pt: f32) -> Option<([f32; 3], [f32; 3])> {
+    let progress = (1.0 - (pt - 5.0) / 10.0).clamp(0.0, 1.0);
+    let radius = (2.0 * progress - 1.0).powi(2) - 1.0;
+    let k = -radius / 32.0;
+    (k > 0.0).then_some(([0.5 - k, 0.25 + k, 0.5 - k], [0.5 + k, 1.0 - k, 0.5 + k]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `BlockHelper.hasBlockSolidSide`: a full block or a top slab's side is full; a bottom
+    /// slab's side, a chest's (inset a pixel) and nothing at all are not.
+    #[test]
+    fn only_a_full_face_holds_the_stack() {
+        let cube = [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]];
+        assert!(face_full(&cube, Dir::West) && face_full(&cube, Dir::Up));
+        let bottom_slab = [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]];
+        assert!(!face_full(&bottom_slab, Dir::West));
+        assert!(face_full(&bottom_slab, Dir::Down));
+        assert!(!face_full(&bottom_slab, Dir::Up));
+        let chest = [[1.0 / 16.0, 0.0, 1.0 / 16.0, 15.0 / 16.0, 14.0 / 16.0, 15.0 / 16.0]];
+        assert!(!face_full(&chest, Dir::North));
+        assert!(!face_full(&[], Dir::East));
+        // Stairs facing east: the bottom half and the east half; its east side is full, its
+        // west side only below.
+        let stairs = [
+            [0.0, 0.0, 0.0, 1.0, 0.5, 1.0],
+            [0.5, 0.5, 0.0, 1.0, 1.0, 1.0],
+        ];
+        assert!(face_full(&stairs, Dir::East));
+        assert!(!face_full(&stairs, Dir::West));
+        // Two halves side by side make a full face.
+        let halves = [
+            [0.0, 0.0, 0.0, 0.5, 1.0, 1.0],
+            [0.5, 0.0, 0.0, 1.0, 1.0, 1.0],
+        ];
+        assert!(face_full(&halves, Dir::North));
+    }
+
+    #[test]
+    fn the_stream_pours_between_the_cycle_s_15th_and_5th_last_ticks() {
+        assert_eq!(stream(20.0), None);
+        assert_eq!(stream(15.0), None);
+        assert_eq!(stream(5.0), None);
+        assert_eq!(stream(0.0), None);
+        let (min, max) = stream(10.0).unwrap();
+        let k = 1.0 / 32.0;
+        assert_eq!((min, max), ([0.5 - k, 0.25 + k, 0.5 - k], [0.5 + k, 1.0 - k, 0.5 + k]));
+        let (a, _) = stream(12.5).unwrap();
+        assert!(a[0] > 0.5 - k && a[0] < 0.5);
+    }
+
+    #[test]
+    fn a_thrown_item_goes_in_the_way_it_moved() {
+        assert_eq!(landing_side([0.0, -0.3, 0.0]), Dir::North, "fell straight");
+        assert_eq!(landing_side([0.2, -0.3, 0.05]), Dir::East);
+        assert_eq!(landing_side([-0.01, 0.0, 0.0]), Dir::West);
+        assert_eq!(landing_side([0.05, 0.0, 0.2]), Dir::South);
+        assert_eq!(landing_side([0.0, 0.0, -0.2]), Dir::North);
+        // A diagonal tie: the first of `Direction.values()` wins (north before east).
+        assert_eq!(landing_side([0.1, 0.0, -0.1]), Dir::North);
+    }
+
+    #[test]
+    fn a_handler_insert_simulated_then_committed_takes_it_once() {
+        // `ItemDrainItemHandler.insertItem` from the east face: `insertedFrom` is west, the
+        // stack starts at the edge. A simulated insert (the glue's `insert_into_drain_sim` on a
+        // copy) leaves the drain as it was; the committed one takes it; then it holds a stack
+        // and takes no more (`!getHeldItemStack().isEmpty()`).
+        let mut d = Drain::default();
+        let mut copy = d.clone();
+        assert_eq!(insert(&mut copy, "minecraft:cobblestone", 32, Dir::West, &[]), 32);
+        assert_eq!(d, Drain::default());
+        assert_eq!(insert(&mut d, "minecraft:cobblestone", 32, Dir::West, &[]), 32);
+        let held = d.held.clone().unwrap();
+        assert_eq!((held.position, held.from, held.count), (0.0, Dir::West, 32));
+        assert_eq!(insert(&mut d, "minecraft:cobblestone", 32, Dir::West, &[]), 0);
+        // Nothing to empty: across in 8 ticks, out by the west side.
+        assert_eq!(run(&mut d, &[], 9), vec![Tick::Out(Dir::West)]);
+        // Of a stack of buckets it takes one (`canItemBeEmptied`).
+        let mut d = Drain::default();
+        assert_eq!(insert(&mut d, "minecraft:water_bucket", 3, Dir::South, &[]), 1);
+    }
 
     fn run(d: &mut Drain, recipes: &[(String, Emptying)], ticks: usize) -> Vec<Tick> {
         (0..ticks)

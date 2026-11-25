@@ -197,7 +197,7 @@ pub fn use_wrench(
         // controller, so `getInventory().ejectAll()` takes every item off the belt before the
         // transfer below, which then finds nothing to hand on.
         if seg.part == Part::Start {
-            with_world(|w| w.destroy_belt(dim, &mut taken));
+            with_world(|w| w.destroy_belt(dim, &mut taken, rpm));
         }
         set_air(lv, pos);
         // `levelEvent(PARTICLES_DESTROY_BLOCK, pos, Block.getId(state))`.
@@ -344,8 +344,11 @@ pub fn use_connector(
     let replaceable =
         next_state.is_none_or(|s| lv.host.block_states().replaceable(s) != Some(false));
     if !replaceable {
-        // Join the belt there.
-        let other = segment_at(lv, next)?;
+        // Join the belt there; any other block refuses (`if (!AllBlocks.BELT.has(nextState))
+        // return FAIL`).
+        let Some(other) = segment_at(lv, next) else {
+            return Some(false);
+        };
         if !seg.compatible(&other) {
             return Some(false);
         }

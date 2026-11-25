@@ -4,6 +4,7 @@
 //! `track/segment_right`) under a transform relative to the curve's first track block.
 
 use crate::bezier::{Curve, Vec3, bezier, bezier_derivative};
+use crate::track::TrackShape;
 
 fn add(a: Vec3, b: Vec3) -> Vec3 {
     [a[0] + b[0], a[1] + b[1], a[2] + b[2]]
@@ -37,7 +38,7 @@ fn normalize(a: Vec3) -> Vec3 {
 }
 
 /// Catnip's `VecHelper.rotate(vec, deg, axis)`: about the x, y or z axis (0, 1, 2).
-fn rotate(v: Vec3, deg: f64, axis: usize) -> Vec3 {
+pub(crate) fn rotate(v: Vec3, deg: f64, axis: usize) -> Vec3 {
     if deg == 0.0 {
         return v;
     }
@@ -116,15 +117,23 @@ fn identity() -> [[f64; 4]; 4] {
 
 /// A `PoseStack` with the operations Create's `TransformStack` applies, each multiplied on the
 /// right as `PoseStack` does; rotations take radians, as Create passes `getModelAngles`' result.
-struct Pose([[f64; 4]; 4]);
+pub(crate) struct Pose([[f64; 4]; 4]);
 
 impl Pose {
-    fn translate(self, v: Vec3) -> Pose {
+    pub(crate) fn new() -> Pose {
+        Pose(identity())
+    }
+    /// Where the pose puts point `v`.
+    pub(crate) fn apply(&self, v: Vec3) -> Vec3 {
+        let m = &self.0;
+        std::array::from_fn(|r| m[0][r] * v[0] + m[1][r] * v[1] + m[2][r] * v[2] + m[3][r])
+    }
+    pub(crate) fn translate(self, v: Vec3) -> Pose {
         let mut t = identity();
         t[3] = [v[0], v[1], v[2], 1.0];
         Pose(mul(&self.0, &t))
     }
-    fn rotate(self, axis: usize, radians: f64) -> Pose {
+    pub(crate) fn rotate(self, axis: usize, radians: f64) -> Pose {
         let (s, c) = (
             f64::from((radians as f32).sin()),
             f64::from((radians as f32).cos()),
@@ -151,12 +160,100 @@ impl Pose {
         s[2][2] = z;
         Pose(mul(&self.0, &s))
     }
+    fn scale(self, by: f64) -> Pose {
+        let mut s = identity();
+        for (k, col) in s.iter_mut().take(3).enumerate() {
+            col[k] = by;
+        }
+        Pose(mul(&self.0, &s))
+    }
     fn angles(self, a: Vec3) -> Pose {
         self.rotate(1, a[1]).rotate(0, a[0]).rotate(2, a[2])
     }
     fn into_mat(self) -> Mat4 {
         self.0.map(|col| col.map(|v| v as f32))
     }
+}
+
+/// What a track overlay (`track_overlay/*`: a station's, signal's or observer's marker) is drawn
+/// on: a straight, diagonal or sloped track block of its shape, or a segment of a curve leaving
+/// the block (`BezierTrackPointLocation.segment`).
+#[derive(Clone, Copy, Debug)]
+pub enum OverlayOn<'a> {
+    Straight(TrackShape),
+    Curve(&'a Curve, i32),
+}
+
+/// `TrackBlock.prepareTrackOverlay`, then `TrackTargetingBehaviour.render`'s
+/// `translate(.5, 0, .5).scale(size).translate(-.5, 0, -.5)`: the overlay model's transform
+/// relative to its track block's lower corner `track`, for target direction `front`
+/// (`POSITIVE`). On straight track it is turned to the track's first axis times the direction
+/// (up its slope, lifted 7 px and moved 2.5 px along); on a curve it stands on the segment's end,
+/// turned along the curve there and lifted 4 px, half a turn about for `NEGATIVE`. A curve's
+/// positions are the world's. None on a curve with no segments.
+pub fn overlay_pose(on: OverlayOn<'_>, track: [i32; 3], front: bool, size: f64) -> Option<Mat4> {
+    let step = if front { 1.0 } else { -1.0 };
+    let mut pose = Pose(identity());
+    let (normal, diff, axis) = match on {
+        OverlayOn::Curve(c, segment) => {
+            let length = (c.length * 2.0).floor();
+            if length <= 0.0 {
+                return None;
+            }
+            let seg = f64::from(segment + 1);
+            let t = seg / length;
+            let (pre, post) = ((seg - 1.0) / length, (seg + 1.0) / length);
+            let bottom_centre = [
+                f64::from(track[0]) + 0.5,
+                f64::from(track[1]),
+                f64::from(track[2]) + 0.5,
+            ];
+            pose = pose
+                .translate(sub(c.position(t), bottom_centre))
+                .translate([0.0, -f64::from(4.0f32 / 16.0), 0.0]);
+            let diff = normalize(sub(c.position(post), c.position(pre)));
+            (c.normal(t), diff, None)
+        }
+        OverlayOn::Straight(shape) => {
+            let axis = shape.axes()[0];
+            (shape.normal(), normalize(scale(axis, step)), Some(axis))
+        }
+    };
+    let angles = model_angles(normal, diff);
+    pose = pose
+        .translate([0.5; 3])
+        .rotate(1, angles[1])
+        .rotate(0, angles[0])
+        .translate([-0.5; 3]);
+    match axis {
+        Some(a) if a[1] != 0.0 => {
+            pose = pose.translate([
+                0.0,
+                f64::from(7.0f32 / 16.0),
+                f64::from(step as f32 * 2.5 / 16.0),
+            ]);
+        }
+        Some(_) => {}
+        None => {
+            pose = pose.translate([0.0, f64::from(4.0f32 / 16.0), 0.0]);
+            if !front {
+                pose = pose
+                    .translate([0.5; 3])
+                    .rotate(1, std::f64::consts::PI)
+                    .translate([-0.5; 3]);
+            }
+        }
+    }
+    let pose = pose
+        .translate([0.5, 0.0, 0.5])
+        .scale(size)
+        .translate([-0.5, 0.0, -0.5]);
+    Some(pose.into_mat())
+}
+
+/// A column-major transform as a row-major 3×4 affine one (the world draw's instances).
+pub fn rows3x4(m: &Mat4) -> [f32; 12] {
+    std::array::from_fn(|k| m[k % 4][k / 4])
 }
 
 /// `SegmentAngles` for `curve`, relative to the block `origin` (the curve's first track, its
@@ -351,5 +448,82 @@ mod tests {
         let tie = ties[0];
         let gap = length(sub(apply(&rail.1, [0.0; 3]), apply(tie, [0.5, 0.0, 0.0])));
         assert!((gap - 0.965).abs() < 0.05, "{gap}");
+    }
+}
+
+#[cfg(test)]
+mod overlay_tests {
+    use super::*;
+
+    fn apply(m: &Mat4, v: Vec3) -> Vec3 {
+        std::array::from_fn(|r| {
+            (0..3).map(|c| f64::from(m[c][r]) * v[c]).sum::<f64>() + f64::from(m[3][r])
+        })
+    }
+
+    fn close(a: Vec3, b: Vec3) -> bool {
+        (0..3).all(|k| (a[k] - b[k]).abs() < 1e-4)
+    }
+
+    #[test]
+    fn an_overlay_on_flat_track_turns_to_its_direction() {
+        // On z track, `POSITIVE`: unturned (the model's +z along the axis).
+        let m = overlay_pose(OverlayOn::Straight(TrackShape::Zo), [0; 3], true, 1.0).unwrap();
+        assert!(close(apply(&m, [0.5, 0.0, 1.0]), [0.5, 0.0, 1.0]));
+        // `NEGATIVE`: half a turn about the block's middle.
+        let m = overlay_pose(OverlayOn::Straight(TrackShape::Zo), [0; 3], false, 1.0).unwrap();
+        assert!(close(apply(&m, [0.5, 0.0, 1.0]), [0.5, 0.0, 0.0]));
+        // On x track, `POSITIVE`: the model's +z turned to +x.
+        let m = overlay_pose(OverlayOn::Straight(TrackShape::Xo), [0; 3], true, 1.0).unwrap();
+        assert!(close(apply(&m, [0.5, 0.0, 1.0]), [1.0, 0.0, 0.5]));
+        // On a diagonal: along (1, 0, 1).
+        let m = overlay_pose(OverlayOn::Straight(TrackShape::Pd), [0; 3], true, 1.0).unwrap();
+        let tip = apply(&m, [0.5, 0.0, 1.0]);
+        let h = std::f64::consts::FRAC_1_SQRT_2 / 2.0;
+        assert!(close(tip, [0.5 + h, 0.0, 0.5 + h]), "{tip:?}");
+        // The preview's scale grows it about the bottom middle.
+        let m = overlay_pose(OverlayOn::Straight(TrackShape::Zo), [0; 3], true, 2.0).unwrap();
+        assert!(close(apply(&m, [0.5, 0.0, 1.0]), [0.5, 0.0, 1.5]));
+    }
+
+    #[test]
+    fn an_overlay_on_a_ramp_climbs_with_it() {
+        // Rising south (`as`), `POSITIVE`: the model's +z goes up the slope, lifted 7 px and 2.5 px
+        // on.
+        let m = overlay_pose(OverlayOn::Straight(TrackShape::As), [0; 3], true, 1.0).unwrap();
+        let a = apply(&m, [0.5, 0.0, 0.0]);
+        let b = apply(&m, [0.5, 0.0, 1.0]);
+        let d = [b[0] - a[0], b[1] - a[1], b[2] - a[2]];
+        let h = std::f64::consts::FRAC_1_SQRT_2;
+        assert!(close(d, [0.0, h, h]), "{d:?}");
+    }
+
+    #[test]
+    fn an_overlay_on_a_curve_stands_on_its_segment() {
+        let up = [0.0, 1.0, 0.0];
+        let c = Curve::new(
+            [[3.0, 64.0, 0.5], [10.5, 64.0, 8.0]],
+            [[1.0, 0.0, 0.0], [0.0, 0.0, -1.0]],
+            [up, up],
+        );
+        let track = [2, 64, 0];
+        let m = overlay_pose(OverlayOn::Curve(&c, 5), track, true, 1.0).unwrap();
+        // The model's bottom middle, from the track block's corner, is where the segment ends.
+        let at = apply(&m, [0.5, 0.0, 0.5]);
+        let length = (c.length * 2.0).floor();
+        let p = c.position(6.0 / length);
+        let want = [p[0] - 2.0, p[1] - 64.0, p[2]];
+        assert!(close(at, want), "{at:?} {want:?}");
+        // Turned along the curve: its +z ahead along it for `POSITIVE`, behind for `NEGATIVE`.
+        let ahead = c.position(7.0 / length);
+        let tip = apply(&m, [0.5, 0.0, 1.0]);
+        let to_tip = [tip[0] - at[0], tip[2] - at[2]];
+        let to_ahead = [ahead[0] - p[0], ahead[2] - p[2]];
+        assert!(to_tip[0] * to_ahead[0] + to_tip[1] * to_ahead[1] > 0.0);
+        let back = overlay_pose(OverlayOn::Curve(&c, 5), track, false, 1.0).unwrap();
+        let tip = apply(&back, [0.5, 0.0, 1.0]);
+        let to_tip = [tip[0] - at[0], tip[2] - at[2]];
+        assert!(to_tip[0] * to_ahead[0] + to_tip[1] * to_ahead[1] < 0.0);
+        assert_eq!(rows3x4(&m)[3], m[3][0]);
     }
 }

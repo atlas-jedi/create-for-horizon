@@ -35,5 +35,31 @@
         ]
       ]
     }
+  },
+  "collision_shapes": {
+    "default": [
+      [
+        0.0,
+        0.0,
+        0.0,
+        1.0,
+        0.375,
+        1.0
+      ]
+    ]
+  },
+  "collision_context_shapes": {
+    "player": {
+      "default": [
+        [
+          0.0,
+          0.0,
+          0.0,
+          1.0,
+          0.1875,
+          1.0
+        ]
+      ]
+    }
   }
 }

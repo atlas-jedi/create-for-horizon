@@ -122,8 +122,8 @@ use create_engine::Block;
 use create_engine::contraption::{Chassis, Found, Sticky};
 use create_engine::kinetics::{Axis, Dir};
 use mod_api::{
-    BlockClick, BlockState, BlockUpdateFlags, Compound, Flow, Host, ItemStack, LeftClickBlockEvent,
-    PlayerRef, Registrar, RegistrationContext, ServerHost,
+    BlockClick, BlockState, BlockUpdateFlags, Compound, Flow, Host, HostBlockStates as _,
+    ItemStack, LeftClickBlockEvent, PlayerRef, Registrar, RegistrationContext, ServerHost,
 };
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -139,6 +139,10 @@ pub struct Contraptions;
 /// the block entity keeps: the value box's option and the chassis range.
 const CARRIED_OPTION: &str = "ScrollOption";
 const CARRIED_RANGE: &str = "ChassisRange";
+
+/// What a windmill bearing taken apart to move carries (`WindmillBearingBlockEntity`'s
+/// `QueueAssembly`): it assembles again where it is set down.
+const CARRIED_REASSEMBLY: &str = "QueueAssembly";
 
 /// The column lists an older version kept and the block entity keys their entries are now.
 const STRUCTURES: [(&str, &str); 4] = [
@@ -166,6 +170,71 @@ impl Subsystem for Contraptions {
         lifts::register(r);
         actors::register(r);
         superglue::register(r);
+    }
+
+    /// `playerWillDestroy` of a mechanical piston, its head and its poles: the rest of its
+    /// extension goes with the broken part (dropping outside creative) and a piston left behind
+    /// is retracted (`create_engine::piston::teardown`).
+    fn break_block(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::BreakBlockEvent<'_>,
+    ) -> Flow {
+        use create_engine::piston::{PistonPart, teardown};
+        if event.cancelled {
+            return Flow::Continue;
+        }
+        let part = |id: Option<u32>| match id.and_then(create_info).map(|(b, i)| (b, i.facing)) {
+            Some((Block::MechanicalPiston | Block::StickyMechanicalPiston, Some(f))) => {
+                PistonPart::Base(f)
+            }
+            Some((Block::MechanicalPistonHead, Some(f))) => PistonPart::Head(f),
+            Some((Block::PistonExtensionPole, Some(f))) => PistonPart::Pole(f.axis()),
+            _ => PistonPart::Other,
+        };
+        let broken = part(super::states::id(event.state));
+        if broken == PistonPart::Other {
+            return Flow::Continue;
+        }
+        let Some(player) = host.players().acting_player() else {
+            return Flow::Continue;
+        };
+        let drops = player.is_creative(&*host) != Some(true);
+        let Some(dimension) = player.dimension(&*host).map(|d| d.to_string()) else {
+            return Flow::Continue;
+        };
+        let Some(mut lv) = ServerLevel::new(host, &dimension) else {
+            return Flow::Continue;
+        };
+        let t = teardown(event.pos, broken, |p| part(lv.state_num(p)));
+        for p in t.destroy {
+            lv.destroy_block(p, drops);
+        }
+        if let Some(base) = t.retract {
+            lv.set_property(base, "state", "retracted", super::server::update_all());
+        }
+        Flow::Continue
+    }
+
+    /// A rope, magnet or rope pulley changed: what hung from it collapses at the level tick
+    /// (`RopeBlockBase.onRemove`, `PulleyBlock.onRemove`).
+    fn block_changed(
+        &self,
+        dim: usize,
+        pos: [i32; 3],
+        old: u32,
+        new: u32,
+        _flags: mod_api::BlockUpdateFlags,
+    ) {
+        lifts::rope_changed(dim, pos, old, new);
+    }
+
+    fn world_opened(&self, host: &mut dyn ServerHost) {
+        actors::note_upright_stickers(&*host);
+    }
+
+    fn client_tick(&self, host: &mut dyn mod_api::ClientHost) {
+        actors::note_upright_stickers(&*host);
     }
 
     fn world_closed(&self) {
@@ -244,8 +313,11 @@ impl Subsystem for Contraptions {
     /// The option on a contraption block's value box (`ScrollOptionBehaviour`: a bearing's or
     /// piston's movement mode, a windmill's direction, a clock's hands) and a chassis' range
     /// (`ChassisScrollValueBehaviour`) ride with it.
-    fn carry_out(&self, lv: &mut ServerLevel<'_>, pos: [i32; 3], _b: Block, out: &mut Compound) {
+    fn carry_out(&self, lv: &mut ServerLevel<'_>, pos: [i32; 3], b: Block, out: &mut Compound) {
         let dim = lv.dim;
+        if b == Block::WindmillBearing && bearings::take_queued_reassembly(dim, pos) {
+            out.insert(CARRIED_REASSEMBLY.into(), mod_api::Tag::Byte(1));
+        }
         let (option, range) = with_world(|w| {
             let d = &mut w.dims[dim];
             (d.scroll_options.remove(&pos), d.chassis_range.remove(&pos))
@@ -263,11 +335,14 @@ impl Subsystem for Contraptions {
         &self,
         lv: &mut ServerLevel<'_>,
         pos: [i32; 3],
-        _b: Block,
+        b: Block,
         data: &Compound,
         _turn: create_engine::contraption::Transform,
     ) {
         let dim = lv.dim;
+        if b == Block::WindmillBearing && data.get(&CARRIED_REASSEMBLY.into()).is_some() {
+            bearings::queue_reassembly(lv, pos);
+        }
         let int = |k: &str| match data.get(&k.into()) {
             Some(mod_api::Tag::Int(v)) => Some(*v),
             _ => None,
@@ -307,7 +382,8 @@ impl Subsystem for Contraptions {
         superglue::tick(lv);
     }
 
-    /// A click on contraption controls riding a moving structure (`CONTROLS_CHANNEL`).
+    /// A click on contraption controls riding a moving structure (`CONTROLS_CHANNEL`), or an
+    /// attack taking glue off (`superglue::REMOVE_CHANNEL`).
     fn client_message(
         &self,
         host: &mut dyn ServerHost,
@@ -315,6 +391,10 @@ impl Subsystem for Contraptions {
         channel: &str,
         data: &[u8],
     ) -> bool {
+        if channel == superglue::REMOVE_CHANNEL {
+            superglue::remove_looked_at(host, player);
+            return true;
+        }
         if channel != draw::CONTROLS_CHANNEL {
             return false;
         }
@@ -340,6 +420,9 @@ impl Subsystem for Contraptions {
         host: &mut dyn mod_api::ClientHost,
         event: &mut mod_api::InteractionKeyMappingTriggeredEvent,
     ) -> Flow {
+        if event.key == mod_api::InteractionKey::Attack && superglue::attack_key(host) {
+            return Flow::Cancel;
+        }
         draw::use_key(host, event)
     }
 
@@ -624,12 +707,107 @@ pub fn create_info(id: u32) -> Option<(Block, create_engine::parts::StateInfo)> 
     with_world(|w| w.table.get(id).map(|(b, i)| (b, *i))).flatten()
 }
 
+/// The facts of `state` when it is a sliding door's.
+fn sliding_door(state: BlockState) -> Option<create_engine::parts::StateInfo> {
+    create_info(states::id(state)?)
+        .filter(|(b, _)| create_engine::dye::is_sliding_door(*b))
+        .map(|(_, i)| i)
+}
+
+/// `state` with `props` set; as it was when it has no such property or value.
+fn state_set(host: &dyn Host, state: BlockState, props: &[(&str, &str)]) -> BlockState {
+    let facts = mod_api::HostBlockStates::block_states(host);
+    props
+        .iter()
+        .try_fold(state, |s, (k, v)| s.with(&facts, k, v).ok())
+        .unwrap_or(state)
+}
+
+/// `Contraption.capture`: a sliding door rides hidden (`VISIBLE` false), drawn by its block
+/// entity's renderer (`SlidingDoorRenderer`); any other state is taken as it is.
+pub(crate) fn captured(host: &dyn Host, state: BlockState) -> BlockState {
+    match sliding_door(state) {
+        Some(_) => state_set(host, state, &[("visible", "false")]),
+        None => state,
+    }
+}
+
+/// `Contraption.addBlocksToWorld`: a sliding door goes back shown when closed and hidden when
+/// open (`VISIBLE` = !`OPEN`), unpowered; any other state as it is.
+pub(crate) fn put_back_state(host: &dyn Host, state: BlockState) -> BlockState {
+    match sliding_door(state) {
+        Some(door) => {
+            let visible = if door.open { "false" } else { "true" };
+            state_set(host, state, &[("visible", visible), ("powered", "false")])
+        }
+        None => state,
+    }
+}
+
+/// [`put_back_state`] of numbered state `id`.
+fn put_back_num(host: &dyn Host, id: u32) -> u32 {
+    match unnum(id) {
+        Some(state) => num(put_back_state(host, state)),
+        None => id,
+    }
+}
+
 fn add(p: [i32; 3], o: [i32; 3]) -> [i32; 3] {
     [p[0] + o[0], p[1] + o[1], p[2] + o[2]]
 }
 
 fn center(p: [i32; 3]) -> [f64; 3] {
     p.map(|v| f64::from(v) + 0.5)
+}
+
+/// A Create sound entry as `AllSoundEvents` plays it on the server (`WrappedSoundEntry.play`):
+/// each event it names (`playExisting`) at its own volume and pitch times these. Create's
+/// `sounds.json` maps each `create:` event to the vanilla sound with no scaling of its own.
+pub(crate) type SoundEntry = &'static [(&'static str, f32, f32)];
+
+/// `AllSoundEvents.CONTRAPTION_ASSEMBLE`: a wooden trapdoor opening and a faint chest.
+pub(crate) const CONTRAPTION_ASSEMBLE: SoundEntry = &[
+    ("create:contraption_assemble", 0.5, 0.5),
+    ("create:contraption_assemble_compounded_1", 0.045, 0.74),
+];
+/// `AllSoundEvents.CONTRAPTION_DISASSEMBLE`: an iron trapdoor closing.
+pub(crate) const CONTRAPTION_DISASSEMBLE: SoundEntry = &[("create:contraption_disassemble", 0.35, 0.75)];
+/// `AllSoundEvents.SLIME_ADDED`: a slime block being placed.
+pub(crate) const SLIME_ADDED: SoundEntry = &[("create:slime_added", 1.0, 1.0)];
+/// `AllSoundEvents.CONTROLLER_CLICK`: an item frame taking an item.
+pub(crate) const CONTROLLER_CLICK: SoundEntry = &[("create:controller_click", 0.35, 1.0)];
+
+/// `entry.play(level, null, pos, volume, pitch)` at the centre of block `pos`.
+pub(crate) fn play_entry(
+    lv: &mut ServerLevel<'_>,
+    entry: SoundEntry,
+    pos: [i32; 3],
+    volume: f32,
+    pitch: f32,
+) {
+    for &(name, v, p) in entry {
+        lv.level.play_sound(
+            &mut *lv.host,
+            name,
+            center(pos),
+            mod_api::SoundSource::Blocks,
+            v * volume,
+            p * pitch,
+        );
+    }
+}
+
+/// `CONTRAPTION_ASSEMBLE.playOnServer(level, worldPosition)`: a bearing, piston or gantry
+/// carriage starts moving its structure.
+pub(crate) fn assemble_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    play_entry(lv, CONTRAPTION_ASSEMBLE, pos, 1.0, 1.0);
+}
+
+/// `CONTRAPTION_DISASSEMBLE.playOnServer`: a structure set down where it stopped
+/// (`AbstractContraptionEntity.disassemble`, at its anchor), and again at a bearing or piston
+/// that took it apart.
+pub(crate) fn disassemble_sound(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    play_entry(lv, CONTRAPTION_DISASSEMBLE, pos, 1.0, 1.0);
 }
 
 const AIRS: [&str; 3] = ["minecraft:air", "minecraft:cave_air", "minecraft:void_air"];
@@ -771,6 +949,7 @@ fn put_back_blocks(
                 }
                 lv.destroy_block(p, true);
             }
+            let state = put_back_num(&*lv.host, state);
             lv.set_num(p, state, flags);
         }
     }
@@ -826,31 +1005,38 @@ fn chassis_range(dim: usize, p: [i32; 3]) -> i32 {
         .unwrap_or(create_engine::contraption::CHASSIS_RANGE)
 }
 
-/// What a structure search finds at `p` (`contraption_found`): None for air and fluids. Blocks
-/// Create can't move (unbreakable ones) are unmovable; block entities ride with what they hold
-/// (`actors::carry_storage`).
+/// What a structure search finds at `p` (`contraption_found`): None for air and fluids, and for
+/// a block that needs no moving (`BlockMovementChecks.isMovementNecessary`: grass, flowers,
+/// snow). Blocks Create may not move (`isMovementAllowed`: `movement_refused`) are unmovable;
+/// block entities ride with what they hold (`actors::carry_storage`).
 pub fn found(lv: &ServerLevel<'_>, p: [i32; 3]) -> Option<Found> {
     let id = lv.state_num(p)?;
     let (name, props) = name_props(&*lv.host, id)?;
     if AIRS.contains(&name.as_str()) || name == "minecraft:water" || name == "minecraft:lava" {
         return None;
     }
+    if !movement_necessary(lv, p, id, &name, &props) {
+        return None;
+    }
+    let unmovable = movement_refused(lv, p, id, &name);
+    // `Contraption.capture`: a sliding door rides hidden.
+    let id = if name.starts_with("create:") && name.ends_with("_door") {
+        unnum(id).map_or(id, |s| num(captured(&*lv.host, s)))
+    } else {
+        id
+    };
     let sail =
         name == "create:sail_frame" || (name.starts_with("create:") && name.ends_with("_sail"));
     let sail_facing = sail
         .then(|| prop(&props, "facing").and_then(dir_of))
         .flatten();
-    let unmovable = matches!(
-        name.as_str(),
-        "minecraft:bedrock"
-            | "minecraft:barrier"
-            | "minecraft:end_portal_frame"
-            | "minecraft:command_block"
-            | "minecraft:chain_command_block"
-            | "minecraft:repeating_command_block"
-            | "minecraft:structure_block"
-            | "minecraft:jigsaw"
-    );
+    // `BearingContraption.addBlock`: wool counts as a windmill's sail too, and so does a copycat
+    // made of a sail block (`getSailBlock`).
+    let sail_counts = !sail
+        && (in_windmill_sails(lv, id)
+            || (name.starts_with("create:copycat")
+                && crate::glue::copycat::material_at(lv.dim, p)
+                    .is_some_and(|m| in_windmill_sails(lv, num(m)))));
     let sticker = (name == "create:sticker" && flag(&props, "extended"))
         .then(|| prop(&props, "facing").and_then(dir_of))
         .flatten();
@@ -870,6 +1056,7 @@ pub fn found(lv: &ServerLevel<'_>, p: [i32; 3]) -> Option<Found> {
     Some(Found {
         state: id,
         sail_facing,
+        sail: sail_counts,
         sticky: match name.as_str() {
             "minecraft:slime_block" => Some(Sticky::Slime),
             "minecraft:honey_block" => Some(Sticky::Honey),
@@ -884,7 +1071,357 @@ pub fn found(lv: &ServerLevel<'_>, p: [i32; 3]) -> Option<Found> {
         belt: (name == "create:belt")
             .then(|| create_info(id).and_then(|(_, i)| i.belt))
             .flatten(),
+        ..moved_with(lv, p, &name, &props)
     })
+}
+
+/// What a structure search reads of the block `name[props]` at `p` besides its stickiness, glue
+/// and faces (the rest of the `Found` is left empty): whether it is brittle or push-only, and
+/// what moving it brings along (`Contraption.moveBlock`): a windmill bearing what it faces
+/// (`moveWindmillBearing`), a mechanical bearing its facing (`moveBearing`: the structure
+/// decides), a rope pulley its rope and magnet and the block under them (`movePulley`), a
+/// mechanical piston, its poles and head each other and what a sticky head holds
+/// (`moveMechanicalPiston`, `movePistonPole`, `movePistonHead`; a moving piston ends the
+/// search), a gantry carriage its front and the shafts beside it and a gantry shaft its line
+/// and carriages (`moveGantryPinion`, `moveGantryShaft`), the other half of a double chest, and
+/// a cart assembler under it. For every structure, trains' too.
+pub(crate) fn moved_with(
+    lv: &ServerLevel<'_>,
+    p: [i32; 3],
+    name: &str,
+    props: &[(String, String)],
+) -> Found {
+    let facing = prop(props, "facing").and_then(dir_of);
+    let at = |d: Dir, n: i32| {
+        let o = d.offset();
+        [p[0] + o[0] * n, p[1] + o[1] * n, p[2] + o[2] * n]
+    };
+    let mut f = Found {
+        brittle: brittle(name, props),
+        push_only: push_only(name),
+        ..Found::default()
+    };
+    // The piston parts beside a block, as their states read.
+    let part = |q: [i32; 3]| {
+        let (n, pr) = lv.name_props(q)?;
+        let fc = prop(&pr, "facing").and_then(dir_of)?;
+        let extended = prop(&pr, "state") == Some("extended");
+        Some((n, fc, extended))
+    };
+    let is_piston = |n: &str| n == "create:mechanical_piston" || n == "create:sticky_mechanical_piston";
+    match name {
+        "create:windmill_bearing" => f.drags.extend(facing.map(|d| at(d, 1))),
+        "create:mechanical_bearing" => f.bearing = facing,
+        "create:mechanical_piston_head" => {
+            f.head = facing;
+            if let Some(d) = facing {
+                let behind = at(d.opposite(), 1);
+                match part(behind) {
+                    Some((n, fc, _)) if n == "create:piston_extension_pole" && fc.axis() == d.axis() => {
+                        f.drags.push(behind);
+                    }
+                    Some((n, fc, true)) if is_piston(&n) && fc == d => f.drags.push(behind),
+                    _ => {}
+                }
+                if prop(props, "type") == Some("sticky") {
+                    f.drags.push(at(d, 1));
+                }
+            }
+        }
+        "create:piston_extension_pole" => {
+            for d in Dir::ALL
+                .into_iter()
+                .filter(|d| facing.is_some_and(|f| f.axis() == d.axis()))
+            {
+                let q = at(d, 1);
+                let Some((n, fc, extended)) = part(q) else {
+                    continue;
+                };
+                let takes = match n.as_str() {
+                    "create:piston_extension_pole" | "create:mechanical_piston_head" => {
+                        fc.axis() == d.axis()
+                    }
+                    _ if is_piston(&n) => fc == d || (fc == d.opposite() && extended),
+                    _ => false,
+                };
+                if takes {
+                    f.drags.push(q);
+                }
+            }
+        }
+        _ if is_piston(name) => {
+            let state = prop(props, "state");
+            if state == Some("moving") {
+                f.halts = true;
+            } else if let Some(d) = facing {
+                let behind = at(d.opposite(), 1);
+                if matches!(part(behind), Some((n, fc, _)) if n == "create:piston_extension_pole" && fc.axis() == d.axis())
+                {
+                    f.drags.push(behind);
+                }
+                if state == Some("extended") || name == "create:sticky_mechanical_piston" {
+                    f.drags.push(at(d, 1));
+                }
+            }
+        }
+        "create:rope_pulley" => {
+            // `movePulley`: down its rope (`maxRopeLength`), the rope and magnet as they are
+            // and the first other block below.
+            for i in 1..=create_engine::pulley::MAX_ROPE_LENGTH + 1 {
+                let q = at(Dir::Down, i);
+                match lv.block_name(q).as_deref() {
+                    Some("create:rope" | "create:pulley_magnet") => f.carries.push(q),
+                    Some(_) => {
+                        f.drags.push(q);
+                        break;
+                    }
+                    None => break,
+                }
+            }
+        }
+        "create:gantry_carriage" => {
+            if let Some(d) = facing {
+                f.drags.push(at(d, 1));
+                let along_first = flag(props, "axis_along_first");
+                let rotation = match d.axis() {
+                    Axis::X if along_first => Axis::Y,
+                    Axis::X => Axis::Z,
+                    Axis::Y if along_first => Axis::X,
+                    Axis::Y => Axis::Z,
+                    Axis::Z if along_first => Axis::X,
+                    Axis::Z => Axis::Y,
+                };
+                for s in Dir::ALL.into_iter().filter(|s| s.axis() == rotation) {
+                    let q = at(s, 1);
+                    if matches!(part(q), Some((n, fc, _)) if n == "create:gantry_shaft" && fc.axis() == s.axis())
+                    {
+                        f.drags.push(q);
+                    }
+                }
+            }
+        }
+        "create:gantry_shaft" => {
+            if let Some(own) = facing {
+                for d in Dir::ALL {
+                    let q = at(d, 1);
+                    let Some((n, fc, _)) = part(q) else {
+                        continue;
+                    };
+                    let takes = if d.axis() == own.axis() && n == "create:gantry_shaft" {
+                        fc == own
+                    } else {
+                        n == "create:gantry_carriage" && fc == d
+                    };
+                    if takes {
+                        f.drags.push(q);
+                    }
+                }
+            }
+        }
+        // `ChestBlock.getConnectedDirection`: the other half of a double chest.
+        _ if facing.is_some() && matches!(prop(props, "type"), Some("left" | "right")) => {
+            if let Some(d) = facing.filter(|d| d.axis() != Axis::Y) {
+                let other = if prop(props, "type") == Some("left") {
+                    create_engine::wrench::clockwise(d, Axis::Y)
+                } else {
+                    create_engine::wrench::clockwise(d, Axis::Y).opposite()
+                };
+                f.drags.push(at(other, 1));
+            }
+        }
+        _ => {}
+    }
+    // Cart assemblers attach themselves to the block above them.
+    let below = at(Dir::Down, 1);
+    if lv.block_name(below).as_deref() == Some("create:cart_assembler") {
+        f.drags.push(below);
+    }
+    f
+}
+
+/// `PushReaction.PUSH_ONLY`: vanilla's glazed terracotta and Create's gearbox
+/// (`GearboxBlock.getPistonPushReaction`).
+fn push_only(name: &str) -> bool {
+    name == "create:gearbox"
+        || name
+            .strip_prefix("minecraft:")
+            .is_some_and(|id| id.ends_with("_glazed_terracotta"))
+}
+
+/// A structure search that may meet running windmill bearings (`Contraption.moveBlock`:
+/// `disassembleForMovement`): each puts its sails back into the world, where the search takes
+/// them, and assembles again where it is set down (`queuedReassembly`). Runs `gather`, and again
+/// while it met any (`cells`: the world positions of what it gathered).
+pub(crate) fn gather_moving<T, E>(
+    lv: &mut ServerLevel<'_>,
+    gather: impl Fn(&ServerLevel<'_>) -> Result<T, E>,
+    cells: impl Fn(&T) -> Vec<[i32; 3]>,
+) -> Result<T, E> {
+    let mut got = gather(lv)?;
+    for _ in 0..8 {
+        let mut any = false;
+        for p in cells(&got) {
+            if lv.create_block(p) == Some(Block::WindmillBearing) {
+                any |= bearings::disassemble_for_movement(lv, p);
+            }
+        }
+        if !any {
+            break;
+        }
+        got = gather(lv)?;
+    }
+    Ok(got)
+}
+
+/// The facing of a mechanical bearing's state (engine id), None for any other block: the
+/// bearings whose tops may turn back against what carries them
+/// (`StabilizedBearingMovementBehaviour`).
+pub(crate) fn mechanical_bearing_facing(state: u32) -> Option<Dir> {
+    create_info(state)
+        .filter(|(b, _)| *b == Block::MechanicalBearing)
+        .and_then(|(_, i)| i.facing)
+}
+
+/// The world positions of `blocks`, offsets from `origin`.
+pub(crate) fn cells_of(origin: [i32; 3], blocks: &[([i32; 3], u32)]) -> Vec<[i32; 3]> {
+    blocks.iter().map(|(o, _)| add(origin, *o)).collect()
+}
+
+/// Whether the block at `p` can't be broken (`getDestroySpeed == -1`), which a pulley's rope
+/// and magnet don't replace.
+pub(crate) fn indestructible(lv: &ServerLevel<'_>, p: [i32; 3]) -> bool {
+    let Some(state) = lv.block_state(p) else {
+        return true;
+    };
+    match lv.host.block_states().destroy_speed(state) {
+        Some(h) => h == -1.0,
+        None => lv.block_name(p).is_some_and(|n| unbreakable(&n)),
+    }
+}
+
+/// Whether the block of state `id` is in `create:windmill_sails` (sails, sail frames, wool).
+fn in_windmill_sails(lv: &ServerLevel<'_>, id: u32) -> bool {
+    unnum(id).is_some_and(|s| lv.host.block_in_tag(s.block(), "create:windmill_sails") == Some(true))
+}
+
+/// `BlockMovementChecksImpl.isMovementNecessaryFallback`: a brittle block, or one in
+/// `create:movable_empty_collider` (cobwebs, vines, open fence gates), always moves; else one
+/// with a collision shape that can't be replaced (grass, flowers and thin snow stay behind).
+pub(crate) fn movement_necessary(
+    lv: &ServerLevel<'_>,
+    p: [i32; 3],
+    id: u32,
+    name: &str,
+    props: &[(String, String)],
+) -> bool {
+    if brittle(name, props) || movable_empty_collider(name) {
+        return true;
+    }
+    let Some(state) = unnum(id) else {
+        return true;
+    };
+    if lv.host.block_states().replaceable(state) == Some(true) {
+        return false;
+    }
+    // `getCollisionShape(level, pos).isEmpty()`: no block collision inside its own cell.
+    let e = 1.0e-4;
+    let [x, y, z] = p.map(f64::from);
+    let cell = [x + e, y + e, z + e, x + 1.0 - e, y + 1.0 - e, z + 1.0 - e];
+    lv.level.has_collisions(&*lv.host, cell) != Some(false)
+}
+
+/// `create:movable_empty_collider`.
+fn movable_empty_collider(name: &str) -> bool {
+    let id = name.strip_prefix("minecraft:").unwrap_or(name);
+    matches!(
+        id,
+        "cobweb"
+            | "powder_snow"
+            | "tripwire"
+            | "tripwire_hook"
+            | "bamboo_sapling"
+            | "vine"
+            | "twisting_vines_plant"
+            | "twisting_vines"
+            | "weeping_vines_plant"
+            | "weeping_vines"
+            | "cave_vines"
+            | "cave_vines_plant"
+    ) && name.starts_with("minecraft:")
+        || coral(name)
+        || (name.starts_with("minecraft:") && (id.ends_with("_fence_gate") || banner(name)))
+}
+
+/// `create:corals`: the coral plants and fans, living and dead (not the coral blocks).
+fn coral(name: &str) -> bool {
+    name.strip_prefix("minecraft:").is_some_and(|id| {
+        id.ends_with("_coral") || id.ends_with("_coral_fan") || id.ends_with("_coral_wall_fan")
+    })
+}
+
+/// `#minecraft:banners`.
+fn banner(name: &str) -> bool {
+    name.starts_with("minecraft:") && name.ends_with("_banner")
+}
+
+/// `BlockMovementChecksImpl.isMovementAllowedFallback`, refused: a block that can't be broken
+/// (`getDestroySpeed == -1`) or is in `c:relocation_not_supported` or `create:non_movable`;
+/// obsidian, crying obsidian, respawn anchors and reinforced deepslate (`ContraptionMovementSetting`
+/// `UNMOVABLE` by default); a mechanical bearing, clockwork bearing or rope pulley while it runs
+/// (a running windmill bearing moves: it is taken apart first); tracks and
+/// stations; and the vanilla blocks pistons can't push (`PushReaction.BLOCK`: a piston's head).
+/// Chassis always move.
+pub(crate) fn movement_refused(lv: &ServerLevel<'_>, p: [i32; 3], id: u32, name: &str) -> bool {
+    if matches!(
+        name,
+        "create:linear_chassis" | "create:secondary_linear_chassis" | "create:radial_chassis"
+    ) {
+        return false;
+    }
+    let state = unnum(id);
+    let hardness = state.and_then(|s| lv.host.block_states().destroy_speed(s));
+    if hardness == Some(-1.0) || (hardness.is_none() && unbreakable(name)) {
+        return true;
+    }
+    let tagged = |tag: &str| state.is_some_and(|s| lv.host.block_in_tag(s.block(), tag) == Some(true));
+    if tagged("c:relocation_not_supported") || tagged("create:non_movable") {
+        return true;
+    }
+    let dim = lv.dim;
+    let running = |name: &str| {
+        with_world(|w| {
+            let d = &w.dims[dim];
+            match name {
+                // Not a windmill bearing (`WindmillBearingBlock` is no `MechanicalBearingBlock`):
+                // a running one is taken apart to move (`disassembleForMovement`).
+                "create:mechanical_bearing" => d.windmills.contains_key(&p),
+                "create:clockwork_bearing" => d.lifts.clocks.contains_key(&p),
+                "create:rope_pulley" => d.lifts.pulleys.contains_key(&p),
+                _ => false,
+            }
+        })
+        .unwrap_or(false)
+    };
+    matches!(
+        name,
+        "minecraft:obsidian"
+            | "minecraft:crying_obsidian"
+            | "minecraft:respawn_anchor"
+            | "minecraft:reinforced_deepslate"
+            | "minecraft:piston_head"
+            | "minecraft:moving_piston"
+            | "create:track"
+            | "create:track_station"
+            // Create's `PushReaction.BLOCK`: rope and magnets (`RopeBlockBase`), cart
+            // assemblers (a cart's own search lets a second one move), water wheels' outer
+            // blocks, crushing wheels' controllers and the schematic table.
+            | "create:rope"
+            | "create:pulley_magnet"
+            | "create:cart_assembler"
+            | "create:water_wheel_structure"
+            | "create:crushing_wheel_controller"
+            | "create:schematic_table"
+    ) || running(name)
 }
 
 /// `BlockMovementChecksImpl.isBlockAttachedTowardsFallback` for fluid tanks and item vaults
@@ -939,8 +1476,58 @@ fn brittle(name: &str, props: &[(String, String)]) -> bool {
         || wool_carpet(name)
         || matches!(
             name,
-            "create:steam_whistle" | "create:steam_whistle_extension" | "create:brass_funnel"
+            "create:steam_whistle"
+                | "create:steam_whistle_extension"
+                | "create:andesite_belt_funnel"
+                | "create:brass_belt_funnel"
         )
+        || brittle_tagged(name)
+}
+
+/// `create:brittle` as Create's data gives it: its nozzle, crank, valve handles, rope, magnet,
+/// links and bells; vanilla bells, cocoa, flower pots, moss carpet, vines, big dripleaf, cake,
+/// corals, cave vines, banners, beds and doors (Create's sliding doors among them).
+fn brittle_tagged(name: &str) -> bool {
+    if let Some(id) = name.strip_prefix("create:") {
+        return matches!(
+            id,
+            "nozzle"
+                | "hand_crank"
+                | "rope"
+                | "pulley_magnet"
+                | "redstone_link"
+                | "peculiar_bell"
+                | "haunted_bell"
+                | "andesite_door"
+                | "brass_door"
+                | "copper_door"
+                | "train_door"
+                | "framed_glass_door"
+        ) || id.ends_with("_valve_handle");
+    }
+    let Some(id) = name.strip_prefix("minecraft:") else {
+        return false;
+    };
+    matches!(
+        id,
+        "bell"
+            | "cocoa"
+            | "flower_pot"
+            | "moss_carpet"
+            | "bamboo_sapling"
+            | "big_dripleaf"
+            | "vine"
+            | "twisting_vines_plant"
+            | "twisting_vines"
+            | "weeping_vines_plant"
+            | "weeping_vines"
+            | "cake"
+            | "cave_vines"
+            | "cave_vines_plant"
+    ) || coral(name)
+        || banner(name)
+        || id.ends_with("_bed")
+        || id.ends_with("_door")
 }
 
 fn torch(name: &str) -> bool {

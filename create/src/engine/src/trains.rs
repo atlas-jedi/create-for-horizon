@@ -21,6 +21,11 @@ use std::collections::{BinaryHeap, HashMap, HashSet};
 pub const TOP_SPEED: f64 = 28.0 / 20.0;
 pub const TURN_TOP_SPEED: f64 = 14.0 / 20.0;
 pub const ACCELERATION: f64 = 3.0 / 400.0;
+/// A train burning fuel (`fuelTicks > 0`): `poweredTrainTopSpeed` (40 m/s) and
+/// `poweredTrainTurningTopSpeed` (20 m/s). `poweredTrainAcceleration` is 3 m/s², the same as
+/// [`ACCELERATION`].
+pub const POWERED_TOP_SPEED: f64 = 40.0 / 20.0;
+pub const POWERED_TURN_TOP_SPEED: f64 = 20.0 / 20.0;
 /// `manualTrainSpeedModifier`: a train driven by hand runs at 75% of a scheduled one's speed.
 pub const MANUAL_SPEED: f64 = 0.75;
 /// `StandardBogeyBlock.getWheelPointSpacing` (both sizes).
@@ -154,7 +159,25 @@ pub struct Train {
     pub derailed: bool,
     /// Driven this tick against the way its controls face, not to brake (`backwardsDriver`).
     pub backwards: bool,
+    /// Ticks of fuel left (`fuelTicks`, saved as `Fuel`): above 0 it runs at the powered top
+    /// speeds.
+    pub fuel: i32,
+    /// For the glue, before each tick: the burn time of the first fuel item in each carriage's
+    /// storage (`getFuelItems`: its storage blocks but vaults), None for a carriage with none.
+    pub fuel_offer: Vec<Option<i32>>,
+    /// Set by a tick that burnt fuel (`burnFuel`): the carriage whose first fuel item the glue
+    /// takes (its container item, a lava bucket's bucket, goes back).
+    pub burnt: Option<usize>,
+    /// `Navigation.announceArrival`: set off for a station more than [`ANNOUNCE_FROM`] blocks
+    /// away; its carriages' bells, note blocks and whistles play as it comes within
+    /// [`ANNOUNCE_WITHIN`] of where it is going (`CarriageContraptionEntity.tickArrivalSound`).
+    pub announce: bool,
 }
+
+/// `Navigation.startNavigation` and `CarriageContraptionEntity.tickContraption`: a journey
+/// longer than this is announced, when this near its end.
+pub const ANNOUNCE_FROM: f64 = 100.0;
+pub const ANNOUNCE_WITHIN: f64 = 60.0;
 
 /// What a tick did.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -164,7 +187,14 @@ pub enum Run {
     Arrived,
     /// Came to the end of the track (`status.endOfTrack`).
     Blocked,
+    /// Its couplings or bogeys stretched more than [`MAX_STRESS`] blocks: it stopped and
+    /// derailed (`status.highStress`).
+    Derailed,
 }
+
+/// `Train.tick`: a train whose couplings or bogeys are stretched or squeezed more than this
+/// (`maxStress > 4`) derails.
+pub const MAX_STRESS: f64 = 4.0;
 
 /// A path found (`DiscoveredPath`).
 #[derive(Clone, Debug, PartialEq)]
@@ -743,6 +773,10 @@ impl Train {
             speed_before_stall: None,
             derailed: false,
             backwards: false,
+            fuel: 0,
+            fuel_offer: Vec::new(),
+            burnt: None,
+            announce: false,
         };
         t.remember(net);
         Some(t)
@@ -888,6 +922,10 @@ impl Train {
             speed_before_stall: None,
             derailed: false,
             backwards: false,
+            fuel: 0,
+            fuel_offer: Vec::new(),
+            burnt: None,
+            announce: false,
         };
         t.remember(net);
         Some(t)
@@ -1322,17 +1360,58 @@ impl Train {
         }
     }
 
+    /// `Train.maxSpeed`: the powered top speed while it has fuel.
+    pub fn max_speed(&self) -> f64 {
+        if self.fuel > 0 {
+            POWERED_TOP_SPEED
+        } else {
+            TOP_SPEED
+        }
+    }
+
+    /// `Train.maxTurnSpeed`.
+    pub fn max_turn_speed(&self) -> f64 {
+        if self.fuel > 0 {
+            POWERED_TURN_TOP_SPEED
+        } else {
+            TURN_TOP_SPEED
+        }
+    }
+
+    /// `Train.burnFuel`: a tick of its fuel goes; with none left, the first carriage with fuel
+    /// (from the back when it runs backwards) gives one item's burn time (`fuel_offer`), which
+    /// the glue takes out of it after the tick (`burnt`).
+    fn burn_fuel(&mut self) {
+        if self.fuel > 0 {
+            self.fuel -= 1;
+            return;
+        }
+        let n = self.fuel_offer.len();
+        let from_back = self.speed < 0.0;
+        for index in 0..n {
+            let i = if from_back { n - 1 - index } else { index };
+            if let Some(burn) = self.fuel_offer[i].filter(|&b| b > 0) {
+                self.fuel += burn;
+                self.fuel_offer[i] = None;
+                self.burnt = Some(i);
+                return;
+            }
+        }
+    }
+
     /// The controls held (`CarriageContraptionEntity.control`): toward the throttle's way at
     /// 75% of top speed scaled by the throttle and the train's (`cappedTopSpeed`), the turning
     /// speed on a curve, a quarter of it backwards, braking twice as hard against the way it
     /// runs; it leaves the station.
     fn drive(&mut self, g: &Graph, m: Manual) {
         let way = m.throttle.signum();
-        let mut top = TOP_SPEED * MANUAL_SPEED;
+        // `if (targetSpeed != 0) burnFuel()`, before its top speed is read.
+        self.burn_fuel();
+        let mut top = self.max_speed() * MANUAL_SPEED;
         let capped = top * m.throttle.abs().min(1.0) * self.throttle;
         let (lead, trail) = (self.points[0], self.points[self.points.len() - 1]);
         if g.edges[lead.edge].turn.is_some() || g.edges[trail.edge].turn.is_some() {
-            top = TURN_TOP_SPEED;
+            top = self.max_turn_speed();
         }
         // `slow`: driven against the way the controls face.
         if m.inverted ^ (way < 0.0) {
@@ -1379,11 +1458,15 @@ impl Train {
             self.reserved.clear();
             self.drive(g, m);
             let before = self.leading(g, self.speed >= 0.0);
-            let (_, blocked) = self.travel(g, self.speed, &mut Control::Steer(steer), false);
+            let (_, blocked, stress) =
+                self.run_travel(g, self.speed, &mut Control::Steer(steer), false);
             Self::passed(net, occ, before, self.leading(g, self.speed >= 0.0));
             if blocked {
                 self.speed = 0.0;
                 return Run::Blocked;
+            }
+            if let Some(run) = self.overstressed(stress) {
+                return run;
             }
             return if self.speed == 0.0 {
                 Run::Still
@@ -1402,10 +1485,14 @@ impl Train {
             } else {
                 (self.speed + ACCELERATION).min(0.0)
             };
-            let (_, blocked) = self.travel(g, self.speed, &mut Control::Steer(steer), false);
+            let (_, blocked, stress) =
+                self.run_travel(g, self.speed, &mut Control::Steer(steer), false);
             if blocked {
                 self.speed = 0.0;
                 return Run::Blocked;
+            }
+            if let Some(run) = self.overstressed(stress) {
+                return run;
             }
             return Run::Moving;
         };
@@ -1441,19 +1528,19 @@ impl Train {
         if target - self.speed.abs() < 1.0 / 32.0 {
             self.speed = target.max(1.0 / 32.0) * dir;
         } else {
-            let max_approach = TOP_SPEED * (target / 10.0);
+            self.burn_fuel();
+            let top = self.max_speed();
+            let max_approach = top * (target / 10.0);
             if target < 10.0 && self.speed * dir > max_approach {
                 self.speed += (max_approach - self.speed.abs()) * 0.5 * dir;
             } else {
-                let turn_top = TOP_SPEED.min(TURN_TOP_SPEED);
-                let mut target_speed = if target > braking {
-                    TOP_SPEED * dir
-                } else {
-                    0.0
-                };
+                // `topSpeed *= train.throttle`: a schedule's throttle or the driver's limits it.
+                let top = top * self.throttle;
+                let turn_top = top.min(self.max_turn_speed());
+                let mut target_speed = if target > braking { top * dir } else { 0.0 };
                 if let Some(curve) = seen.curve {
                     let slowing = braking - turn_top * turn_top / (2.0 * ACCELERATION);
-                    let turn = if curve > slowing { TOP_SPEED } else { turn_top } * dir;
+                    let turn = if curve > slowing { top } else { turn_top } * dir;
                     if turn.abs() < target_speed.abs() {
                         target_speed = turn;
                     }
@@ -1470,7 +1557,7 @@ impl Train {
         }
         let approaching = nav.distance < 5.0;
         let before = self.leading(g, !nav.behind);
-        let (moved, blocked) = self.travel(
+        let (moved, blocked, stress) = self.run_travel(
             g,
             self.speed,
             &mut Control::Path(&mut nav.path),
@@ -1489,18 +1576,74 @@ impl Train {
             self.reserved.clear();
             return Run::Blocked;
         }
+        if let Some(run) = self.overstressed(stress) {
+            return run;
+        }
         self.nav = Some(nav);
         Run::Moving
     }
 
+    /// [`Train::travel`] with `Train.tick`'s `maxStress`: each coupling's stretch before the
+    /// move (`stress[i]`, either way), then each carriage's bogeys' (`bogeySpacing -
+    /// getAnchorDiff`) and each bogey's wheels' (`getStress`) after it.
+    fn run_travel(
+        &mut self,
+        g: &Graph,
+        distance: f64,
+        control: &mut Control,
+        approaching: bool,
+    ) -> (f64, bool, f64) {
+        let mut stress = 0.0f64;
+        for i in 1..self.carriages.len() {
+            let lead = self.anchor(g, self.carriages[i].first);
+            let trail = self.anchor(g, self.last_bogey(i - 1));
+            let target = f64::from(self.spacing.get(i - 1).copied().unwrap_or(0));
+            stress = stress.max((target - distance_between(lead, trail)).abs());
+        }
+        let (moved, blocked) = self.travel(g, distance, control, approaching);
+        for c in 0..self.carriages.len() {
+            let shape = self.carriages[c];
+            if shape.two {
+                let diff =
+                    distance_between(self.anchor(g, shape.first), self.anchor(g, shape.first + 1));
+                stress = stress.max(f64::from(shape.bogey_spacing) - diff);
+            }
+            for b in shape.first..=self.last_bogey(c) {
+                let wheels =
+                    distance_between(self.points[2 * b].at(g), self.points[2 * b + 1].at(g));
+                stress = stress.max(WHEEL_SPACING - wheels);
+            }
+        }
+        (moved, blocked, stress)
+    }
+
+    /// `Train.tick` past [`MAX_STRESS`]: it stops, stops navigating and derails.
+    fn overstressed(&mut self, stress: f64) -> Option<Run> {
+        if stress <= MAX_STRESS {
+            return None;
+        }
+        self.speed = 0.0;
+        self.nav = None;
+        self.reserved.clear();
+        self.derailed = true;
+        Some(Run::Derailed)
+    }
+
     /// `Navigation.findPathTo`: searched ahead of its front and behind its back (not back
-    /// out of a path it is already running, and behind only when it has controls facing
-    /// backwards, `doubleEnded`), the cheaper one.
-    pub fn find_path(&self, net: &Network, targets: &[usize], cx: &SearchContext) -> Option<Found> {
+    /// out of a path it is already running), the cheaper one, each way only when it may be
+    /// driven that way (`drive`, [`crate::train_status::may_drive`]: a conductor facing it, or
+    /// behind only with controls facing backwards, `doubleEnded`).
+    pub fn find_path(
+        &self,
+        net: &Network,
+        targets: &[usize],
+        cx: &SearchContext,
+        drive: [bool; 2],
+    ) -> Option<Found> {
         let g = &net.graph;
         let mut found: [Option<Found>; 2] = [None, None];
         for (k, forward) in [true, false].into_iter().enumerate() {
-            if !forward && !self.double_ended {
+            if !drive[k] {
                 continue;
             }
             if let Some(nav) = &self.nav
@@ -1527,6 +1670,9 @@ impl Train {
     /// `startNavigation`.
     pub fn start(&mut self, net: &Network, found: Found) {
         self.manual = None;
+        if found.distance.abs() > ANNOUNCE_FROM {
+            self.announce = true;
+        }
         self.nav = Some(Nav {
             station: net.stations[found.station].0,
             distance: found.distance.abs(),
@@ -1648,9 +1794,27 @@ pub struct TrainOnTrack {
     pub players: i32,
     /// What the glue measured for its schedule before this tick (taken by the tick).
     pub probes: Probes,
+    /// The player who assembled it (`Train.owner`), who is told its status.
+    pub owner: Option<u128>,
+    /// What it has to tell its owner (`TrainStatus`).
+    pub status: crate::train_status::Status,
+    /// For the glue, before each tick: each carriage's conductors driving toward the train's
+    /// front and its back (`Carriage.presentConductors`, kept while the glue can't tell).
+    pub conductors: Vec<[bool; 2]>,
 }
 
 impl TrainOnTrack {
+    /// `hasForwardConductor` and `hasBackwardConductor`.
+    pub fn conductors_present(&self) -> [bool; 2] {
+        crate::train_status::any_side(&self.conductors)
+    }
+
+    /// `runtime.paused` as Create reads it: no schedule (`ScheduleRuntime.reset` pauses it),
+    /// or one paused.
+    pub fn paused(&self) -> bool {
+        self.schedule.is_none() || self.runtime.paused
+    }
+
     /// `Train.getNavigationPenalty`.
     pub fn navigation_penalty(&self) -> i32 {
         if self.schedule.is_none() || self.runtime.paused {
@@ -1665,6 +1829,25 @@ impl TrainOnTrack {
             }
         }
         ANY_TRAIN
+    }
+
+    /// Whether its arrival is to be announced now (`announceArrival` and
+    /// `abs(distanceToDestination) < 60`; with no destination the distance reads 0, as Create's
+    /// `cancelNavigation` leaves it).
+    pub fn announce_due(&self) -> bool {
+        self.train.announce
+            && self
+                .train
+                .nav
+                .as_ref()
+                .map_or(0.0, |n| n.distance)
+                .abs()
+                < ANNOUNCE_WITHIN
+    }
+
+    /// `getPositionInDimension`: the block its first carriage is in (`positionAnchor`).
+    pub fn block_position(&self, net: &Network) -> [i32; 3] {
+        self.position(net).map(|v| v.floor() as i32)
     }
 
     /// Where its first carriage is (its leading bogey's anchor).
@@ -1732,7 +1915,9 @@ pub struct Pose {
 }
 
 /// A train's motion as clients get it: each carriage's pose, each bogey's size and pose, the
-/// way it faced when assembled, and each carriage's blocks (only when clients must learn them).
+/// way it faced when assembled, each carriage's blocks (only when clients must learn them), and
+/// whether it is derailed (its carriages smoke, `spawnDerailParticles`) or stalled by an actor
+/// (`isStalled`: it has not arrived anywhere, for its steam).
 #[derive(Clone, Debug, PartialEq)]
 pub struct Motion {
     pub id: u32,
@@ -1740,6 +1925,8 @@ pub struct Motion {
     pub cars: Vec<Pose>,
     pub bogeys: Vec<(BogeySize, Pose)>,
     pub blocks: Option<Vec<CarBlocks>>,
+    pub derailed: bool,
+    pub stalled: bool,
 }
 
 const HEADINGS: [[i32; 2]; 4] = [[1, 0], [0, 1], [-1, 0], [0, -1]];
@@ -1769,9 +1956,10 @@ fn get_pose(d: &[u8], k: usize) -> Option<Pose> {
 }
 
 impl Motion {
-    /// The message: id, heading, carriage and bogey counts, whether blocks follow; each
-    /// carriage's pose; each bogey's size and pose; then each carriage's block count and
-    /// blocks. A message of the id alone clears the train.
+    /// The message: id, heading, carriage and bogey counts, whether blocks follow (bit 0, with
+    /// derailed in bit 1 and stalled in bit 2); each carriage's pose; each bogey's size and
+    /// pose; then each carriage's block count and blocks. A message of the id alone clears the
+    /// train.
     pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(8 + 48 * self.cars.len() + 49 * self.bogeys.len());
         out.extend_from_slice(&self.id.to_le_bytes());
@@ -1783,7 +1971,11 @@ impl Motion {
         );
         out.push(self.cars.len().min(255) as u8);
         out.push(self.bogeys.len().min(255) as u8);
-        out.push(u8::from(self.blocks.is_some()));
+        out.push(
+            u8::from(self.blocks.is_some())
+                | (u8::from(self.derailed) << 1)
+                | (u8::from(self.stalled) << 2),
+        );
         for c in self.cars.iter().take(255) {
             put_pose(&mut out, c);
         }
@@ -1818,7 +2010,9 @@ impl Motion {
             return Err(Some(id));
         }
         let heading = HEADINGS[usize::from(d[4]).min(3)];
-        let (n_cars, n_bogeys, with_blocks) = (usize::from(d[5]), usize::from(d[6]), d[7] != 0);
+        let (n_cars, n_bogeys, with_blocks) =
+            (usize::from(d[5]), usize::from(d[6]), d[7] & 1 != 0);
+        let (derailed, stalled) = (d[7] & 2 != 0, d[7] & 4 != 0);
         let mut k = 8;
         let mut cars = Vec::with_capacity(n_cars);
         for _ in 0..n_cars {
@@ -1859,6 +2053,8 @@ impl Motion {
             cars,
             bogeys,
             blocks,
+            derailed,
+            stalled,
         })
     }
 }
@@ -1913,6 +2109,8 @@ impl TrainOnTrack {
             cars,
             bogeys,
             blocks: full.then(|| self.cars.clone()),
+            derailed: self.train.derailed,
+            stalled: self.train.stalled,
         }
     }
 
@@ -1928,7 +2126,7 @@ impl TrainOnTrack {
             .iter()
             .any(|p| g.edges.get(p.edge).is_some_and(|e| e.turn.is_some()));
         event.started
-            || matches!(event.run, Run::Arrived | Run::Blocked)
+            || matches!(event.run, Run::Arrived | Run::Blocked | Run::Derailed)
             || self.train.speed == 0.0
             || (on_turn && tick >= self.sent_tick + CURVE_UPDATE_TICKS)
             || lead != self.sent_edge
@@ -2027,9 +2225,10 @@ pub struct Railway {
     pub tracks: HashMap<[i32; 3], TrackShape>,
     pub stations: HashMap<[i32; 3], String>,
     pub signals: HashMap<[i32; 3], SignalBlock>,
-    /// The track and way each signal picked with its item (`TrackTargetingBehaviour`), as its
-    /// block entity keeps them; a signal with none binds to the track beside it.
-    pub signal_targets: HashMap<[i32; 3], crate::network::Target>,
+    /// The track and way each station, signal and track observer picked with its item
+    /// (`TrackTargetingBehaviour`), as its block entity keeps them; one with none binds to the
+    /// straight track beside it.
+    pub targets: HashMap<[i32; 3], crate::network::Target>,
     /// Names saved with a column, waiting for their station block.
     pub saved_names: HashMap<[i32; 3], String>,
     /// Stations in assembly mode (`StationBlock.ASSEMBLING`), each with its assembly
@@ -2066,6 +2265,9 @@ pub struct Railway {
     dirty: bool,
     signals_dirty: bool,
     curves_seen: u64,
+    /// A column unloaded since the graph was last built: trains its track leaves off it are not
+    /// told their track is missing (Create keeps its graph whole; here it goes with its chunks).
+    unloaded: bool,
 }
 
 impl Railway {
@@ -2100,12 +2302,13 @@ impl Railway {
         }
     }
 
-    /// The track and way the signal at `pos` picked (`TargetTrack`, `TargetDirection`), read from
-    /// its block entity when it is placed or loaded; the graph is built again when it changes.
-    pub fn set_signal_target(&mut self, pos: [i32; 3], target: Option<crate::network::Target>) {
+    /// The track and way the station, signal or observer at `pos` picked (`TargetTrack`,
+    /// `TargetDirection`, `Bezier`), read from its block entity when it is placed or loaded; the
+    /// graph is built again when it changes.
+    pub fn set_target(&mut self, pos: [i32; 3], target: Option<crate::network::Target>) {
         let old = match target {
-            Some(t) => self.signal_targets.insert(pos, t),
-            None => self.signal_targets.remove(&pos),
+            Some(t) => self.targets.insert(pos, t),
+            None => self.targets.remove(&pos),
         };
         if old != target {
             self.dirty = true;
@@ -2184,7 +2387,7 @@ impl Railway {
     /// A track, station or signal at `pos` is gone.
     pub fn remove(&mut self, pos: [i32; 3]) {
         let signal = self.signals.remove(&pos).is_some();
-        self.signal_targets.remove(&pos);
+        self.targets.remove(&pos);
         if signal && self.lights.remove(&pos).is_some() {
             self.lights_changed.push((pos, None));
         }
@@ -2229,6 +2432,7 @@ impl Railway {
         self.auto_schedules.retain(|p, _| out(p));
         self.prev_train_names.retain(|p, _| out(p));
         self.trains.retain(|t| t.column != (cx, cz));
+        self.unloaded = true;
         if (t, s, g) != (self.tracks.len(), self.stations.len(), self.signals.len()) {
             self.dirty = true;
         }
@@ -2340,14 +2544,15 @@ impl Railway {
             curves,
             &stations,
             &signals,
-            &self.signal_targets,
+            &self.targets,
         );
         let mut observers: Vec<[i32; 3]> = self.observers.keys().copied().collect();
         observers.sort_unstable();
-        self.net.bind_observers(&self.tracks, &observers);
+        self.net.bind_observers(&self.tracks, &observers, &self.targets);
         self.dirty = false;
         self.signals_dirty = true;
         self.curves_seen = curves.revision;
+        let unloaded = std::mem::take(&mut self.unloaded);
         self.states = vec![[SignalState::Invalid; 2]; self.net.signals.len()];
         self.refresh_forced();
         self.occupancy.fill(&self.net, &[]);
@@ -2356,8 +2561,14 @@ impl Railway {
             let bound = self.trains[i].train.bind(&self.net);
             if bound && !was {
                 self.trains[i].fresh = true;
+                // `reattachToTracks`: on the track again (`successfulMigration`).
+                self.trains[i].status.successful_migration();
             }
             if !bound {
+                // `reattachToTracks` finding no track under it (`failedMigration`).
+                if was && !unloaded {
+                    self.trains[i].status.failed_migration();
+                }
                 continue;
             }
             if let Some(station) = self.trains[i].train.nav.as_ref().map(|n| n.station) {
@@ -2399,6 +2610,13 @@ impl Railway {
     /// Train `i` finds its way to the nearest of `targets` and sets off (`findPathTo`,
     /// `startNavigation`); false when there is none.
     pub fn navigate(&mut self, i: usize, targets: &[usize]) -> bool {
+        let paused = self.trains[i].paused();
+        self.navigate_as(i, targets, paused)
+    }
+
+    /// [`Railway::navigate`] for a train whose schedule is `paused` or not (its schedule is
+    /// out of it while it ticks).
+    fn navigate_as(&mut self, i: usize, targets: &[usize], paused: bool) -> bool {
         if targets.is_empty() || !self.trains[i].train.bound || self.trains[i].train.derailed {
             return false;
         }
@@ -2433,13 +2651,59 @@ impl Railway {
                 .as_ref()
                 .map_or(0, |n| n.ticks_waiting),
         };
-        match self.trains[i].train.find_path(&self.net, targets, &cx) {
+        // `canDriveForward`, `canDriveBackward`.
+        let t = &self.trains[i];
+        let drive = crate::train_status::may_drive(
+            t.conductors_present(),
+            t.train.double_ended,
+            paused,
+        );
+        match self.trains[i].train.find_path(&self.net, targets, &cx, drive) {
             Some(found) => {
                 self.trains[i].train.start(&self.net, found);
                 true
             }
             None => false,
         }
+    }
+
+    /// `ScheduleRuntime.tick` after a path was found: `successfulNavigation`, then
+    /// `startNavigation`'s `foundConductor` (its schedule runs), and it is in transit.
+    fn navigation_started(&mut self, i: usize) {
+        let t = &mut self.trains[i];
+        t.status.successful_navigation();
+        t.status.found_conductor();
+        t.runtime.started();
+    }
+
+    /// `DestinationInstruction.start`'s `anyMatch`: a station on the track train `i` stands on
+    /// (assembling or not) is named as `filter` asks.
+    pub fn any_named(&self, i: usize, filter: &str) -> bool {
+        let t = &self.trains[i].train;
+        let g = &self.net.graph;
+        let Some(start) = t.points.first().filter(|_| t.bound).map(|p| g.edges[p.edge].from) else {
+            return false;
+        };
+        // The nodes its track reaches, either way.
+        let mut seen = vec![false; g.nodes.len()];
+        let mut todo = vec![start];
+        seen[start] = true;
+        while let Some(n) = todo.pop() {
+            for &e in &g.out[n] {
+                let to = g.edges[e].to;
+                if !seen[to] {
+                    seen[to] = true;
+                    todo.push(to);
+                }
+            }
+        }
+        self.net.stations.iter().any(|(p, at)| {
+            seen[g.edges[at.edge].from]
+                && self
+                    .stations
+                    .get(p)
+                    .is_some_and(|name| station_matches(filter, name))
+        })
     }
 
     /// `SignalBoundary.tickState`: each side with signal blocks is red while redstone holds it
@@ -2547,6 +2811,13 @@ impl Railway {
                 self.trains[i].train.backwards,
                 self.trains[j].train.backwards,
             ];
+            // `crash`: told with where each is, unless it was derailed already.
+            for k in [i, j] {
+                if !self.trains[k].train.derailed {
+                    let p = self.trains[k].block_position(&self.net);
+                    self.trains[k].status.crash(Some(p));
+                }
+            }
             self.trains[i].train.crash();
             self.trains[j].train.crash();
             self.trains[i].runtime.interrupted();
@@ -2597,6 +2868,10 @@ impl Railway {
         else {
             return false;
         };
+        // `manualControls`: a running schedule pauses for the driver.
+        if !t.paused() {
+            t.status.manual_controls();
+        }
         t.train.nav = None;
         t.train.reserved.clear();
         t.runtime.paused = true;
@@ -2830,10 +3105,15 @@ impl Railway {
                 continue;
             }
             self.trains[i].idle = self.trains[i].idle.saturating_add(1);
+            // `ScheduleRuntime.tick`: not while derailed.
+            if self.trains[i].train.derailed {
+                continue;
+            }
             let Some(schedule) = self.trains[i].schedule.take() else {
                 continue;
             };
             let t = &mut self.trains[i];
+            let [front, back] = t.conductors_present();
             let inputs = Inputs {
                 idle_cargo: t.idle,
                 day_time: self.day_time,
@@ -2842,14 +3122,18 @@ impl Railway {
                     .train
                     .at_station
                     .is_some_and(|p| self.powered.contains(&p)),
+                conductor: front || back,
             };
             let probes = std::mem::take(&mut t.probes);
             let order = t
                 .runtime
                 .tick(&schedule, t.train.nav.is_some(), inputs, &probes);
-            if let Order::Throttle(p) = order {
+            match &order {
                 // `ChangeThrottleInstruction`: `train.throttle`.
-                t.train.throttle = f64::from(p.clamp(5, 100)) / 100.0;
+                Order::Throttle(p) => t.train.throttle = f64::from((*p).clamp(5, 100)) / 100.0,
+                Order::MissingConductor => t.status.missing_conductor(),
+                Order::NoPackageTarget(address) => t.status.failed_package_no_target(address),
+                _ => {}
             }
             if let Order::Navigate(filter) = &order {
                 let targets = self.matching(filter);
@@ -2859,12 +3143,20 @@ impl Railway {
                         .get(&h)
                         .is_some_and(|n| station_matches(filter, n))
                 }) {
+                    self.trains[i].status.successful_navigation();
                     self.trains[i].runtime.already_there(&schedule);
                     self.trains[i].idle = 0;
-                } else if self.navigate(i, &targets) {
-                    self.trains[i].runtime.started();
+                } else if self.navigate_as(i, &targets, false) {
+                    self.navigation_started(i);
                 } else {
                     self.trains[i].runtime.no_path();
+                    // `DestinationInstruction.start`: a station of that name on its track that
+                    // can't be reached, or none.
+                    if self.any_named(i, filter) {
+                        self.trains[i].status.failed_navigation();
+                    } else {
+                        self.trains[i].status.failed_navigation_no_target(filter);
+                    }
                 }
             }
             if let Order::NavigateTo(stations) = &order {
@@ -2875,18 +3167,42 @@ impl Railway {
                     .filter_map(|p| self.station_index(*p))
                     .collect();
                 if here.is_some_and(|h| stations.contains(&h)) {
+                    self.trains[i].status.successful_navigation();
                     self.trains[i].runtime.already_there(&schedule);
                     self.trains[i].idle = 0;
-                } else if self.navigate(i, &targets) {
-                    self.trains[i].runtime.started();
+                } else if self.navigate_as(i, &targets, false) {
+                    self.navigation_started(i);
                 } else {
                     self.trains[i].runtime.no_path();
+                    self.trains[i].status.failed_navigation();
                 }
             }
             self.trains[i].schedule = Some(schedule);
         }
         for i in 0..self.trains.len() {
             let t = &mut self.trains[i];
+            // `Navigation.tick`: a scheduled train going to its station needs a conductor
+            // facing the way it goes, or it stops navigating.
+            if let Some(nav) = &t.train.nav
+                && t.train.bound
+                && !t.train.derailed
+                && !t.paused()
+            {
+                use crate::train_status::{Crew, crew_for};
+                match crew_for(t.conductors_present(), nav.behind) {
+                    Crew::Fine => t.status.found_conductor(),
+                    crew => {
+                        if crew == Crew::Opposite {
+                            t.status.missing_correct_conductor();
+                        } else {
+                            t.status.missing_conductor();
+                        }
+                        t.train.nav = None;
+                        t.train.reserved.clear();
+                        t.runtime.interrupted();
+                    }
+                }
+            }
             let was = t.train.speed;
             let run = t.train.tick(&self.net, &mut self.occupancy, t.id);
             match run {
@@ -2896,7 +3212,16 @@ impl Railway {
                         t.runtime.arrived(s);
                     }
                 }
-                Run::Blocked => t.runtime.interrupted(),
+                Run::Blocked => {
+                    t.runtime.interrupted();
+                    t.status.end_of_track();
+                }
+                Run::Derailed => {
+                    t.runtime.interrupted();
+                    t.status.high_stress();
+                }
+                // `trackOK`: moving freely.
+                _ if t.train.speed != 0.0 => t.status.track_ok(),
                 _ => {}
             }
             if run != Run::Still || was != 0.0 {
@@ -3117,6 +3442,9 @@ mod tests {
             icon: 0,
             players: 0,
             probes: Default::default(),
+            owner: None,
+            status: Default::default(),
+            conductors: Vec::new(),
         });
         r.trains.len() - 1
     }
@@ -3216,6 +3544,80 @@ mod tests {
         assert!((front[0] - 410.5).abs() < 0.5, "{front:?}");
     }
 
+    /// The top speed a train on a 1200 block straight reaches toward a station 1100 ahead, with
+    /// `setup` applied after assembly and before each tick.
+    fn top_speed_with(setup: impl Fn(&mut Train)) -> (f64, Train) {
+        let mut r = Railway::default();
+        let mut t = HashMap::new();
+        line(&mut t, [0, 64, 0], [1, 0, 0], 1200, TrackShape::Xo);
+        for (p, s) in t {
+            r.set_track(p, s);
+        }
+        r.add_station([1110, 64, 1]);
+        r.ensure(&Curves::default());
+        let i = assemble(&mut r, &[[9, 64, 0]], [1.0, 0.0, 0.0]);
+        assert!(r.navigate(i, &[0]));
+        let (mut events, mut top) = (Vec::new(), 0.0f64);
+        for _ in 0..4000 {
+            setup(&mut r.trains[i].train);
+            r.tick(&mut events);
+            top = top.max(r.trains[i].train.speed);
+            if events.iter().any(|e| e.run == Run::Arrived) {
+                break;
+            }
+        }
+        (top, r.trains[i].train.clone())
+    }
+
+    #[test]
+    fn a_scheduled_train_keeps_to_its_throttle() {
+        // `Navigation.tick`: `topSpeed *= train.throttle` (a schedule's throttle instruction).
+        let (top, _) = top_speed_with(|t| t.throttle = 0.5);
+        assert!((top - TOP_SPEED * 0.5).abs() < 1e-9, "{top}");
+    }
+
+    #[test]
+    fn a_train_burning_fuel_runs_at_the_powered_top_speed() {
+        // The glue offers a carriage's coal (1600 ticks) whenever the train has none left.
+        let (top, train) = top_speed_with(|t| {
+            if t.fuel == 0 {
+                t.fuel_offer = vec![Some(1600)];
+            }
+        });
+        assert!((top - POWERED_TOP_SPEED).abs() < 1e-9, "reaches 40 m/s: {top}");
+        assert!(train.fuel > 0 && train.fuel < 1600, "{}", train.fuel);
+        // Without fuel it keeps to 28 m/s.
+        let (top, train) = top_speed_with(|_| {});
+        assert!((top - TOP_SPEED).abs() < 1e-9, "{top}");
+        assert_eq!((train.fuel, train.burnt), (0, None));
+    }
+
+    #[test]
+    fn burning_takes_one_item_and_counts_its_ticks_down() {
+        let mut r = Railway::default();
+        let mut t = HashMap::new();
+        line(&mut t, [0, 64, 0], [1, 0, 0], 40, TrackShape::Xo);
+        for (p, s) in t {
+            r.set_track(p, s);
+        }
+        r.ensure(&Curves::default());
+        let i = assemble(&mut r, &[[9, 64, 0]], [1.0, 0.0, 0.0]);
+        let train = &mut r.trains[i].train;
+        train.fuel_offer = vec![None, Some(100), Some(50)];
+        train.burn_fuel();
+        // The first carriage with fuel (from the front) gives it.
+        assert_eq!((train.fuel, train.burnt), (100, Some(1)));
+        train.burnt = None;
+        train.burn_fuel();
+        assert_eq!((train.fuel, train.burnt), (99, None));
+        // Running backwards it looks from the back.
+        train.fuel = 0;
+        train.speed = -0.5;
+        train.fuel_offer = vec![Some(100), None, Some(50)];
+        train.burn_fuel();
+        assert_eq!((train.fuel, train.burnt), (50, Some(2)));
+    }
+
     #[test]
     fn pathfinding_takes_the_branch_that_leads_to_the_station() {
         let mut r = l_shape();
@@ -3295,6 +3697,26 @@ mod tests {
 
     #[test]
     fn a_scheduled_train_shuttles_between_stations() {
+        let (mut r, i) = shuttle_line();
+        // A conductor drives it either way (`hasForwardConductor`, `hasBackwardConductor`).
+        r.trains[i].conductors = vec![[true, true]];
+        let mut events = Vec::new();
+        let mut visits = Vec::new();
+        for _ in 0..3000 {
+            r.tick(&mut events);
+            if events.iter().any(|e| e.run == Run::Arrived) {
+                visits.push(r.trains[i].train.at_station.unwrap());
+            }
+        }
+        assert!(visits.len() >= 4, "{visits:?}");
+        assert_eq!(visits[0], [11, 64, 40]);
+        assert_eq!(visits[1], [-30, 64, 1]);
+        assert_eq!(visits[2], [11, 64, 40]);
+        assert!(r.trains[i].status.queued.is_empty(), "nothing to tell");
+    }
+
+    /// The L line with West and South stations and a train at West scheduled between them.
+    fn shuttle_line() -> (Railway, usize) {
         let mut r = l_shape();
         r.add_station([-30, 64, 1]);
         r.add_station([11, 64, 40]);
@@ -3323,18 +3745,156 @@ mod tests {
             cyclic: true,
             saved_progress: 0,
         });
+        (r, i)
+    }
+
+    fn told(t: &TrainOnTrack) -> Vec<&'static str> {
+        t.status.queued.iter().flatten().map(|l| l.key).collect()
+    }
+
+    #[test]
+    fn a_scheduled_train_needs_a_conductor_facing_its_way() {
+        let (mut r, i) = shuttle_line();
         let mut events = Vec::new();
-        let mut visits = Vec::new();
-        for _ in 0..3000 {
+        // Nobody behind its controls: it stays, and says so once.
+        for _ in 0..200 {
+            r.tick(&mut events);
+        }
+        assert_eq!(r.trains[i].train.at_station, Some([-30, 64, 1]));
+        assert!(r.trains[i].train.nav.is_none());
+        assert_eq!(told(&r.trains[i]), vec!["missing_driver"]);
+        r.trains[i].status.take();
+        // A conductor facing its front: off to South, glad to have found one.
+        r.trains[i].conductors = vec![[true, false]];
+        let mut arrived = false;
+        for _ in 0..2000 {
             r.tick(&mut events);
             if events.iter().any(|e| e.run == Run::Arrived) {
-                visits.push(r.trains[i].train.at_station.unwrap());
+                arrived = true;
+                break;
             }
         }
-        assert!(visits.len() >= 4, "{visits:?}");
-        assert_eq!(visits[0], [11, 64, 40]);
-        assert_eq!(visits[1], [-30, 64, 1]);
-        assert_eq!(visits[2], [11, 64, 40]);
+        assert!(arrived);
+        assert_eq!(r.trains[i].train.at_station, Some([11, 64, 40]));
+        assert_eq!(told(&r.trains[i]), vec!["found_driver"]);
+        r.trains[i].status.take();
+        // West is behind it now, and it may only be driven forward: no way there.
+        for _ in 0..200 {
+            r.tick(&mut events);
+        }
+        assert_eq!(r.trains[i].train.at_station, Some([11, 64, 40]));
+        assert_eq!(told(&r.trains[i]), vec!["no_path"]);
+        r.trains[i].status.take();
+        // One facing back as well: it backs to West; when he leaves on the way, it stops
+        // navigating and says the one left faces the other way.
+        r.trains[i].conductors = vec![[true, true]];
+        for _ in 0..100 {
+            r.tick(&mut events);
+            if r.trains[i].train.nav.is_some() {
+                break;
+            }
+        }
+        assert!(r.trains[i].train.nav.as_ref().is_some_and(|n| n.behind));
+        assert_eq!(told(&r.trains[i]), vec!["navigation_success"]);
+        r.trains[i].status.take();
+        r.trains[i].conductors = vec![[true, false]];
+        r.tick(&mut events);
+        assert!(r.trains[i].train.nav.is_none());
+        assert_eq!(told(&r.trains[i]), vec!["opposite_driver"]);
+    }
+
+    #[test]
+    fn a_station_nobody_is_named_after_is_no_match() {
+        let (mut r, i) = shuttle_line();
+        r.trains[i].conductors = vec![[true, true]];
+        if let Some(s) = &mut r.trains[i].schedule {
+            s.entries[0] = Entry::station("Nowhere", Vec::new());
+        }
+        let mut events = Vec::new();
+        r.tick(&mut events);
+        assert_eq!(told(&r.trains[i]), vec!["no_match"]);
+        assert_eq!(
+            r.trains[i].status.queued[0][0].args,
+            vec![crate::train_status::Arg::Text("Nowhere".into())]
+        );
+        assert!(r.any_named(i, "Sou*") && !r.any_named(i, "Nowhere"));
+    }
+
+    #[test]
+    fn stretched_couplings_derail_a_train_and_the_track_s_end_is_told() {
+        let mut r = straight(60);
+        r.add_station([50, 64, 1]);
+        r.ensure(&Curves::default());
+        let a = assemble(&mut r, &[[20, 64, 0], [14, 64, 0]], [1.0, 0.0, 0.0]);
+        assert!(r.navigate(a, &[0]));
+        // Its coupling as long as it is plus five: stretched past four blocks.
+        r.trains[a].train.spacing[0] += 5;
+        let mut events = Vec::new();
+        r.tick(&mut events);
+        assert_eq!(events[0].run, Run::Derailed);
+        let t = &r.trains[a];
+        assert!(t.train.derailed && t.train.nav.is_none() && t.train.speed == 0.0);
+        assert_eq!(told(t), vec!["coupling_stress"]);
+        // Driven into the end of the track, it says so once.
+        let mut r = straight(30);
+        r.ensure(&Curves::default());
+        let b = assemble(&mut r, &[[25, 64, 0]], [1.0, 0.0, 0.0]);
+        r.trains[b].train.speed = 0.5;
+        for _ in 0..40 {
+            r.tick(&mut events);
+            r.trains[b].train.speed = 0.5;
+        }
+        assert_eq!(told(&r.trains[b]), vec!["end_of_track"]);
+    }
+
+    #[test]
+    fn a_crash_and_the_driver_taking_over_are_told() {
+        let mut r = straight(300);
+        r.ensure(&Curves::default());
+        let a = assemble(&mut r, &[[100, 64, 0]], [1.0, 0.0, 0.0]);
+        let b = assemble(&mut r, &[[120, 64, 0]], [-1.0, 0.0, 0.0]);
+        r.trains[a].train.speed = 0.5;
+        r.trains[b].train.speed = 0.5;
+        let mut events = Vec::new();
+        for _ in 0..40 {
+            r.tick(&mut events);
+        }
+        for t in [a, b] {
+            assert_eq!(told(&r.trains[t]), vec!["collision", "collision.where"]);
+        }
+        // A player takes the controls of a train running its schedule.
+        let (mut r, i) = shuttle_line();
+        let id = r.trains[i].id;
+        assert!(r.start_controlling(id));
+        assert_eq!(told(&r.trains[i]), vec!["paused_for_manual"]);
+        assert!(r.start_controlling(id));
+        assert_eq!(told(&r.trains[i]).len(), 1, "paused already");
+    }
+
+    #[test]
+    fn a_long_journey_is_announced_near_its_end() {
+        let mut r = straight(300);
+        r.add_station([250, 64, 1]);
+        r.add_station([40, 64, 1]);
+        r.ensure(&Curves::default());
+        let a = assemble(&mut r, &[[10, 64, 0]], [1.0, 0.0, 0.0]);
+        let near = r.station_index([40, 64, 1]).unwrap();
+        assert!(r.navigate(a, &[near]));
+        assert!(!r.trains[a].train.announce, "30 blocks: not announced");
+        let far = r.station_index([250, 64, 1]).unwrap();
+        r.trains[a].train.nav = None;
+        assert!(r.navigate(a, &[far]));
+        assert!(r.trains[a].train.announce && !r.trains[a].announce_due());
+        let mut events = Vec::new();
+        let mut due_at = None;
+        for _ in 0..2000 {
+            r.tick(&mut events);
+            if r.trains[a].announce_due() {
+                due_at = r.trains[a].train.nav.as_ref().map(|n| n.distance);
+                break;
+            }
+        }
+        assert!(due_at.is_some_and(|d| d < ANNOUNCE_WITHIN && d > ANNOUNCE_WITHIN - 2.0));
     }
 
     #[test]
@@ -3395,7 +3955,13 @@ mod tests {
         assert_eq!(m.bogeys.len(), 1);
         assert_eq!(Motion::decode(&m.encode()), Ok(m.clone()));
         let moving = Motion { blocks: None, ..m };
-        assert_eq!(Motion::decode(&moving.encode()), Ok(moving));
+        assert_eq!(Motion::decode(&moving.encode()), Ok(moving.clone()));
+        let wrecked = Motion {
+            derailed: true,
+            stalled: true,
+            ..moving
+        };
+        assert_eq!(Motion::decode(&wrecked.encode()), Ok(wrecked));
         assert_eq!(Motion::decode(&7u32.to_le_bytes()), Err(Some(7)));
         // Mid-turn: turning clockwise looking down (east to south), so its yaw falls.
         let south = r.station_index([11, 64, 40]).unwrap();
@@ -3469,6 +4035,9 @@ mod tests {
             icon: 0,
             players: 0,
             probes: Default::default(),
+            owner: None,
+            status: Default::default(),
+            conductors: Vec::new(),
         });
         r.trains.len() - 1
     }

@@ -3,7 +3,7 @@
 //! poles and the structure in front off the world and slides them `speed / 512` blocks a tick,
 //! then puts them back where they stop.
 
-use crate::contraption::{Found, MAX_BLOCKS, Refused};
+use crate::contraption::{Found, Refused};
 use crate::kinetics::{Axis, Dir};
 use std::collections::{HashSet, VecDeque};
 
@@ -39,13 +39,14 @@ fn add(a: [i32; 3], d: Dir, n: i32) -> [i32; 3] {
 }
 
 /// `PistonContraption.collectExtensions` for the piston at `pos` facing `facing`, `extended` when
-/// its state is `EXTENDED`. None without poles (`noPistonPoles`) or with too many.
+/// its state is `EXTENDED`. Refused without poles (`noPistonPoles`) or with too many
+/// (`tooManyPistonPoles`).
 pub fn collect(
     pos: [i32; 3],
     facing: Dir,
     extended: bool,
     cell: impl Fn([i32; 3]) -> PoleCell,
-) -> Option<Collected> {
+) -> Result<Collected, Refused> {
     let mut poles: Vec<([i32; 3], bool)> = Vec::new();
     let mut front = 0;
     if extended {
@@ -66,7 +67,7 @@ pub fn collect(
                 _ => break,
             }
             if front > MAX_POLES {
-                return None;
+                return Err(Refused::TooManyPistonPoles);
             }
         }
     }
@@ -82,12 +83,12 @@ pub fn collect(
         poles.push((end, false));
         back += 1;
         if front + back > MAX_POLES {
-            return None;
+            return Err(Refused::TooManyPistonPoles);
         }
     }
     let range = front + back;
     if range == 0 {
-        return None;
+        return Err(Refused::NoPistonPoles);
     }
     let anchor = add(pos, facing, front + 1);
     let poles = poles
@@ -100,7 +101,7 @@ pub fn collect(
             )
         })
         .collect();
-    Some(Collected {
+    Ok(Collected {
         anchor,
         poles,
         range,
@@ -155,17 +156,23 @@ pub fn gather(
     exclude: &[[i32; 3]],
     at: impl Fn([i32; 3]) -> Option<Found>,
 ) -> Result<Vec<([i32; 3], u32)>, Refused> {
-    search(start, VecDeque::from([start]), Some(forced), exclude, at)
+    let frontier = if at(start).is_some_and(|f| f.brittle) {
+        VecDeque::new()
+    } else {
+        VecDeque::from([start])
+    };
+    search(start, frontier, Some(forced), exclude, at)
 }
 
 /// `kinetics.maxChassisRange`: how far ahead an extending piston pushes a line of blocks.
 pub const MAX_CHASSIS_RANGE: i32 = 16;
 
 /// `PistonContraption.assemble` (`searchMovedStructure` from the anchor in front of the head,
-/// forced along `facing` while it extends, none while it retracts) with its
+/// forced along `facing` while it extends and back toward the piston while it retracts) with its
 /// `addToInitialFrontier`: extending, the line of blocks ahead (up to `maxChassisDistance`)
-/// until air, a brittle block or a face that pushes nothing; retracting, a sticky piston's
-/// block in front of its head alone, and a plain piston's nothing. Offsets from `start`.
+/// until air, a brittle block but a carpet, a piston head facing back, or a face that pushes
+/// nothing; retracting, a sticky piston's block in front of its head alone (none that can't
+/// move, nor a push-only one), and a plain piston's nothing. Offsets from `start`.
 pub fn gather_piston(
     start: [i32; 3],
     facing: Dir,
@@ -178,6 +185,8 @@ pub fn gather_piston(
     if retracting && !sticky {
         return Ok(Vec::new());
     }
+    // The direction the structure is searched in (`retract ? orientation.getOpposite()`).
+    let direction = if retracting { facing.opposite() } else { facing };
     for offset in 0..=MAX_CHASSIS_RANGE {
         if offset == 1 && retracting {
             break;
@@ -186,8 +195,12 @@ pub fn gather_piston(
         let Some(f) = at(p) else {
             break;
         };
-        // `isBrittle` (but carpet): every face pushes nothing.
-        if f.unsupportive == 0x3F {
+        // `isBrittle(state) && !(state.getBlock() instanceof WoolCarpetBlock)`: a carpet is the
+        // one brittle block whose only face that pushes nothing is its top.
+        if f.brittle && f.unsupportive != Dir::Up.bit() {
+            break;
+        }
+        if f.head == Some(direction.opposite()) {
             break;
         }
         if !f.movable {
@@ -196,91 +209,32 @@ pub fn gather_piston(
             }
             return Err(Refused::Unmovable(p));
         }
+        if retracting && f.push_only {
+            break;
+        }
         frontier.push_back(p);
         if crate::contraption::not_supportive(&f, facing) {
             break;
         }
     }
-    search(
-        start,
-        frontier,
-        (!retracting).then_some(facing),
-        exclude,
-        at,
-    )
+    search(start, frontier, Some(direction), exclude, at)
 }
 
 /// `Contraption.searchMovedStructure` from `frontier`, pushing ahead in `forced`.
 fn search(
     start: [i32; 3],
-    mut frontier: VecDeque<[i32; 3]>,
+    frontier: VecDeque<[i32; 3]>,
     forced: Option<Dir>,
     exclude: &[[i32; 3]],
     at: impl Fn([i32; 3]) -> Option<Found>,
 ) -> Result<Vec<([i32; 3], u32)>, Refused> {
-    let mut visited: HashSet<[i32; 3]> = HashSet::new();
-    let mut blocks = Vec::new();
-    while let Some(pos) = frontier.pop_front() {
-        if !visited.insert(pos) || exclude.contains(&pos) {
-            continue;
-        }
-        let Some(found) = at(pos) else {
-            continue;
-        };
-        if !found.movable {
-            return Err(Refused::Unmovable(pos));
-        }
-        if let Some(c) = found.chassis {
-            for p in crate::contraption::chassis_reach(pos, c, forced, &at) {
-                if !visited.contains(&p) && !exclude.contains(&p) {
-                    frontier.push_back(p);
-                }
-            }
-        }
-        if let Some(p) = crate::contraption::sticker_target(pos, &found)
-            .filter(|p| !visited.contains(p) && !exclude.contains(p))
-        {
-            frontier.push_back(p);
-        }
-        for p in crate::contraption::belt_neighbours(pos, &found) {
-            if !visited.contains(&p) && !exclude.contains(&p) {
-                frontier.push_back(p);
-            }
-        }
-        for d in Dir::ALL {
-            let next = add(pos, d, 1);
-            if visited.contains(&next) || exclude.contains(&next) {
-                continue;
-            }
-            let Some(other) = at(next) else {
-                continue;
-            };
-            if !other.movable {
-                if Some(d) == forced {
-                    return Err(Refused::Unmovable(next));
-                }
-                continue;
-            }
-            // `Contraption.moveBlock`: what sticks, what hangs on to this block, glue, and the
-            // block pushed in front unless this face pushes nothing.
-            use crate::contraption::{attached_towards, glued_toward, not_supportive, sticks};
-            if sticks(&found, &other)
-                || attached_towards(&other, d.opposite())
-                || glued_toward(&found, d)
-                || (Some(d) == forced && !not_supportive(&found, d))
-            {
-                frontier.push_back(next);
-            }
-        }
-        blocks.push((
-            [pos[0] - start[0], pos[1] - start[1], pos[2] - start[2]],
-            found.state,
-        ));
-        if blocks.len() > MAX_BLOCKS {
-            return Err(Refused::TooLarge);
-        }
-    }
-    Ok(blocks)
+    let skip = |p: [i32; 3]| exclude.contains(&p);
+    let rules = crate::contraption::Rules {
+        forced,
+        skip: &skip,
+        stabilizes: &crate::contraption::never,
+    };
+    Ok(crate::contraption::search(frontier, start, &rules, &at)?.blocks)
 }
 
 /// `MechanicalPistonBlockEntity.getMovementSpeed` on the server: blocks a tick, positive out,
@@ -292,9 +246,139 @@ pub fn movement(speed: f32, facing: Dir, offset: f32, range: i32) -> f32 {
     (m * -modifier).clamp(-offset, range as f32 - offset)
 }
 
+/// A block as a broken piston part's search reads it (`playerWillDestroy`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PistonPart {
+    /// A mechanical or sticky mechanical piston facing a direction.
+    Base(Dir),
+    Head(Dir),
+    Pole(Axis),
+    Other,
+}
+
+/// What a player breaking a piston part takes with it: the blocks destroyed with it (dropping
+/// outside creative), and the piston left retracted (none when the piston itself broke).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Teardown {
+    pub destroy: Vec<[i32; 3]>,
+    pub retract: Option<[i32; 3]>,
+}
+
+/// `playerWillDestroy` of the piston (`MechanicalPistonBlock`: its poles and head in front, up
+/// to the head facing its way, and its poles behind), its head (`MechanicalPistonHeadBlock`: the
+/// poles back to the piston facing its way, which retracts) and a pole
+/// (`PistonExtensionPoleBlock`: both ways along its axis to a head and a piston facing the same
+/// way, the poles between going and the piston retracting). Each search goes no further than
+/// `maxPistonPoles`.
+pub fn teardown(pos: [i32; 3], broken: PistonPart, at: impl Fn([i32; 3]) -> PistonPart) -> Teardown {
+    let mut out = Teardown::default();
+    match broken {
+        PistonPart::Base(d) => {
+            let ahead = (1..MAX_POLES).find_map(|n| match at(add(pos, d, n)) {
+                PistonPart::Pole(a) if a == d.axis() => None,
+                PistonPart::Head(f) if f == d => Some(Some(n)),
+                _ => Some(None),
+            });
+            if let Some(Some(head)) = ahead {
+                out.destroy.extend((1..=head).map(|n| add(pos, d, n)));
+            }
+            for n in 1..MAX_POLES {
+                let p = add(pos, d.opposite(), n);
+                match at(p) {
+                    PistonPart::Pole(a) if a == d.axis() => out.destroy.push(p),
+                    _ => break,
+                }
+            }
+        }
+        PistonPart::Head(d) => {
+            let back = (1..MAX_POLES).find_map(|n| match at(add(pos, d.opposite(), n)) {
+                PistonPart::Pole(a) if a == d.axis() => None,
+                PistonPart::Base(f) if f == d => Some(Some(n)),
+                _ => Some(None),
+            });
+            if let Some(Some(base)) = back {
+                out.destroy
+                    .extend((1..base).map(|n| add(pos, d.opposite(), n)));
+                out.retract = Some(add(pos, d.opposite(), base));
+            }
+        }
+        PistonPart::Pole(axis) => {
+            let positive = Dir::ALL
+                .into_iter()
+                .find(|d| d.axis() == axis && d.positive())
+                .unwrap_or(Dir::Up);
+            let (mut base, mut head) = (None, None);
+            for way in [positive, positive.opposite()] {
+                for n in 1..MAX_POLES {
+                    let p = add(pos, way, n);
+                    match at(p) {
+                        PistonPart::Pole(a) if a == axis => continue,
+                        PistonPart::Base(f) if f.axis() == axis => base = Some((p, f, n, way)),
+                        PistonPart::Head(f) if f.axis() == axis => head = Some((p, f, n, way)),
+                        _ => {}
+                    }
+                    break;
+                }
+            }
+            if let (Some((b, bf, bn, bway)), Some((_, hf, hn, hway))) = (base, head)
+                && bf == hf
+            {
+                out.destroy.extend((1..=hn).map(|n| add(pos, hway, n)));
+                out.destroy.extend((1..bn).map(|n| add(pos, bway, n)));
+                out.retract = Some(b);
+            }
+        }
+        PistonPart::Other => {}
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A piston at the origin facing east with `poles` poles and its head after them.
+    fn line(poles: i32) -> impl Fn([i32; 3]) -> PistonPart {
+        move |p: [i32; 3]| match (p[0], p[1], p[2]) {
+            (0, 0, 0) => PistonPart::Base(Dir::East),
+            (x, 0, 0) if (1..=poles).contains(&x) => PistonPart::Pole(Axis::X),
+            (x, 0, 0) if x == poles + 1 => PistonPart::Head(Dir::East),
+            (x, 0, 0) if (-2..0).contains(&x) => PistonPart::Pole(Axis::X),
+            _ => PistonPart::Other,
+        }
+    }
+
+    #[test]
+    fn breaking_a_piston_takes_its_poles_and_head() {
+        let t = teardown([0, 0, 0], PistonPart::Base(Dir::East), line(3));
+        let mut d = t.destroy.clone();
+        d.sort();
+        // The poles and head in front, and the two poles behind it.
+        let want: Vec<[i32; 3]> = [-2, -1, 1, 2, 3, 4].iter().map(|&x| [x, 0, 0]).collect();
+        assert_eq!(d, want);
+        assert_eq!(t.retract, None);
+    }
+
+    #[test]
+    fn breaking_a_head_or_pole_retracts_the_piston() {
+        let t = teardown([4, 0, 0], PistonPart::Head(Dir::East), line(3));
+        assert_eq!(t.destroy, vec![[3, 0, 0], [2, 0, 0], [1, 0, 0]]);
+        assert_eq!(t.retract, Some([0, 0, 0]));
+        let t = teardown([2, 0, 0], PistonPart::Pole(Axis::X), line(3));
+        let mut d = t.destroy.clone();
+        d.sort();
+        assert_eq!(d, vec![[1, 0, 0], [3, 0, 0], [4, 0, 0]]);
+        assert_eq!(t.retract, Some([0, 0, 0]));
+        // A loose pole takes nothing.
+        let loose = |p: [i32; 3]| {
+            if p == [1, 0, 0] {
+                PistonPart::Pole(Axis::X)
+            } else {
+                PistonPart::Other
+            }
+        };
+        assert_eq!(teardown([0, 0, 0], PistonPart::Pole(Axis::X), loose), Teardown::default());
+    }
 
     #[test]
     fn a_moving_structure_meets_the_cells_its_leading_blocks_enter() {
@@ -331,7 +415,10 @@ mod tests {
         assert_eq!((c.anchor, c.range, c.progress), ([1, 0, 0], 3, 0));
         assert_eq!(c.poles[0], ([-1, 0, 0], true), "the head, in the piston");
         assert_eq!(c.poles.last(), Some(&([-4, 0, 0], false)));
-        assert!(collect([0, 0, 0], Dir::East, false, |_| PoleCell::Other).is_none());
+        assert_eq!(
+            collect([0, 0, 0], Dir::East, false, |_| PoleCell::Other),
+            Err(Refused::NoPistonPoles)
+        );
     }
 
     #[test]
@@ -445,5 +532,81 @@ mod tests {
         let mut back = gather_piston([1, 0, 0], Dir::East, true, true, &[], at).unwrap();
         back.sort();
         assert_eq!(back, vec![([0, 0, 0], 1), ([0, 1, 0], 2)]);
+    }
+
+    #[test]
+    fn a_retracting_sticky_piston_pulls_along_its_way_back() {
+        // A sticky head at x 0 facing east (excluded), a slime block at x 1 holding a stone
+        // beside it (x 1, z 1), and a block behind that one toward the piston (x 0, z 1): the
+        // slime and its stone come back, pushing the block in their way (`forcedDirection` is
+        // toward the piston while retracting).
+        let world = |behind: Found| {
+            move |p: [i32; 3]| match p {
+                [1, 0, 0] => Some(Found {
+                    state: 1,
+                    movable: true,
+                    sticky: Some(crate::contraption::Sticky::Slime),
+                    ..Default::default()
+                }),
+                [1, 0, 1] => Some(Found {
+                    state: 2,
+                    movable: true,
+                    ..Default::default()
+                }),
+                [0, 0, 1] => Some(behind.clone()),
+                _ => None,
+            }
+        };
+        let stone = Found {
+            state: 3,
+            movable: true,
+            ..Default::default()
+        };
+        let mut back =
+            gather_piston([1, 0, 0], Dir::East, true, true, &[[0, 0, 0]], world(stone.clone()))
+                .unwrap();
+        back.sort();
+        assert_eq!(back, vec![([-1, 0, 1], 3), ([0, 0, 0], 1), ([0, 0, 1], 2)]);
+        // An unmovable block in that way refuses the move, named by the block pushing it.
+        let obsidian = Found {
+            movable: false,
+            ..stone.clone()
+        };
+        assert_eq!(
+            gather_piston([1, 0, 0], Dir::East, true, true, &[[0, 0, 0]], world(obsidian)),
+            Err(Refused::Unmovable([1, 0, 1]))
+        );
+        // Push-only (glazed terracotta) in front of the head stays as the piston retracts, but
+        // is pushed as it extends; a head facing back stops the line.
+        let glazed = |p: [i32; 3]| {
+            (p == [1, 0, 0]).then(|| Found {
+                state: 4,
+                movable: true,
+                push_only: true,
+                ..Default::default()
+            })
+        };
+        assert!(
+            gather_piston([1, 0, 0], Dir::East, true, true, &[], glazed)
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            gather_piston([1, 0, 0], Dir::East, false, true, &[], glazed).unwrap(),
+            vec![([0, 0, 0], 4)]
+        );
+        let facing_back = |p: [i32; 3]| {
+            (p == [1, 0, 0]).then(|| Found {
+                state: 5,
+                movable: true,
+                head: Some(Dir::West),
+                ..Default::default()
+            })
+        };
+        assert!(
+            gather_piston([1, 0, 0], Dir::East, false, false, &[], facing_back)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

@@ -24,6 +24,18 @@ pub struct ServerLevel<'a> {
     pub dimension: &'a str,
 }
 
+thread_local! {
+    /// Writes under way through [`ServerLevel::set_state`] with `UPDATE_MOVE_BY_PISTON`.
+    static MOVING_WRITES: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Whether the block change being heard comes from a write with `UPDATE_MOVE_BY_PISTON`
+/// (`onRemove`'s `isMoving`: a structure taking or setting down its blocks). Horizon's
+/// `block_changed` doesn't tell a change's flags, so the glue's own writes say it.
+pub fn moving_write() -> bool {
+    MOVING_WRITES.with(|m| m.get() > 0)
+}
+
 /// Vanilla's `Block.UPDATE_CLIENTS`.
 pub const UPDATE_CLIENTS: BlockUpdateFlags = BlockUpdateFlags::CLIENTS;
 
@@ -70,9 +82,18 @@ impl<'a> ServerLevel<'a> {
 
     /// Sets the state at `pos` (`Level.setBlock`). True when the block changed.
     pub fn set_state(&mut self, pos: [i32; 3], state: BlockState, flags: BlockUpdateFlags) -> bool {
-        self.level
+        let moving = flags.bits() & BlockUpdateFlags::MOVE_BY_PISTON.bits() != 0;
+        if moving {
+            MOVING_WRITES.with(|m| m.set(m.get() + 1));
+        }
+        let changed = self
+            .level
             .set_block(&mut *self.host, pos, state, flags)
-            .unwrap_or(false)
+            .unwrap_or(false);
+        if moving {
+            MOVING_WRITES.with(|m| m.set(m.get() - 1));
+        }
+        changed
     }
 
     /// Sets one property of the state at `pos` (`state.setValue(..)` then `setBlock`). False when

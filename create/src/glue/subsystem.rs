@@ -426,6 +426,16 @@ pub trait Subsystem: Sync {
         Flow::Continue
     }
 
+    /// `Hooks::block_highlight`, on the client: `Flow::Cancel` to leave out the targeted block's
+    /// outline.
+    fn block_highlight(
+        &self,
+        _host: &dyn ClientHost,
+        _event: &mut mod_api::BlockHighlightEvent,
+    ) -> Flow {
+        Flow::Continue
+    }
+
     /// `Hooks::interaction_key_mapping_triggered`, on the client: `Flow::Cancel` when the
     /// click was taken.
     fn interaction_key(

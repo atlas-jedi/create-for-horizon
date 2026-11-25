@@ -525,7 +525,8 @@ pub struct Request {
     /// The second track's block entity is tilted (`turn_start`).
     pub second_tilted: bool,
     pub max_length: i32,
-    /// Sneaking: the turn as large as the ends allow, with no straight lead-in.
+    /// `TRACK_EXTENDED_CURVE` (the click went out with the sprint key held): the turn as large as
+    /// the ends allow, with no straight lead-in.
     pub maximise_turn: bool,
     /// On the client Create builds the curve before the checks, to draw a failed one red;
     /// the server doesn't.
@@ -1049,7 +1050,7 @@ mod tests {
         assert_eq!(c.starts, [[0.5, 0.0, 4.0], [2.5, 0.0, 8.0]]);
         assert_eq!(c.radius, 0.0);
         assert_eq!(p.straight(0).count(), 4);
-        // Sneaking keeps the whole run as the bend.
+        // An extended curve keeps the whole run as the bend.
         let max = connect(
             ([0, 0, 0], z),
             ([2, 0, 10], z),

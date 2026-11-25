@@ -96,42 +96,6 @@ fn custom_rendered(name: &str) -> Option<Value> {
     }))
 }
 
-/// The sliding doors whose block entity draws them while they are not `visible`.
-const SLIDING_DOORS: [&str; 5] = [
-    "andesite_door",
-    "brass_door",
-    "copper_door",
-    "train_door",
-    "framed_glass_door",
-];
-
-/// A sliding door's blockstate (`SlidingDoorBlock.getRenderShape`: `ENTITYBLOCK_ANIMATED` while
-/// not `visible`): Create's variants as multipart cases, without those of hidden states, so a
-/// hidden door draws nothing of its own (its block entity draws it sliding).
-fn sliding_door_states(path: &str, bytes: &[u8]) -> Option<Value> {
-    let name = path
-        .strip_prefix("assets/create/blockstates/")?
-        .strip_suffix(".json")?;
-    if !SLIDING_DOORS.contains(&name) {
-        return None;
-    }
-    let doc: Value = serde_json::from_slice(bytes).ok()?;
-    let cases: Vec<Value> = doc["variants"]
-        .as_object()?
-        .iter()
-        .filter(|(key, _)| !key.split(',').any(|kv| kv == "visible=false"))
-        .map(|(key, model)| {
-            let when: serde_json::Map<String, Value> = key
-                .split(',')
-                .filter_map(|kv| kv.split_once('='))
-                .map(|(k, v)| (k.to_owned(), json!(v)))
-                .collect();
-            json!({ "when": when, "apply": model })
-        })
-        .collect();
-    Some(json!({ "multipart": cases }))
-}
-
 /// The tinted copy's path of a model the glue draws coloured (`<model>_tinted.json`).
 fn tinted_model(path: &str) -> Option<String> {
     let rest = path.strip_prefix("assets/create/models/block/")?;
@@ -183,9 +147,9 @@ pub(crate) fn item_models(
     let mut models = BTreeMap::new();
     for path in files.keys() {
         let block_or_item = path
-            .strip_prefix("data/create/sunrise/block/")
-            .or_else(|| path.strip_prefix("data/create/sunrise/item/"));
-        let fluid = path.strip_prefix("data/create/sunrise/fluid/");
+            .strip_prefix("data/create/horizon/block/")
+            .or_else(|| path.strip_prefix("data/create/horizon/item/"));
+        let fluid = path.strip_prefix("data/create/horizon/fluid/");
         let Some(name) = block_or_item
             .or(fluid)
             .and_then(|n| n.strip_suffix(".json"))
@@ -338,35 +302,31 @@ pub fn prepare(repo: &Path, sources: &[PathBuf], out: &Path) -> Result<String, S
         if let Some(behaviour) = particle_behaviour(path) {
             let mut doc: Value =
                 serde_json::from_slice(bytes).map_err(|e| format!("{path}: {e}"))?;
-            doc["sunrise:behaviour"] = behaviour;
+            // Horizon reads a particle's spawn values from `horizon:behaviour`.
+            doc["horizon:behaviour"] = behaviour;
             put(path, &serde_json::to_vec_pretty(&doc).unwrap())?;
             copied += 1;
             continue;
         }
-        if let Some(door) = sliding_door_states(path, bytes) {
-            put(path, &serde_json::to_vec_pretty(&door).unwrap())?;
-            copied += 1;
-        } else {
-            put(path, bytes)?;
-            copied += 1;
-            // Fluid textures go on the block atlas too (Create's `FluidRenderer` reads fluid
-            // sprites from the block atlas; vanilla's atlas reads `textures/block/`): the
-            // tanks' fluid parts use them.
-            if let Some(rest) = path.strip_prefix("assets/create/textures/fluid/") {
-                put(&format!("assets/create/textures/block/fluid/{rest}"), bytes)?;
-            }
-            // Create's special textures (`AllSpecialTextures`: the outliner's checkered and glue
-            // faces) on the block atlas too, where a world pipeline samples them.
-            if let Some(rest) = path.strip_prefix("assets/create/textures/special/") {
-                put(
-                    &format!("assets/create/textures/block/special/{rest}"),
-                    bytes,
-                )?;
-            }
-            // The icon atlas (`AllIcons`), for the value boxes' frames and icons in the world.
-            if path == "assets/create/textures/gui/icons.png" {
-                put("assets/create/textures/block/special/gui_icons.png", bytes)?;
-            }
+        put(path, bytes)?;
+        copied += 1;
+        // Fluid textures go on the block atlas too (Create's `FluidRenderer` reads fluid
+        // sprites from the block atlas; vanilla's atlas reads `textures/block/`): the
+        // tanks' fluid parts use them.
+        if let Some(rest) = path.strip_prefix("assets/create/textures/fluid/") {
+            put(&format!("assets/create/textures/block/fluid/{rest}"), bytes)?;
+        }
+        // Create's special textures (`AllSpecialTextures`: the outliner's checkered and glue
+        // faces) on the block atlas too, where a world pipeline samples them.
+        if let Some(rest) = path.strip_prefix("assets/create/textures/special/") {
+            put(
+                &format!("assets/create/textures/block/special/{rest}"),
+                bytes,
+            )?;
+        }
+        // The icon atlas (`AllIcons`), for the value boxes' frames and icons in the world.
+        if path == "assets/create/textures/gui/icons.png" {
+            put("assets/create/textures/block/special/gui_icons.png", bytes)?;
         }
     }
     // Tinted copies of the models the glue colours as Create does (`SuperByteBuffer.color`): a
@@ -423,20 +383,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn hidden_sliding_doors_have_no_model() {
-        let states = json!({ "variants": {
-            "facing=north,half=lower,open=false,visible=true": { "model": "a" },
-            "facing=north,half=lower,open=true,visible=false": { "model": "a", "y": 90 }
-        }});
-        let bytes = serde_json::to_vec(&states).unwrap();
-        let door =
-            sliding_door_states("assets/create/blockstates/brass_door.json", &bytes).unwrap();
-        assert_eq!(door["multipart"].as_array().unwrap().len(), 1);
-        assert_eq!(door["multipart"][0]["when"]["visible"], "true");
-        assert!(sliding_door_states("assets/create/blockstates/oak_window.json", &bytes).is_none());
-    }
-
-    #[test]
     fn keeps_only_local_asset_types() {
         assert!(kept_asset("assets/create/textures/block/a.png"));
         assert!(!kept_asset("assets/create/ponder/a.nbt"));
@@ -459,7 +405,9 @@ mod tests {
 /// all of a jar asset's JSON at its own path, with keys added, counts as a copy).
 #[cfg(test)]
 mod committed_assets {
-    use crate::registry::visuals::{SPINNING_TOOLS, spinner_definition};
+    use crate::registry::visuals::{
+        PORT_ITEM_DEFINITIONS, SPINNING_TOOLS, port_item_definition, spinner_definition,
+    };
     use serde_json::Value;
     use std::collections::{BTreeMap, HashSet};
     use std::io::Read;
@@ -485,6 +433,18 @@ mod committed_assets {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
     }
 
+    /// `bytes` with Windows line ends as `\n`: a checkout with `core.autocrlf` writes text files
+    /// with `\r\n`, where the generators write `\n`.
+    fn unix_lines(bytes: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(bytes.len());
+        for (i, &b) in bytes.iter().enumerate() {
+            if !(b == b'\r' && bytes.get(i + 1) == Some(&b'\n')) {
+                out.push(b);
+            }
+        }
+        out
+    }
+
     #[test]
     fn only_approved_asset_types_are_committed() {
         let root = repo().join("create/assets");
@@ -500,13 +460,16 @@ mod committed_assets {
                     if SPINNING_TOOLS.iter().any(|(item, _)| *item == name) {
                         return doc != spinner_definition(name);
                     }
+                    if PORT_ITEM_DEFINITIONS.iter().any(|(item, _)| *item == name) {
+                        return doc != port_item_definition(name);
+                    }
                     return !["block", "item"].into_iter().any(|kind| {
                         doc == serde_json::json!({ "model": { "type": "minecraft:model", "model": format!("create:{kind}/{name}") } })
                     });
                 }
                 !(f.starts_with("create/blockstates/") && f.ends_with(".json")
                     || f.starts_with("create/models/block/") && f.ends_with(".json")
-                    || generated_connections.get(&format!("assets/{f}")).is_some_and(|expected| std::fs::read(root.join(f)).is_ok_and(|bytes| bytes == *expected))
+                    || generated_connections.get(&format!("assets/{f}")).is_some_and(|expected| std::fs::read(root.join(f)).is_ok_and(|bytes| unix_lines(&bytes) == *expected))
                     || matches!(f.as_str(), "create/textures/gui/placement_indicator.png"
                         | "create/shaders/pipeline/textured.wgsl" | "minecraft/atlases/blocks.json"))
             })
@@ -529,16 +492,61 @@ mod committed_assets {
         }
     }
 
-    #[test]
-    fn no_committed_file_is_one_of_create_s_assets() {
-        let jar = std::env::var_os("CREATE_JAR")
+    /// Create's jar, where it is at hand (`$CREATE_JAR`, else the `prepare` download cache).
+    fn create_jar() -> Option<PathBuf> {
+        std::env::var_os("CREATE_JAR")
             .map(PathBuf::from)
             .or_else(|| {
                 crate::jar::cache_dir()
                     .ok()
                     .map(|d| d.join(crate::jar::CREATE.file))
             })
-            .filter(|p| p.is_file());
+            .filter(|p| p.is_file())
+    }
+
+    /// The sliding doors' generated blockstates draw what Create's do in every `visible` state
+    /// (the same model, turned the same), and have no case for a hidden one.
+    #[test]
+    fn sliding_door_states_match_create_s_visible_variants() {
+        let Some(jar) = create_jar() else {
+            eprintln!("no Create jar at hand ($CREATE_JAR or the prepare cache): skipped");
+            return;
+        };
+        let mut zip = zip::ZipArchive::new(std::fs::File::open(&jar).unwrap()).unwrap();
+        for door in crate::blocks::SLIDING_DOORS {
+            let mut b = Vec::new();
+            zip.by_name(&format!("assets/create/blockstates/{door}.json"))
+                .unwrap()
+                .read_to_end(&mut b)
+                .unwrap();
+            let create: Value = serde_json::from_slice(&b).unwrap();
+            let ours = crate::blocks::sliding_door_states(door);
+            let cases = ours["multipart"].as_array().unwrap();
+            let shown: Vec<(&String, &Value)> = create["variants"]
+                .as_object()
+                .unwrap()
+                .iter()
+                .filter(|(key, _)| key.split(',').any(|kv| kv == "visible=true"))
+                .collect();
+            assert_eq!(shown.len(), cases.len(), "{door}");
+            for (key, model) in shown {
+                let when: serde_json::Map<String, Value> = key
+                    .split(',')
+                    .filter_map(|kv| kv.split_once('='))
+                    .map(|(k, v)| (k.to_owned(), Value::String(v.to_owned())))
+                    .collect();
+                let case = cases
+                    .iter()
+                    .find(|c| c["when"].as_object() == Some(&when))
+                    .unwrap_or_else(|| panic!("{door}: no case for {key}"));
+                assert_eq!(&case["apply"], model, "{door}: {key}");
+            }
+        }
+    }
+
+    #[test]
+    fn no_committed_file_is_one_of_create_s_assets() {
+        let jar = create_jar();
         let Some(jar) = jar else {
             eprintln!("no Create jar at hand ($CREATE_JAR or the prepare cache): skipped");
             return;

@@ -11,7 +11,7 @@ use super::railway::{railway_ready, send_train_clear, send_trains};
 use super::structure::{found_carrying, turned_state};
 use crate::glue::names::Named as _;
 use create_engine::Block;
-use create_engine::kinetics::{Axis, Dir};
+use create_engine::kinetics::Axis;
 use create_engine::schedule::Runtime;
 use create_engine::track::TrackShape;
 use create_engine::trains::{
@@ -186,11 +186,12 @@ fn clear_failure(dim: usize, pos: [i32; 3]) {
     FAILURES.with_borrow_mut(|f| f.remove(&(dim, pos)));
 }
 
-/// The straight track a station looks at, and its shape.
+/// The straight track a station looks at (its pick, or with none the track beside it), and its
+/// shape.
 fn station_track(dim: usize, pos: [i32; 3]) -> Option<([i32; 3], TrackShape)> {
     with_world(|w| {
         let r = &w.dims[dim].railway;
-        let target = create_engine::network::target_track(&r.tracks, pos)?;
+        let target = create_engine::network::station_track(&r.tracks, &r.targets, pos)?;
         Some((target, r.tracks[&target]))
     })
     .flatten()
@@ -318,6 +319,7 @@ pub fn disassemble(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: Option<Playe
                 continue;
             };
             let state = turned_state(&*lv.host, state, quarter, Axis::Y);
+            let state = crate::glue::contraptions::put_back_state(&*lv.host, state);
             // Without shape updates (`Contraption.addBlocksToWorld` places them as they were
             // carried): a door's half put back before its other half stays.
             lv.set_state(
@@ -328,6 +330,8 @@ pub fn disassemble(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: Option<Playe
         }
         // The carriage's storage blocks take their items back.
         super::cargo::release(lv, t.id, c, place);
+        // `AbstractContraptionEntity.disassemble`: `CONTRAPTION_DISASSEMBLE` at the carriage.
+        crate::glue::contraptions::disassemble_sound(lv, place([0, 0, 0]));
     }
     super::super::persist::mark_unsaved(dim, [t.column.0, t.column.1]);
     super::super::persist::mark_pos_unsaved(dim, pos);
@@ -344,9 +348,10 @@ pub fn assembling(dim: usize, pos: [i32; 3]) -> bool {
 }
 
 /// `enterAssemblyMode`: a train standing at the station is taken apart first; the station's
-/// track must be straight (`tryEnterAssemblyMode`). Its assembly direction is the way along
-/// the track bogeys stand on, else the way `player` looks (Create takes it from the look of
-/// the player who placed the station on its track). Trains bound for it look for another way.
+/// track must be straight (`tryEnterAssemblyMode`). Its assembly direction is the way it picked
+/// with its item (`getAssemblyDirection`: the track's axis times its target direction); for one
+/// with no pick, the way along the track bogeys stand on, else the way `player` looks. Trains
+/// bound for it look for another way.
 pub fn enter_assembly(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: Option<PlayerRef>) -> bool {
     let dim = lv.dim;
     railway_ready(dim);
@@ -375,6 +380,11 @@ pub fn enter_assembly(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: Option<Pl
             if s < 0.0 { -1 } else { 1 }
         });
     let direction = with_bogeys.unwrap_or([along[0] * looked, 0, along[2] * looked]);
+    // A station that picked its track assembles the way it picked (`getAssemblyDirection`).
+    let picked = with_world(|w| w.dims[dim].railway.targets.get(&pos).copied()).flatten();
+    let direction = picked.map_or(direction, |t| {
+        create_engine::network::assembly_direction(shape, &t)
+    });
     with_world(|w| {
         let r = &mut w.dims[dim].railway;
         r.assembling.insert(pos, direction);
@@ -451,6 +461,22 @@ pub fn assemble(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> bool {
     let Some((run, bogeys)) = assembly_track(lv, pos) else {
         return false;
     };
+    // `Contraption.moveBlock`: a running windmill bearing on a carriage is taken apart to move
+    // (`disassembleForMovement`) before the carriages' structures are searched.
+    for &(_, b, _) in &bogeys {
+        let _ = crate::glue::contraptions::gather_moving(
+            lv,
+            |lv| {
+                create_engine::contraption::gather_from(
+                    b,
+                    b,
+                    |p| run.contains(&p),
+                    |p| found_carrying(lv, p),
+                )
+            },
+            |g| crate::glue::contraptions::cells_of(b, &g.0),
+        );
+    }
     let locations: Vec<i32> = bogeys.iter().map(|b| b.0).collect();
     let dir_name = match direction {
         [1, _, 0] => "east",
@@ -458,16 +484,20 @@ pub fn assemble(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> bool {
         [0, _, 1] => "south",
         _ => "north",
     };
-    // Each carriage's structure from its first bogey (`CarriageContraption.assemble`): what
-    // sticks to it, not the track.
+    // Each carriage's structure from its first bogey (`CarriageContraption.assemble`:
+    // `searchMovedStructure(level, pos, null)`, nothing pushed ahead): what sticks to it, not
+    // the track.
     let mut gathered: HashMap<usize, Vec<([i32; 3], u32)>> = HashMap::new();
     let mut refused = false;
     let controls = states::key(Block::Controls);
     let laid = layout(&locations, |i| {
         let b = bogeys[i].1;
-        let Ok(blocks) =
-            create_engine::piston::gather(b, Dir::Down, &run, |p| found_carrying(lv, p))
-        else {
+        let Ok((blocks, _)) = create_engine::contraption::gather_from(
+            b,
+            b,
+            |p| run.contains(&p),
+            |p| found_carrying(lv, p),
+        ) else {
             refused = true;
             return Structure::default();
         };
@@ -548,6 +578,10 @@ pub fn assemble(lv: &mut ServerLevel<'_>, pos: [i32; 3]) -> bool {
             icon: 0,
             players: 0,
             probes: Default::default(),
+            // `Train.owner`: set by the station screen's assembly (`assemble(playerUUID)`).
+            owner: None,
+            status: Default::default(),
+            conductors: Vec::new(),
         };
         t.column = t.column_on(&r.net);
         r.trains.push(t);

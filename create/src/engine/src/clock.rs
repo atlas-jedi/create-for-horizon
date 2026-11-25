@@ -2,7 +2,7 @@
 //! hand in front of the bearing and a minute hand in front of that, each turning toward the
 //! angle the day time gives it, at most its speed a tick.
 
-use crate::contraption::{Found, Gathered, Refused, gather_from};
+use crate::contraption::{Found, Refused};
 use crate::kinetics::Dir;
 
 /// `ClockworkBearingBlockEntity.ClockHands` (the bearing's scroll option, `HOUR_FIRST` first).
@@ -113,10 +113,32 @@ impl Clock {
 
     /// One tick of a running clock (`tick`): each hand turns by its speed, `% 360`.
     pub fn tick(&mut self, sky: &Sky) {
-        let (h, m) = self.speeds(sky);
-        self.hour = (self.hour + h) % 360.0;
-        self.minute = (self.minute + m) % 360.0;
+        self.tick_holding(sky, (false, false));
     }
+
+    /// [`Clock::tick`] with the hands an actor stalls held where they are
+    /// (`hourHand.isStalled()`, `minuteHand.isStalled()`).
+    pub fn tick_holding(&mut self, sky: &Sky, held: (bool, bool)) {
+        let (h, m) = self.speeds(sky);
+        if !held.0 {
+            self.hour = (self.hour + h) % 360.0;
+        }
+        if !held.1 {
+            self.minute = (self.minute + m) % 360.0;
+        }
+    }
+}
+
+/// The key the minute hand's storage blocks' items are kept under (`minuteHand` is a
+/// contraption of its own, with its own `MountedStorageManager`), apart from the hour hand's
+/// (kept under the bearing's position): a step of `contraption::SUB_KEY_STEP` down from the
+/// bearing, which is no stabilized structure's key.
+pub fn minute_key(pos: [i32; 3]) -> [i32; 3] {
+    [
+        pos[0],
+        pos[1].wrapping_sub(crate::contraption::SUB_KEY_STEP),
+        pos[2],
+    ]
 }
 
 /// A structure's blocks: offsets and states.
@@ -128,6 +150,9 @@ pub type Blocks = Vec<([i32; 3], u32)>;
 pub struct Arms {
     pub hour: Blocks,
     pub minute: Option<(i32, Blocks)>,
+    /// The mechanical bearings on them that ride stabilized (`pendingSubContraptions`): the
+    /// hand (0 the hour's, 1 the minute's), the bearing's world position and its facing.
+    pub subs: Vec<(u8, [i32; 3], Dir)>,
 }
 
 /// `ClockworkContraption.assembleClockworkAt` for a bearing at `bearing` facing `facing`: the
@@ -139,12 +164,23 @@ pub fn gather(
     facing: Dir,
     at: impl Fn([i32; 3]) -> Option<Found>,
 ) -> Result<Option<Arms>, Refused> {
+    use crate::contraption::{clockwork_stabilizes, gather_from_stabilizing};
     let o = facing.offset();
     let along = |n: i32| [0, 1, 2].map(|a| bearing[a] + o[a] * n);
-    let (hour, _): Gathered = gather_from(along(1), bearing, |p| p == bearing, &at)?;
+    // Each hand's `canBeStabilized`, from its own anchor.
+    let rule = |anchor: [i32; 3]| {
+        move |f: Dir, p: [i32; 3]| {
+            clockwork_stabilizes(facing, f, [0, 1, 2].map(|a| p[a] - anchor[a]))
+        }
+    };
+    let hour_rule = rule(along(1));
+    let found = gather_from_stabilizing(along(1), bearing, |p| p == bearing, &hour_rule, &at)?;
+    let hour = found.blocks;
     if hour.is_empty() {
         return Ok(None);
     }
+    let mut subs: Vec<(u8, [i32; 3], Dir)> =
+        found.subs.into_iter().map(|(p, f)| (0, p, f)).collect();
     // `hourArmBlocks`: the first offset along the facing (from the hour hand's anchor) it
     // doesn't hold, below 16.
     let holds = |i: i32| {
@@ -160,17 +196,82 @@ pub fn gather(
                 hour.iter().any(|(q, _)| *q == l)
             }
         };
-        let (blocks, _) = gather_from(along(reach + 1), bearing, skip, &at)?;
-        if !blocks.is_empty() {
-            minute = Some((reach, blocks));
+        let minute_rule = rule(along(reach + 1));
+        let found = gather_from_stabilizing(along(reach + 1), bearing, skip, &minute_rule, &at)?;
+        if !found.blocks.is_empty() {
+            minute = Some((reach, found.blocks));
+            subs.extend(found.subs.into_iter().map(|(p, f)| (1, p, f)));
         }
     }
-    Ok(Some(Arms { hour, minute }))
+    Ok(Some(Arms { hour, minute, subs }))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_minute_hand_keeps_its_storage_apart_from_the_hour_hand_s() {
+        let p = [3, 70, -5];
+        let m = minute_key(p);
+        assert_ne!(m, p);
+        assert_eq!(crate::contraption::sub_of_key(m), None);
+        assert!((0..8).all(|i| crate::contraption::sub_key(p, i) != m));
+    }
+
+    #[test]
+    fn a_hand_an_actor_stalls_stays_while_the_other_turns() {
+        let sky = Sky {
+            rpm: 32.0,
+            day_time: 6000,
+            natural: true,
+            positive: true,
+        };
+        let mut c = Clock {
+            hour: 123.0,
+            minute: 77.0,
+            hands: Hands::HourFirst,
+        };
+        let (h, m) = c.speeds(&sky);
+        assert!(h != 0.0 && m != 0.0);
+        c.tick_holding(&sky, (true, false));
+        assert_eq!(c.hour, 123.0);
+        assert_eq!(c.minute, (77.0 + m) % 360.0);
+        let minute = c.minute;
+        c.tick_holding(&sky, (false, true));
+        assert!(c.hour != 123.0);
+        assert_eq!(c.minute, minute);
+    }
+
+    #[test]
+    fn a_bearing_on_a_hand_rides_upright_unless_it_is_the_hand_s_anchor() {
+        use crate::contraption::clockwork_stabilizes;
+        // A clock facing north: its hour hand anchored at (0, 0, -1).
+        assert!(clockwork_stabilizes(Dir::North, Dir::South, [0, 2, 0]));
+        assert!(!clockwork_stabilizes(Dir::North, Dir::North, [0, 0, 0]), "the anchor");
+        assert!(!clockwork_stabilizes(Dir::North, Dir::South, [0, 0, -1]), "facing the anchor");
+        assert!(!clockwork_stabilizes(Dir::North, Dir::Up, [0, 2, 0]), "across");
+        // A hand of stone up from (0, 0, -1) with a south-facing bearing on its tip (0, 2, -1):
+        // the bearing rides on the hour hand, stabilized.
+        let at = |p: [i32; 3]| match p {
+            [0, 0..=1, -1] => Some(Found {
+                state: 1,
+                movable: true,
+                glued: Dir::Up.bit(),
+                ..Default::default()
+            }),
+            [0, 2, -1] => Some(Found {
+                state: 2,
+                movable: true,
+                bearing: Some(Dir::South),
+                ..Default::default()
+            }),
+            _ => None,
+        };
+        let arms = gather([0, 0, 0], Dir::North, at).unwrap().unwrap();
+        assert_eq!(arms.subs, vec![(0, [0, 2, -1], Dir::South)]);
+        assert_eq!(arms.hour.len(), 3);
+    }
 
     fn sky(day_time: i64) -> Sky {
         Sky {

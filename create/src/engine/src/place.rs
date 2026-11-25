@@ -214,9 +214,12 @@ pub fn facing(block: Block, ctx: Context, shaft: impl Fn(Dir) -> bool) -> Option
         Block::Sticker => nearest.opposite(),
         // RollerBlock.getStateForPlacement: facing the player.
         Block::MechanicalRoller => horizontal_direction(ctx.yaw).opposite(),
-        // ControlsBlock (contraption controls): facing the player; sneaking, away.
-        Block::ContraptionControls if ctx.sneaking => horizontal_direction(ctx.yaw),
-        Block::ContraptionControls => horizontal_direction(ctx.yaw).opposite(),
+        // ControlsBlock (train controls, and the contraption controls that extend it): facing
+        // the player; sneaking, away.
+        Block::Controls | Block::ContraptionControls if ctx.sneaking => {
+            horizontal_direction(ctx.yaw)
+        }
+        Block::Controls | Block::ContraptionControls => horizontal_direction(ctx.yaw).opposite(),
         // PortableStorageInterfaceBlock: against the player's view; sneaking, along it.
         Block::PortableStorageInterface | Block::PortableFluidInterface if ctx.sneaking => nearest,
         Block::PortableStorageInterface | Block::PortableFluidInterface => nearest.opposite(),
@@ -683,6 +686,17 @@ mod tests {
         };
         assert_eq!(crafter(east, Some(Dir::South)), (Dir::South, "left"));
         assert_eq!(facing(Block::Basin, c, |_| false), Some(Dir::Down));
+    }
+
+    #[test]
+    fn train_controls_face_the_player_or_away_sneaking() {
+        // `ControlsBlock.getStateForPlacement`: a player looking north places them facing
+        // south, toward the player; sneaking, facing north.
+        let c = ctx(180.0, 30.0, false);
+        assert_eq!(facing(Block::Controls, c, |_| false), Some(Dir::South));
+        let sneaking = ctx(180.0, 30.0, true);
+        assert_eq!(facing(Block::Controls, sneaking, |_| false), Some(Dir::North));
+        assert_eq!(facing(Block::Controls, ctx(90.0, 0.0, false), |_| false), Some(Dir::East));
     }
 
     #[test]

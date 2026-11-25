@@ -309,13 +309,15 @@ pub fn use_basin(
             for s in slots.into_iter().flatten() {
                 lv.give(player, s);
             }
+            // `ITEM_PICKUP` at .2, pitch `1 + nextFloat()`.
+            let pitch = 1.0 + Rng::new(lv.seed_at(pos)).next_float();
             sound(
                 lv,
                 "minecraft:entity.item.pickup",
                 pos,
                 mod_api::SoundSource::Players,
                 0.2,
-                1.5,
+                pitch,
             );
         }
         return true;
@@ -373,10 +375,73 @@ pub fn use_basin(
         return true;
     }
     // An item that could be emptied or filled is used up all the same.
-    emptying.is_some()
+    if emptying.is_some()
         || held == "minecraft:bucket"
         || held == "minecraft:glass_bottle"
         || recipes::with(|r| create_engine::spout::fillable(&held, &r.filling)).unwrap_or(false)
+    {
+        return true;
+    }
+    // A sponge drains every tank (`drain(Integer.MAX_VALUE)` on the basin's tanks, the outputs
+    // then the inputs, each drained whole); it stays dry, and passes when there was nothing.
+    if held == "minecraft:sponge" && tanks != basin::Tanks::default() {
+        with_world(|w| w.set_basin_fluids(dim, pos, basin::Tanks::default()));
+        return true;
+    }
+    false
+}
+
+/// Whether the basin at `pos` this client sees holds any fluid (a sponge's click is then the
+/// basin's).
+pub fn shown_fluid(host: &dyn mod_api::ClientHost, pos: [i32; 3]) -> bool {
+    host.level(host.dimension())
+        .and_then(|l| host.block_entity(l, pos))
+        .and_then(|e| e.data(host))
+        .is_some_and(|d| !super::client::basin_fluids(&d).is_empty())
+}
+
+/// `BasinBlockEntity.addToGoggleTooltip` from what the basin at `pos` shows this client: its
+/// stacks (`name xcount`, inputs then outputs), then its fluids (outputs then inputs, as its
+/// combined tanks list them); nothing when it is empty.
+pub fn goggle_lines(
+    host: &dyn mod_api::ClientHost,
+    pos: [i32; 3],
+    lines: &mut Vec<Vec<(String, u32)>>,
+) {
+    use create_engine::gauge::{goggles, number};
+    let Some(data) = host
+        .level(host.dimension())
+        .and_then(|l| host.block_entity(l, pos))
+        .and_then(|e| e.data(host))
+    else {
+        return;
+    };
+    let mut out = Vec::new();
+    for (id, n) in super::client::basin_items(&data) {
+        let name = stacks::stack(host, &id, 1).map_or(id, |s| host.hover_name(&s));
+        out.push(goggles(1, vec![(name, 0xAAAAAA), (format!(" x{n}"), 0x55FF55)]));
+    }
+    let fluids = super::client::basin_fluids_by_tank(&data);
+    let mb = host
+        .translate("create.generic.unit.millibuckets")
+        .unwrap_or_else(|| "mB".into());
+    for (fluid, n) in fluids[2..].iter().chain(&fluids[..2]).flatten() {
+        out.push(goggles(
+            1,
+            vec![
+                (format!("{} ", fluid.name()), 0xAAAAAA),
+                (format!("{}{mb}", number(f64::from(*n))), 0x5555FF),
+            ],
+        ));
+    }
+    if out.is_empty() {
+        return;
+    }
+    let title = host
+        .translate("create.gui.goggles.basin_contents")
+        .unwrap_or_else(|| "Basin Contents:".into());
+    lines.push(goggles(0, vec![(title, 0xFFFFFF)]));
+    lines.extend(out);
 }
 
 /// Mechanical mixers: those asked to look at their basin (`updateBasin`: turning, not running,
@@ -429,6 +494,22 @@ pub fn tick_mixers(lv: &mut ServerLevel<'_>) {
         match m.tick(speed, time) {
             MixStep::None => {}
             MixStep::Done => checks.push(pos),
+            // `processingTicks` set at the bottom: a basin holding fluid bubbles
+            // (`BUBBLE_COLUMN_WHIRLPOOL_AMBIENT` at .75, its pitch .75 under 65 rpm, else 1.5).
+            MixStep::Bottom => {
+                let t = basin_tanks(dim, basin_pos);
+                if t.input.iter().chain(&t.output).any(Option::is_some) {
+                    let pitch = if speed.abs() < 65.0 { 0.75 } else { 1.5 };
+                    sound(
+                        lv,
+                        "minecraft:block.bubble_column.whirlpool_ambient",
+                        pos,
+                        mod_api::SoundSource::Blocks,
+                        0.75,
+                        pitch,
+                    );
+                }
+            }
             MixStep::Apply => {
                 let heat = basin_heat(lv, basin_pos);
                 let mut rng = Rng::new(lv.seed_at(pos));
@@ -679,8 +760,38 @@ fn compressible(lv: &ServerLevel<'_>, slots: &[Slot]) -> Vec<basin::Recipe> {
     out
 }
 
-/// `tryProcessInBasin` at the head's lowest point: the press's compacting recipe on the basin.
+/// `tryProcessInBasin` at the head's lowest point: the press's compacting recipe on the basin,
+/// then (`makeCompactingParticleEffect`, on its clients) 20 crumbs of each stack left in its
+/// inputs, thrown out across the basin's middle.
 pub fn compact_in_basin(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    compact(lv, pos);
+    let basin_pos = [pos[0], pos[1] - 2, pos[2]];
+    if !basin_at(lv, basin_pos) {
+        return;
+    }
+    let inputs = lv.slots(basin_pos, basin::INPUTS.end).unwrap_or_default();
+    let at = basin_pos.map(|v| f64::from(v) + 0.5);
+    let seed = lv.seed_at(pos);
+    for (i, stack) in inputs.into_iter().enumerate() {
+        let Some(stack) = stack else {
+            continue;
+        };
+        super::ambient::send_crumbs(
+            lv,
+            &stack,
+            at,
+            20,
+            |rng| {
+                let o = super::ambient::offset_with(rng, 0.175);
+                [o[0], 0.25, o[2]]
+            },
+            seed ^ i as u64,
+        );
+    }
+}
+
+/// The compacting recipe the press at `pos` works applied to its basin (`applyBasinRecipe`).
+fn compact(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
     let dim = lv.dim;
     let Some(i) = with_world(|w| w.dims[dim].press_basin.get(&pos).copied()).flatten() else {
         return;
@@ -907,6 +1018,17 @@ pub fn use_burner(
     let Some(remainder) = feed_burner(lv, pos, stack, true, false) else {
         return false;
     };
+    // `spawnParticleBurst` on the feeding player's client: soul flames for special fuel, or for a
+    // creative cake that takes a kindled blaze on (`nextActiveLevel` at least seething).
+    let soul = if held == "create:creative_blaze_cake" {
+        info.heat == Some(Heat::Kindled)
+    } else {
+        let dim = lv.dim;
+        with_world(|w| w.dims[dim].burners.get(&pos).map(|b| b.fuel))
+            .flatten()
+            .is_some_and(|f| f == burner::Fuel::Special)
+    };
+    super::ambient::burner_burst(lv, pos, soul);
     if !lv.creative(player) && held != "create:creative_blaze_cake" {
         lv.take_held(player, 1);
         if let Some(r) = remainder {
@@ -949,19 +1071,12 @@ pub fn feed_burner(
             Some(next)
         })
         .flatten()?;
+        blaze_shoot(lv, pos);
         lv.set_property(
             pos,
             "blaze",
             burner::heat_name(heat),
             crate::glue::server::update_all(),
-        );
-        sound(
-            lv,
-            "minecraft:entity.blaze.shoot",
-            pos,
-            mod_api::SoundSource::Blocks,
-            0.2,
-            0.6,
         );
         return Some(None);
     }
@@ -999,6 +1114,22 @@ pub fn feed_burner(
             .flatten()
     })
     .flatten()?;
+    // `tryUpdateFuel`: `playSound`, the heat set, and the blaze's ambient call when it changed
+    // (at .125 to .25, pitch .9 to 1.15).
+    blaze_shoot(lv, pos);
+    if info.heat != Some(heat) {
+        let mut rng = Rng::new(lv.seed_at(pos) ^ 0xA3B1);
+        let volume = 0.125 + rng.next_float() * 0.125;
+        let pitch = 1.15 - rng.next_float() * 0.25;
+        sound(
+            lv,
+            "minecraft:entity.blaze.ambient",
+            pos,
+            mod_api::SoundSource::Blocks,
+            volume,
+            pitch,
+        );
+    }
     lv.set_property(
         pos,
         "blaze",
@@ -1006,4 +1137,19 @@ pub fn feed_burner(
         crate::glue::server::update_all(),
     );
     Some(remainder)
+}
+
+/// `BlazeBurnerBlockEntity.playSound`: the blaze shoots, at .125 to .25, pitch .5 to .75.
+fn blaze_shoot(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    let mut rng = Rng::new(lv.seed_at(pos));
+    let volume = 0.125 + rng.next_float() * 0.125;
+    let pitch = 0.75 - rng.next_float() * 0.25;
+    sound(
+        lv,
+        "minecraft:entity.blaze.shoot",
+        pos,
+        mod_api::SoundSource::Blocks,
+        volume,
+        pitch,
+    );
 }

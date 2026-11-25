@@ -272,6 +272,7 @@ pub(super) fn tick(host: &mut dyn ClientHost) {
         };
         host.add_particle(&options, at, v);
     }
+    nozzle_puffs(host, &fans, keys.poof);
     let Some(options) = AIR_FLOW_TYPE.get().map(|t| t.options(())) else {
         return;
     };
@@ -292,6 +293,50 @@ pub(super) fn tick(host: &mut dyn ClientHost) {
         if !host.add_particle(&options, at, [0.0; 3]) {
             shared(|s| s.spawned.retain(|(p, _)| *p != at));
         }
+    }
+}
+
+/// `NozzleBlockEntity.tick` on the client: a nozzle on the front of a turning fan puffs now and
+/// then (one tick in `clamp(20 - range, 1, 10)`, `fanPushDistance` 20), within a block of its
+/// centre blowing out when the fan pushes, else within half its range drawn in toward it.
+fn nozzle_puffs(host: &mut dyn ClientHost, fans: &[Seen], poof: ParticleKey) {
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    for f in fans {
+        let o = f.facing.offset();
+        let pos = [f.pos[0] + o[0], f.pos[1] + o[1], f.pos[2] + o[2]];
+        let seen: &dyn ClientHost = &*host;
+        let nozzle = level
+            .block_state(seen, pos)
+            .and_then(crate::glue::states::id)
+            .and_then(|id| {
+                crate::glue::client_table(seen, |t| t.get(id).map(|(b, i)| (b, i.facing)))
+                    .flatten()
+            });
+        if nozzle != Some((create_engine::Block::Nozzle, Some(f.facing))) {
+            continue;
+        }
+        // `calcRange`: the fan's reach unblocked (`getMaxDistance`) and its way.
+        let (range, pushing) = (fan::max_distance(f.speed), fan::pushing(f.speed, f.facing));
+        let odds = (20 - range as i32).clamp(1, 10);
+        if (random() * odds as f32) as i32 != 0 {
+            continue;
+        }
+        let centre = pos.map(|v| f64::from(v) + 0.5);
+        let spread = f64::from(if pushing { 1.0 } else { range / 2.0 });
+        let start: [f64; 3] =
+            std::array::from_fn(|i| centre[i] + f64::from((random() - 0.5) * 2.0) * spread);
+        let diff: [f64; 3] = std::array::from_fn(|i| centre[i] - start[i]);
+        let len = diff.iter().map(|v| v * v).sum::<f64>().sqrt();
+        let scale = f64::from((range * if pushing { 0.025 } else { 1.0 }).clamp(0.0, 0.5))
+            * if pushing { -1.0 } else { 1.0 };
+        let motion = if len < 1e-4 {
+            [0.0; 3]
+        } else {
+            diff.map(|v| v / len * scale)
+        };
+        host.add_particle(&ParticleOptions::simple(poof), start, motion);
     }
 }
 

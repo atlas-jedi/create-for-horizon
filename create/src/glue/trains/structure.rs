@@ -46,6 +46,12 @@ fn found_with(lv: &ServerLevel<'_>, p: [i32; 3], storage: bool) -> Option<Found>
     ) {
         return None;
     }
+    // `isMovementNecessary` and `isMovementAllowed`, as for every contraption.
+    let id = crate::glue::contraptions::num(state);
+    if !crate::glue::contraptions::movement_necessary(lv, p, id, &name, &props) {
+        return None;
+    }
+    let refused = crate::glue::contraptions::movement_refused(lv, p, id, &name);
     let sail =
         name == "create:sail_frame" || (name.starts_with("create:") && name.ends_with("_sail"));
     let sail_facing = sail.then(|| prop("facing").and_then(dir_named)).flatten();
@@ -67,7 +73,8 @@ fn found_with(lv: &ServerLevel<'_>, p: [i32; 3], storage: bool) -> Option<Found>
             | "minecraft:repeating_command_block"
             | "minecraft:structure_block"
             | "minecraft:jigsaw"
-    ) || foreign_entity;
+    ) || refused
+        || foreign_entity;
     let dim = lv.dim;
     let range = with_world(|w| w.dims[dim].chassis_range.get(&p).copied())
         .flatten()
@@ -100,6 +107,12 @@ fn found_with(lv: &ServerLevel<'_>, p: [i32; 3], storage: bool) -> Option<Found>
         }
         _ => None,
     };
+    // `Contraption.capture`: a sliding door rides hidden.
+    let state = if super::doors::is_sliding_door(&name) {
+        crate::glue::contraptions::captured(&*lv.host, state)
+    } else {
+        state
+    };
     Some(Found {
         state: super::car_id(state),
         sail_facing,
@@ -120,6 +133,7 @@ fn found_with(lv: &ServerLevel<'_>, p: [i32; 3], storage: bool) -> Option<Found>
             .then(|| prop("facing").and_then(dir_named))
             .flatten(),
         movable: !unmovable,
+        sail: false,
         chassis,
         attached: crate::glue::contraptions::attached_sides(&name, &props),
         unsupportive: crate::glue::contraptions::unsupportive_faces(&name, &props),
@@ -129,6 +143,8 @@ fn found_with(lv: &ServerLevel<'_>, p: [i32; 3], storage: bool) -> Option<Found>
                 crate::glue::contraptions::create_info(id).and_then(|(_, i)| i.belt)
             })
             .flatten(),
+        // Brittle and push-only blocks, and what bearings, pulleys and pistons bring along.
+        ..crate::glue::contraptions::moved_with(lv, p, &name, &props)
     })
 }
 

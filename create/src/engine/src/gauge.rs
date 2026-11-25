@@ -81,6 +81,16 @@ impl SpeedLevel {
             SpeedLevel::Fast => "Fast",
         }
     }
+
+    /// The last part of its `tooltip.speedRequirement.*` key (`Lang.asId(name())`).
+    pub fn id(self) -> &'static str {
+        match self {
+            SpeedLevel::None => "none",
+            SpeedLevel::Slow => "slow",
+            SpeedLevel::Medium => "medium",
+            SpeedLevel::Fast => "fast",
+        }
+    }
 }
 
 /// `IRotate.StressImpact`, by a network's stress over its capacity.
@@ -123,6 +133,16 @@ impl StressLevel {
             StressLevel::Medium => "Moderate",
             StressLevel::High => "High",
             StressLevel::Overstressed => "Overstressed",
+        }
+    }
+
+    /// The last part of its `tooltip.stressImpact.*` key (`Lang.asId(name())`).
+    pub fn id(self) -> &'static str {
+        match self {
+            StressLevel::Low => "low",
+            StressLevel::Medium => "medium",
+            StressLevel::High => "high",
+            StressLevel::Overstressed => "overstressed",
         }
     }
 }
@@ -456,22 +476,42 @@ pub fn goggles(indent: usize, pieces: Line) -> Line {
 }
 
 /// `SpeedGaugeBlockEntity.addToGoggleTooltip` and `StressGaugeBlockEntity.addToGoggleTooltip`
-/// (en_us). An overstressed speed is struck through in Create; here it is only dark grey.
+/// in en_us ([`tooltip_in`] with no translations).
 pub fn tooltip(kind: Kind, s: &Shown) -> Vec<Line> {
-    let mut lines = vec![goggles(0, vec![("Gauge Information:".into(), WHITE)])];
+    tooltip_in(kind, s, &|_| None)
+}
+
+/// `SpeedGaugeBlockEntity.addToGoggleTooltip` and `StressGaugeBlockEntity.addToGoggleTooltip`
+/// in the game's language: `tr` gives a lang key's text (`CreateLang.translate`), en_us where it
+/// gives none. An overstressed speed is struck through (its formatting code).
+pub fn tooltip_in(kind: Kind, s: &Shown, tr: &dyn Fn(&str) -> Option<String>) -> Vec<Line> {
+    let t = |key: &str, english: &str| {
+        tr(&format!("create.{key}")).unwrap_or_else(|| english.to_owned())
+    };
+    let mut lines = vec![goggles(
+        0,
+        vec![(t("gui.gauge.info_header", "Gauge Information:"), WHITE)],
+    )];
     match kind {
         Kind::Speed => {
-            lines.push(goggles(0, vec![("Rotation Speed".into(), GRAY)]));
+            lines.push(goggles(
+                0,
+                vec![(t("gui.speedometer.title", "Rotation Speed"), GRAY)],
+            ));
             // `SpeedLevel.getFormattedSpeedText(speed, isOverStressed())`.
             let level = SpeedLevel::of(s.speed);
             // Overstressed: dark grey and struck through (`ChatFormatting.STRIKETHROUGH`, drawn
             // from its formatting code).
             let text = format!(
-                "{}{}{} ({} RPM) ",
+                "{}{}{} ({} {}) ",
                 if s.overstressed { "\u{a7}m" } else { "" },
                 progress_bar(3, level as usize),
-                level.name(),
-                number(f64::from(s.speed.abs()))
+                t(
+                    &format!("tooltip.speedRequirement.{}", level.id()),
+                    level.name()
+                ),
+                number(f64::from(s.speed.abs())),
+                t("generic.unit.rpm", "RPM"),
             );
             let color = if s.overstressed {
                 DARK_GRAY
@@ -484,11 +524,15 @@ pub fn tooltip(kind: Kind, s: &Shown) -> Vec<Line> {
             let capacity = f64::from(s.capacity);
             let stress = f64::from(s.stress);
             let fraction = stress / if capacity == 0.0 { 1.0 } else { capacity };
-            lines.push(goggles(0, vec![("Network Stress".into(), GRAY)]));
+            lines.push(goggles(
+                0,
+                vec![(t("gui.stressometer.title", "Network Stress"), GRAY)],
+            ));
             if s.speed == 0.0 {
+                let still = t("gui.stressometer.no_rotation", "No Rotation");
                 lines.push(goggles(
                     0,
-                    vec![(format!("{}No Rotation", progress_bar(3, 0)), DARK_GRAY)],
+                    vec![(format!("{}{still}", progress_bar(3, 0)), DARK_GRAY)],
                 ));
             } else {
                 // `StressImpact.getFormattedStressText`.
@@ -499,18 +543,22 @@ pub fn tooltip(kind: Kind, s: &Shown) -> Vec<Line> {
                         format!(
                             "{}{} ({}%) ",
                             progress_bar(3, (level as usize + 1).min(3)),
-                            level.name(),
+                            t(&format!("tooltip.stressImpact.{}", level.id()), level.name()),
                             (fraction * 100.0) as i32
                         ),
                         level.relative_color(),
                     )],
                 ));
-                lines.push(goggles(0, vec![("Remaining Capacity".into(), GRAY)]));
+                lines.push(goggles(
+                    0,
+                    vec![(t("gui.stressometer.capacity", "Remaining Capacity"), GRAY)],
+                ));
                 let remaining = capacity - stress;
-                let mut tip = vec![(format!("{}su", number(remaining)), level.relative_color())];
+                let su = t("generic.unit.stress", "su");
+                let mut tip = vec![(format!("{}{su}", number(remaining)), level.relative_color())];
                 if remaining != capacity {
                     tip.push((" / ".into(), GRAY));
-                    tip.push((format!("{}su", number(capacity)), DARK_GRAY));
+                    tip.push((format!("{}{su}", number(capacity)), DARK_GRAY));
                 }
                 lines.push(goggles(1, tip));
             }
@@ -803,6 +851,40 @@ mod tests {
         assert_eq!(t[4][3], ("16,384su".into(), 0x555555));
         let still = tooltip(Kind::Stress, &Shown::default());
         assert_eq!(still[2][1].0, " \u{2592}\u{2592}\u{2592} No Rotation");
+        // In the game's language: every text through its lang key, numbers as before.
+        let pt = |key: &str| {
+            Some(
+                match key {
+                    "create.gui.gauge.info_header" => "Informações do Medidor:",
+                    "create.gui.stressometer.capacity" => "Capacidade Restante",
+                    "create.tooltip.stressImpact.low" => "Baixo",
+                    "create.generic.unit.stress" => "us",
+                    "create.tooltip.speedRequirement.medium" => "Moderada",
+                    "create.generic.unit.rpm" => "RPM",
+                    _ => return None,
+                }
+                .to_owned(),
+            )
+        };
+        let t = tooltip_in(Kind::Stress, &s, &pt);
+        assert_eq!(t[0][1].0, "Informações do Medidor:");
+        assert_eq!(t[1][1].0, "Network Stress");
+        assert_eq!(t[2][1].0, " \u{2588}\u{2592}\u{2592} Baixo (25%) ");
+        assert_eq!(t[3][1].0, "Capacidade Restante");
+        assert_eq!(t[4][1].0, "12,288us");
+        let fast = Shown {
+            speed: 64.0,
+            overstressed: true,
+            ..Shown::default()
+        };
+        let t = tooltip_in(Kind::Speed, &fast, &pt);
+        assert_eq!(
+            t[2][1],
+            (
+                "\u{a7}m \u{2588}\u{2588}\u{2592} Moderada (64 RPM) ".into(),
+                0x555555
+            )
+        );
         assert_eq!(number(1234567.5), "1,234,567.5");
         assert_eq!(number(-1000.0), "-1,000");
     }

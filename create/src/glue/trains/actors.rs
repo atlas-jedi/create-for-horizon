@@ -25,12 +25,101 @@ thread_local! {
     /// Each carriage's pivot last tick and the entities touching it then
     /// (`collidingEntities`), for its motion and its run-over damage.
     static LAST: RefCell<HashMap<(usize, u32, usize), Touching>> = RefCell::new(HashMap::new());
+    /// Each carriage's sliding doors' kinds the contraption controls turned on or off since it
+    /// was loaded (their `MovementContext.disabled`, which `setActorsActive` sets and a load
+    /// sets again from the carriage's list of kinds turned off).
+    static DOORS_OFF: RefCell<HashMap<(usize, u32, usize), Vec<(String, bool)>>> =
+        RefCell::new(HashMap::new());
+}
+
+/// Whether the sliding doors of kind `item` on carriage `car` of `train` are turned off by
+/// contraption controls (`context.disabled`: `shouldOpen` is false, so they close).
+pub fn door_off(dim: usize, train: u32, car: usize, item: &str) -> bool {
+    let set = DOORS_OFF.with_borrow(|m| {
+        m.get(&(dim, train, car))
+            .and_then(|l| l.iter().find(|(k, _)| k == item).map(|(_, off)| *off))
+    });
+    set.unwrap_or_else(|| {
+        let extras = super::cargo::extras_of(dim, super::cargo::key(train, car));
+        create_engine::actors::stays_disabled(&extras.disabled, &Some(item.to_owned()))
+    })
+}
+
+/// The kinds of the sliding doors on carriage `key` (`cargo::key`), as actors its contraption
+/// controls can turn off (`canBeDisabledVia`: the door's block).
+pub(crate) fn door_kinds(lv: &ServerLevel<'_>, key: [i32; 3]) -> Vec<String> {
+    let (Some(train), Ok(car)) = (super::cargo::train_of(key), usize::try_from(key[2])) else {
+        return Vec::new();
+    };
+    let dim = lv.dim;
+    let blocks = with_world(|w| {
+        let t = w.dims[dim].railway.trains.iter().find(|t| t.id == train)?;
+        t.cars.get(car).cloned()
+    })
+    .flatten()
+    .unwrap_or_default();
+    let mut kinds: Vec<String> = Vec::new();
+    for (_, s) in blocks {
+        let Some((name, _)) = super::car_state(s).and_then(|st| super::state_parts(&*lv.host, st))
+        else {
+            continue;
+        };
+        if super::doors::is_sliding_door(&name) && !kinds.contains(&name) {
+            kinds.push(name);
+        }
+    }
+    kinds
+}
+
+/// Contraption controls with `filter` on carriage `key` were clicked, turning that kind
+/// `enable`d: its sliding doors of that kind (every kind for no filter) follow
+/// (`setActorsActive`), and a door's kind follows on every carriage of the train ("doors are
+/// toggled on all carriages of a train").
+pub(crate) fn doors_controlled(
+    lv: &ServerLevel<'_>,
+    key: [i32; 3],
+    filter: &create_engine::actors::Filter,
+    enable: bool,
+) {
+    let (Some(train), Ok(car)) = (super::cargo::train_of(key), usize::try_from(key[2])) else {
+        return;
+    };
+    let dim = lv.dim;
+    let door = filter.as_deref().is_some_and(|f| {
+        crate::glue::processing::item_tagged(&*lv.host, f, "minecraft:doors")
+    });
+    let cars: Vec<usize> = if door {
+        with_world(|w| {
+            let t = w.dims[dim].railway.trains.iter().find(|t| t.id == train)?;
+            Some((0..t.cars.len()).collect())
+        })
+        .flatten()
+        .unwrap_or_default()
+    } else {
+        vec![car]
+    };
+    for c in cars {
+        let kinds = door_kinds(lv, super::cargo::key(train, c));
+        DOORS_OFF.with_borrow_mut(|m| {
+            let l = m.entry((dim, train, c)).or_default();
+            for k in kinds {
+                if filter.as_deref().is_some_and(|f| f != k) {
+                    continue;
+                }
+                match l.iter_mut().find(|(n, _)| *n == k) {
+                    Some(e) => e.1 = !enable,
+                    None => l.push((k, !enable)),
+                }
+            }
+        });
+    }
 }
 
 /// The world closed.
 pub fn forget() {
     CARRIED.with_borrow_mut(HashMap::clear);
     LAST.with_borrow_mut(HashMap::clear);
+    DOORS_OFF.with_borrow_mut(HashMap::clear);
 }
 
 /// After the trains moved: each loaded carriage's actors tick where it is now; a train whose
@@ -94,7 +183,13 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
                 })
                 .flatten()
                 .unwrap_or_default();
-                let mut carried = actors::structure_actors(&*lv.host, &blocks, super::car_state);
+                // Its actors with the kinds its contraption controls turned off
+                // (`ContraptionControlsMovement`, `disabledActors`).
+                let extras = super::cargo::extras_of(dim, super::cargo::key(train, car));
+                let mut carried = actors::with_extras(
+                    actors::structure_actors(&*lv.host, &blocks, super::car_state),
+                    &extras,
+                );
                 // A carriage's interfaces never stall it (`onCarriage`): `cargo` runs them.
                 carried
                     .actors
@@ -129,6 +224,97 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
     });
 }
 
+/// What carriage `key` (`cargo::key`) carries, for a click on its contraption controls: its
+/// actors, controls and the kinds they turned off, and where each of its blocks is now (by its
+/// pose this tick); None for no such loaded carriage.
+pub(crate) fn take_carriage_carried(
+    lv: &ServerLevel<'_>,
+    key: [i32; 3],
+) -> Option<(Carried, crate::glue::contraptions::actors::Place)> {
+    let train = super::cargo::train_of(key)?;
+    let car = usize::try_from(key[2]).ok()?;
+    let dim = lv.dim;
+    let frame = with_world(|w| {
+        let r = &w.dims[dim].railway;
+        let t = r.trains.iter().find(|t| t.id == train && t.train.bound)?;
+        (car < t.train.carriages.len().min(t.cars.len())).then(|| {
+            let (pivot, front) = t.train.carriage_pose(&r.net.graph, car);
+            Frame::new(pivot, front, t.heading)
+        })
+    })
+    .flatten()?;
+    let extras = super::cargo::extras_of(dim, key);
+    let mut carried = CARRIED
+        .with_borrow(|m| m.get(&(dim, train, car)).cloned())
+        .unwrap_or_default();
+    carried.controls = extras.controls;
+    carried.disabled = extras.disabled;
+    let place = move |o: [i32; 3]| {
+        let c = frame.to_world([0, 1, 2].map(|i| f64::from(o[i]) + 0.5));
+        c.map(|v| v.floor() as i32)
+    };
+    Some((carried, Box::new(place)))
+}
+
+/// What [`take_carriage_carried`] took, changed by its controls, goes back: its actors to the
+/// carriage, its controls and the kinds turned off to what it carries (saved with its train).
+pub(crate) fn put_carriage_carried(lv: &mut ServerLevel<'_>, key: [i32; 3], carried: Carried) {
+    let dim = lv.dim;
+    let (Some(train), Ok(car)) = (super::cargo::train_of(key), usize::try_from(key[2])) else {
+        return;
+    };
+    super::cargo::set_controls(dim, key, &carried);
+    let mut actors_only = carried;
+    actors_only.controls.clear();
+    actors_only.glue.clear();
+    CARRIED.with_borrow_mut(|m| {
+        if m.contains_key(&(dim, train, car)) {
+            m.insert((dim, train, car), actors_only);
+        }
+    });
+    // Its train's column keeps it (`chunk_data_save`).
+    if let Some(column) =
+        with_world(|w| w.dims[dim].railway.trains.iter().find(|t| t.id == train).map(|t| t.column))
+            .flatten()
+    {
+        crate::glue::persist::mark_unsaved(dim, [column.0, column.1]);
+    }
+}
+
+/// The contraption controls on the carriages of level `lv`'s trains, each carriage's by its key
+/// (`cargo::key`) and where it stands this tick, for the clients near them to find with their
+/// ray.
+pub(crate) fn posed_controls(lv: &ServerLevel<'_>) -> Vec<create_engine::actors::PosedControls> {
+    let dim = lv.dim;
+    let cars: Vec<(u32, usize, Frame)> = with_world(|w| {
+        let r = &w.dims[dim].railway;
+        let mut out = Vec::new();
+        for t in r.trains.iter().filter(|t| t.train.bound) {
+            for c in 0..t.train.carriages.len().min(t.cars.len()) {
+                let (pivot, front) = t.train.carriage_pose(&r.net.graph, c);
+                out.push((t.id, c, Frame::new(pivot, front, t.heading)));
+            }
+        }
+        out
+    })
+    .unwrap_or_default();
+    let mut out = Vec::new();
+    for (train, car, frame) in cars {
+        let key = super::cargo::key(train, car);
+        let extras = super::cargo::extras_of(dim, key);
+        if extras.controls.is_empty() {
+            continue;
+        }
+        let (centre, turns) = frame.actor_pose();
+        out.push(create_engine::actors::PosedControls {
+            key,
+            pose: create_engine::collider::Pose { centre, turns },
+            controls: extras.controls.iter().map(|(o, _)| *o).collect(),
+        });
+    }
+    out
+}
+
 /// Train `train` comes apart: its actors stop (`Contraption.stop`: their cracks go, deployers
 /// let go of what they broke).
 pub fn disassembled(lv: &mut ServerLevel<'_>, train: u32) {
@@ -146,6 +332,7 @@ pub fn disassembled(lv: &mut ServerLevel<'_>, train: u32) {
     for ((_, t, c), mut carried) in list {
         actors::cancel_actors(lv, super::cargo::key(t, c), &mut carried);
     }
+    DOORS_OFF.with_borrow_mut(|m| m.retain(|k, _| k.0 != dim || k.1 != train));
 }
 
 /// `ContraptionCollider.handleDamageFromTrain` for carriage `car` of `train`, posed `frame`:

@@ -33,6 +33,12 @@ pub(super) fn side(lv: &ServerLevel<'_>, pos: [i32; 3], d: Dir) -> Side {
             .and_then(super::dir_named)
             .map(|f| decor::connected_direction(get("face").unwrap_or(""), f))
             == Some(d);
+    // `NixieTubeBlock.getFacing(sideState) == d`: a nixie tube hanging on to this side.
+    let nixie_toward = name.ends_with("nixie_tube")
+        && get("facing")
+            .and_then(super::dir_named)
+            .map(|f| decor::connected_direction(get("double_face").unwrap_or(""), f))
+            == Some(d);
     let holds = d.axis() == Axis::Y
         && (get("up") == Some("true")
             || name == "create:display_board"
@@ -55,7 +61,7 @@ pub(super) fn side(lv: &ServerLevel<'_>, pos: [i32; 3], d: Dir) -> Side {
                 Axis::Z
             }
         }),
-        toward: bracket || placard_toward,
+        toward: bracket || placard_toward || nixie_toward,
         holds,
         full_face: lv
             .level

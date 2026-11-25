@@ -10,7 +10,8 @@ use super::super::server::{ServerLevel, update_all};
 use super::super::subsystem::Subsystem;
 use super::super::world::with_world;
 use super::super::{kinetics, persist, states};
-use super::{assembly, riding, saved, tracks, visuals};
+use super::{assembly, cargo, riding, saved, tracks, visuals};
+use crate::glue::contraptions::actors;
 use crate::glue::names::Named as _;
 use create_engine::Block;
 use create_engine::trains::{CURVE_UPDATE_TICKS, Event, Run};
@@ -44,6 +45,7 @@ impl Subsystem for Trains {
         tracks::register(r);
         super::schedule_screen::register(r);
         super::conductor::register(r);
+        super::effects::register(r);
         r.block_part(states::key(Block::TrackStation), assembly::Station);
         r.block_part(states::key(Block::Track), assembly::TrackClick);
         r.block_part(states::key(Block::TrackObserver), Observer);
@@ -60,6 +62,7 @@ impl Subsystem for Trains {
         super::cargo::forget();
         assembly::forget();
         super::conductor::forget();
+        super::arrival::forget();
         super::relocate::forget();
         super::station_screen::forget();
         super::station_draw::forget();
@@ -177,6 +180,47 @@ impl Subsystem for Trains {
         });
     }
 
+    /// `SignalBlock.onWrenched`: a signal on the track switches between an entry and a cross
+    /// signal (`cycleSignalType`: its block's `type`, one per side of the track) and says which;
+    /// one on no track can't (`cannot_change_mode`). Sneaking, the wrench picks it up.
+    fn wrench_used(
+        &self,
+        lv: &mut ServerLevel<'_>,
+        player: PlayerRef,
+        pos: [i32; 3],
+        block: Block,
+        _clicked: create_engine::kinetics::Dir,
+        _point: [f64; 3],
+        sneaking: bool,
+    ) -> bool {
+        if block != Block::TrackSignal || sneaking {
+            return false;
+        }
+        let dim = lv.dim;
+        railway_ready(dim);
+        let state = lv.block(pos);
+        let (bound, cross) = with_world(|w| {
+            let bound = w.dims[dim]
+                .railway
+                .net
+                .signals
+                .iter()
+                .any(|b| b.blocks.iter().any(|side| side.contains(&pos)));
+            let cross = w.table.get(state).is_some_and(|(_, i)| i.cross_signal);
+            (bound, cross)
+        })
+        .unwrap_or((false, false));
+        let line = if bound {
+            let next = if cross { "entry_signal" } else { "cross_signal" };
+            crate::glue::items::wrench::switch_property(lv, pos, "type", next);
+            format!("create.track_signal.mode_change.{next}")
+        } else {
+            "create.track_signal.cannot_change_mode".to_owned()
+        };
+        super::action_bar(lv.host, player, mod_api::Text::translate(&line, Vec::new()));
+        true
+    }
+
     fn saved_keys(&self, block: create_engine::Block) -> &'static [&'static str] {
         if block == create_engine::Block::Track {
             &[CONNECTIONS]
@@ -242,6 +286,7 @@ impl Subsystem for Trains {
                 super::schedule_screen::client_message(host, player, data);
             }
             super::relocate::CHANNEL => super::relocate::client_message(player, data),
+            super::tracks::CHANNEL => super::tracks::client_message(host, player, data),
             _ => return false,
         }
         true
@@ -255,6 +300,7 @@ impl Subsystem for Trains {
             super::station_screen::CHANNEL => super::station_screen::server_message(host, data),
             super::schedule_screen::CHANNEL => super::schedule_screen::server_message(host, data),
             super::relocate::CHANNEL => super::relocate::server_message(data),
+            super::tracks::CHANNEL => super::track_client::server_message(data),
             _ => return false,
         }
         true
@@ -264,6 +310,8 @@ impl Subsystem for Trains {
         super::station_screen::tick_client(host);
         super::schedule_screen::tick_client(host);
         super::relocate::client_tick(host);
+        super::track_client::client_tick(host);
+        super::effects::client_tick(host);
     }
 
     fn input_handled(&self, host: &mut dyn ClientHost) {
@@ -299,6 +347,7 @@ impl Subsystem for Trains {
     ) {
         super::carriage_draw::render_level_stage(host, event);
         super::relocate::render_level_stage(event);
+        super::track_client::render_level_stage(host, event);
     }
 
     /// A station's flag moving and an invalid signal's blink (`SignalRenderer`) are drawn every
@@ -317,10 +366,52 @@ impl Subsystem for Trains {
     fn client_reset(&self) {
         super::station_draw::client_reset();
         super::relocate::client_reset();
+        super::effects::reset();
         super::carriage_draw::reset();
         super::client::reset();
         super::station_screen::reset();
         super::schedule_screen::reset();
+        super::track_client::reset();
+    }
+
+    /// `TrackBlock.playerWillDestroy`: a creative player's break drops no curve items.
+    fn break_block(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::BreakBlockEvent<'_>,
+    ) -> Flow {
+        super::tracks::break_block(host, event);
+        Flow::Continue
+    }
+
+    /// `CurvedTrackInteraction.onClickInput`: clicks on the curve aimed at.
+    fn interaction_key(
+        &self,
+        host: &mut dyn ClientHost,
+        event: &mut mod_api::InteractionKeyMappingTriggeredEvent,
+    ) -> Flow {
+        super::track_client::interaction_key(host, event)
+    }
+
+    /// `TrackBlockItem.sendExtenderPacket`.
+    fn right_click_block(
+        &self,
+        host: mod_api::HostSide,
+        event: &mut mod_api::RightClickBlockEvent<'_>,
+    ) -> Flow {
+        if let mod_api::HostSide::Client(host) = host {
+            super::track_client::right_click_block(host, event.click);
+        }
+        Flow::Continue
+    }
+
+    /// No block outline while a curve is aimed at.
+    fn block_highlight(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::BlockHighlightEvent,
+    ) -> Flow {
+        super::track_client::block_highlight(host, event)
     }
 
     fn screen_render_post(&self, host: &dyn ClientHost, event: &mut ScreenRenderPostEvent<'_>) {
@@ -520,23 +611,56 @@ fn tick_trains(lv: &mut ServerLevel<'_>) {
         .filter(|p| lv.has_neighbor_signal(*p))
         .collect();
     let seated = riding::passengers(dim);
+    // `Train.updateConductors`.
+    super::conductor::update(lv);
     let probes = probe_schedules(lv);
+    // `Train.burnFuel`: trains out of fuel that drive (by hand or toward a station) this tick
+    // are offered their carriages' first fuel items.
+    let hungry: Vec<(u32, usize)> = with_world(|w| {
+        w.dims[dim]
+            .railway
+            .trains
+            .iter()
+            .filter(|t| t.train.bound && !t.train.derailed && t.train.fuel <= 0)
+            .filter(|t| {
+                t.train.nav.is_some() || t.train.manual.is_some_and(|m| m.throttle != 0.0)
+            })
+            .map(|t| (t.id, t.train.carriages.len()))
+            .collect()
+    })
+    .unwrap_or_default();
+    let offers: Vec<(u32, Vec<Option<i32>>)> = hungry
+        .into_iter()
+        .map(|(id, cars)| {
+            let offer = (0..cars)
+                .map(|car| actors::burn_fuel(lv, cargo::key(id, car), false))
+                .collect();
+            (id, offer)
+        })
+        .collect();
     with_world(|w| {
         let r = &mut w.dims[dim].railway;
         r.day_time = day_time;
         r.powered = powered;
         for t in &mut r.trains {
             t.players = seated.get(&t.id).copied().unwrap_or(0);
+            t.train.fuel_offer.clear();
         }
         for (id, p) in probes {
             if let Some(t) = r.trains.iter_mut().find(|t| t.id == id) {
                 t.probes = p;
             }
         }
+        for (id, offer) in offers {
+            if let Some(t) = r.trains.iter_mut().find(|t| t.id == id) {
+                t.train.fuel_offer = offer;
+            }
+        }
     });
     let mut events = EVENTS.take();
     let mut observed = Vec::new();
     let mut crashes = Vec::new();
+    let mut burnt: Vec<(u32, usize)> = Vec::new();
     let (due, fresh, lights) = with_world(|w| {
         let d = &mut w.dims[dim];
         d.railway.ensure(&d.track_curves);
@@ -555,6 +679,11 @@ fn tick_trains(lv: &mut ServerLevel<'_>) {
             d.analog_checks.push(*p);
         }
         crashes = std::mem::take(&mut d.railway.crashes);
+        for t in &mut d.railway.trains {
+            if let Some(car) = t.train.burnt.take() {
+                burnt.push((t.id, car));
+            }
+        }
         let lights = std::mem::take(&mut d.railway.lights_changed);
         d.analog_checks
             .extend(lights.iter().filter(|l| l.1.is_some()).map(|l| l.0));
@@ -579,6 +708,10 @@ fn tick_trains(lv: &mut ServerLevel<'_>) {
         (due, fresh, lights)
     })
     .unwrap_or_default();
+    // The fuel item a train burnt leaves its carriage's storage.
+    for (id, car) in burnt {
+        let _ = actors::burn_fuel(lv, cargo::key(id, car), true);
+    }
     // Saved with the column it stands in: the one it left and the one it is in save again.
     for e in &events {
         if e.was != e.now || e.run == Run::Arrived {
@@ -606,6 +739,10 @@ fn tick_trains(lv: &mut ServerLevel<'_>) {
     for c in crashes {
         crashed(lv, &c);
     }
+    // `CarriageContraptionEntity.tickArrivalSound`, then `TrainStatus.tick` (told before the
+    // next tick's moves in Create's `earlyTick`).
+    super::arrival::tick(lv);
+    super::status::tell(lv);
 }
 
 /// `Train.collideWithOtherTrains` and `crash` after two trains met: a blast that breaks nothing
@@ -741,12 +878,16 @@ fn probe_schedules(lv: &mut ServerLevel<'_>) -> Vec<(u32, create_engine::schedul
         if let Some(instruction) = packages {
             // The stations whose postboxes (`GlobalPackagePort`) take the packages aboard, or
             // hold packages to fetch; whether packages are aboard decides what a delivery with
-            // none does.
-            let any = stacks.iter().any(|s| {
-                create_engine::package::is_package(&crate::glue::packages::body::item_id(
-                    &*lv.host, s,
-                ))
-            });
+            // none does, and the first one's address is told when none is taken
+            // (`failedPackageNoTarget`).
+            let any = stacks
+                .iter()
+                .find(|s| {
+                    create_engine::package::is_package(&crate::glue::packages::body::item_id(
+                        &*lv.host, s,
+                    ))
+                })
+                .map(crate::glue::packages::body::address);
             let fetch = match &instruction {
                 create_engine::schedule::Instruction::FetchPackages(f) => Some(f.as_str()),
                 _ => None,

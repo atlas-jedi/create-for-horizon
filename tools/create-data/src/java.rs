@@ -13,8 +13,15 @@ pub struct JavaFacts {
     /// `stone`, `softMetal`, `wooden`, `copperMetal`, `netheriteMetal` (`SharedProperties::x`),
     /// or a vanilla block (`Blocks.GLASS` gives `glass`).
     pub base: Option<String>,
-    /// `SoundType.X`, lowercased: `metal`, `wood`, `netherite_block`...
+    /// `SoundType.X`, lowercased: `metal`, `wood`, `netherite_block`... The last one the chain
+    /// sets, counting a `BuilderTransformers` helper's where `.transform` calls it, as Registrate
+    /// applies `properties` in chain order.
     pub sound: Option<String>,
+    /// `lightLevel($ -> n)`: a light level that is a number, whatever the state.
+    pub light: Option<u8>,
+    /// `.tag(Tags.Blocks.RELOCATION_NOT_SUPPORTED)` (`c:relocation_not_supported`): a block nothing
+    /// should move.
+    pub relocation_not_supported: bool,
     pub no_occlusion: bool,
     /// `.requiresCorrectToolForDrops()` set in the chain itself.
     pub requires_tool: bool,
@@ -119,12 +126,43 @@ pub fn read_all(java_root: &Path) -> BTreeMap<String, JavaFacts> {
     let mut files = Vec::new();
     collect(java_root, &mut files);
     files.sort();
+    let helpers = fs::read_to_string(
+        java_root.join("com/simibubi/create/foundation/data/BuilderTransformers.java"),
+    )
+    .map(|text| transformer_sounds(&text))
+    .unwrap_or_default();
     for file in files {
         let Ok(text) = fs::read_to_string(&file) else {
             continue;
         };
-        for (name, facts) in chains(&text, ".block(\"") {
+        for (name, facts) in chains_with(&text, ".block(\"", &helpers) {
             out.entry(name).or_insert(facts);
+        }
+    }
+    out
+}
+
+/// The sound each `BuilderTransformers` helper sets (`p.sound(SoundType.X)` in its body), as
+/// (`BuilderTransformers.name(`, `x`): `casing` gives wood, `bogey` netherite.
+pub fn transformer_sounds(text: &str) -> Vec<(String, String)> {
+    let mut starts: Vec<usize> = ["public static ", "private static ", "protected static "]
+        .iter()
+        .flat_map(|m| text.match_indices(m).map(|(i, _)| i))
+        .collect();
+    starts.sort_unstable();
+    let mut out = Vec::new();
+    for (k, &at) in starts.iter().enumerate() {
+        let body = &text[at..starts.get(k + 1).copied().unwrap_or(text.len())];
+        let Some(open) = body.find('(') else { continue };
+        let name = body[..open]
+            .rsplit(|c: char| !(c.is_ascii_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
+        if let Some(sound) = ident_after(body, "SoundType.").filter(|_| !name.is_empty()) {
+            out.push((
+                format!("BuilderTransformers.{name}("),
+                sound.to_ascii_lowercase(),
+            ));
         }
     }
     out
@@ -227,6 +265,15 @@ pub fn collect(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
 
 /// Every `.block("literal", ...)` chain in one file.
 pub fn chains(text: &str, marker: &str) -> Vec<(String, JavaFacts)> {
+    chains_with(text, marker, &[])
+}
+
+/// [`chains`], with the sounds `BuilderTransformers` helpers set ([`transformer_sounds`]).
+pub fn chains_with(
+    text: &str,
+    marker: &str,
+    helpers: &[(String, String)],
+) -> Vec<(String, JavaFacts)> {
     let mut out = Vec::new();
     let mut rest = text;
     while let Some(at) = rest.find(marker) {
@@ -241,7 +288,7 @@ pub fn chains(text: &str, marker: &str) -> Vec<(String, JavaFacts)> {
             .chars()
             .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
         {
-            out.push((name.to_string(), facts(body)));
+            out.push((name.to_string(), facts(body, helpers)));
         }
         rest = &after[end_name..];
     }
@@ -257,7 +304,34 @@ fn ident_after<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
     (n > 0).then(|| &t[..n])
 }
 
-fn facts(body: &str) -> JavaFacts {
+/// The sound the chain ends with: its own `SoundType.X`s and its helpers' ([`transformer_sounds`])
+/// in chain order, the last winning (a copper casing's own copper gives way to `casing`'s wood).
+fn last_sound(body: &str, helpers: &[(String, String)]) -> Option<String> {
+    let own = body.match_indices("SoundType.").filter_map(|(i, _)| {
+        Some((
+            i,
+            ident_after(&body[i..], "SoundType.")?.to_ascii_lowercase(),
+        ))
+    });
+    let by_helpers = helpers.iter().flat_map(|(call, sound)| {
+        body.match_indices(call.as_str())
+            .map(move |(i, _)| (i, sound.clone()))
+    });
+    own.chain(by_helpers)
+        .max_by_key(|(i, _)| *i)
+        .map(|(_, sound)| sound)
+}
+
+/// `lightLevel(s -> n)` with `n` a number (`$ -> 12`); a light by state (`s -> ... ? 15 : 0`, a
+/// method reference) is none.
+fn constant_light(body: &str) -> Option<u8> {
+    let at = body.find(".lightLevel(")? + ".lightLevel(".len();
+    let inner = &body[at..at + body[at..].find(')')?];
+    let (_, n) = inner.split_once("->")?;
+    n.trim().parse().ok().filter(|n| *n <= 15)
+}
+
+fn facts(body: &str, helpers: &[(String, String)]) -> JavaFacts {
     // The constructor is the second argument of `.block(name, X::new)` or a lambda `new X(`.
     let head = &body[..body
         .find(')')
@@ -282,12 +356,13 @@ fn facts(body: &str) -> JavaFacts {
         .iter()
         .find(|(t, _)| body.contains(t))
         .map(|(_, b)| (*b).to_string());
-    let sound = ident_after(body, "SoundType.").map(|s| s.to_ascii_lowercase());
     JavaFacts {
         class,
         base,
         transformer_base,
-        sound,
+        sound: last_sound(body, helpers),
+        light: constant_light(body),
+        relocation_not_supported: body.contains("Tags.Blocks.RELOCATION_NOT_SUPPORTED"),
         // `BuilderTransformers.encasedBase` (under the encased shafts and cogwheels), `bearing`
         // and `mechanicalPiston` set it in their own chains.
         no_occlusion: body.contains("noOcclusion()")
@@ -345,5 +420,91 @@ mod tests {
         assert_eq!(c[0].1.base.as_deref(), Some("stone"));
         assert_eq!(c[0].1.sound.as_deref(), Some("wood"));
         assert_eq!(c[2].1.class.as_deref(), Some("EncasedShaftBlock"));
+    }
+
+    #[test]
+    fn the_last_sound_in_chain_order_wins_with_its_helpers() {
+        let transformers = r#"
+	public static <B extends CasingBlock> NonNullUnaryOperator<BlockBuilder<B, CreateRegistrate>> casing(
+		Supplier<CTSpriteShiftEntry> ct) {
+		return b -> b.initialProperties(SharedProperties::stone)
+			.properties(p -> p.sound(SoundType.WOOD))
+			.build();
+	}
+
+	private static <B extends Block, P> BlockBuilder<B, P> plain(BlockBuilder<B, P> b) {
+		return b.initialProperties(SharedProperties::stone);
+	}
+
+	public static <B extends CasingBlock> NonNullUnaryOperator<BlockBuilder<B, CreateRegistrate>> layeredCasing(
+		Supplier<CTSpriteShiftEntry> ct, Supplier<CTSpriteShiftEntry> ct2) {
+		return b -> b.initialProperties(SharedProperties::stone);
+	}
+"#;
+        let helpers = transformer_sounds(transformers);
+        assert_eq!(
+            helpers,
+            [(
+                "BuilderTransformers.casing(".to_string(),
+                "wood".to_string()
+            )]
+        );
+        let java = r#"
+	public static final BlockEntry<CasingBlock> COPPER_CASING = REGISTRATE.block("copper_casing", CasingBlock::new)
+		.properties(p -> p.mapColor(MapColor.TERRACOTTA_LIGHT_GRAY)
+			.sound(SoundType.COPPER))
+		.transform(BuilderTransformers.casing(() -> AllSpriteShifts.COPPER_CASING))
+		.register();
+	public static final BlockEntry<CasingBlock> RAILWAY_CASING = REGISTRATE.block("railway_casing", CasingBlock::new)
+		.transform(BuilderTransformers.layeredCasing(() -> AllSpriteShifts.RAILWAY_CASING_SIDE,
+			() -> AllSpriteShifts.RAILWAY_CASING))
+		.properties(p -> p.sound(SoundType.NETHERITE_BLOCK))
+		.register();
+	public static final BlockEntry<CasingBlock> X = REGISTRATE.block("loud_casing", CasingBlock::new)
+		.transform(BuilderTransformers.casing(() -> AllSpriteShifts.ANDESITE_CASING))
+		.properties(p -> p.sound(SoundType.ANVIL))
+		.register();
+"#;
+        let c = chains_with(java, ".block(\"", &helpers);
+        // `casing` sets wood after the copper casing's own copper.
+        assert_eq!(c[0].1.sound.as_deref(), Some("wood"));
+        // A helper without a sound leaves the chain's.
+        assert_eq!(c[1].1.sound.as_deref(), Some("netherite_block"));
+        // The chain's own sound after the helper's wins.
+        assert_eq!(c[2].1.sound.as_deref(), Some("anvil"));
+        // Without the helpers, the chain's own sounds only.
+        assert_eq!(
+            chains(java, ".block(\"")[0].1.sound.as_deref(),
+            Some("copper")
+        );
+    }
+
+    #[test]
+    fn reads_a_constant_light_and_the_relocation_tag() {
+        let java = r#"
+	public static final BlockEntry<CasingBlock> A = REGISTRATE.block("refined_radiance_casing", CasingBlock::new)
+		.properties(p -> p.lightLevel($ -> 12))
+		.register();
+	public static final BlockEntry<ExperienceBlock> B = REGISTRATE.block("experience_block", ExperienceBlock::new)
+		.properties(p -> p.requiresCorrectToolForDrops()
+			.lightLevel(s -> 15))
+		.blockstate((c, p) -> p.simpleBlock(c.get()))
+		.register();
+	public static final BlockEntry<Block> C = REGISTRATE.block("rose_quartz_lamp", Block::new)
+		.properties(p -> p.lightLevel(s -> s.getValue(RoseQuartzLampBlock.POWERING) ? 15 : 0))
+		.register();
+	public static final BlockEntry<Block> D = REGISTRATE.block("lit_blaze_burner", Block::new)
+		.properties(p -> p.lightLevel(LitBlazeBurnerBlock::getLight))
+		.blockstate((c, p) -> p.simpleBlock(c.get()))
+		.register();
+	public static final BlockEntry<TrackBlock> E = REGISTRATE.block("track", TrackMaterial.ANDESITE::createBlock)
+		.tag(Tags.Blocks.RELOCATION_NOT_SUPPORTED)
+		.register();
+"#;
+        let c = chains(java, ".block(\"");
+        let light: Vec<Option<u8>> = c.iter().map(|(_, f)| f.light).collect();
+        assert_eq!(light, [Some(12), Some(15), None, None, None]);
+        let tagged: Vec<bool> = c.iter().map(|(_, f)| f.relocation_not_supported).collect();
+        assert_eq!(tagged, [false, false, false, false, true]);
     }
 }

@@ -4,7 +4,8 @@
     "hardness": 0.8,
     "explosion_resistance": 0.8,
     "requires_tool": true,
-    "sounds": "minecraft:iron_block"
+    "sounds": "minecraft:iron_block",
+    "push_reaction": "IMMOVEABLE"
   },
   "item": true,
   "shapes": {

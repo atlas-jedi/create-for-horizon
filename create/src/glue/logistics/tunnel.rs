@@ -345,8 +345,10 @@ fn shape_tunnel(lv: &mut ServerLevel<'_>, pos: [i32; 3], at_once: bool) {
 }
 
 /// Andesite tunnels: those whose surroundings changed break without a cased, flat belt below (`canSurvive`) or take the shape
-/// the belts and depots beside their segment give (`updateShape`, `getTunnelState`).
+/// the belts and depots beside their segment give (`updateShape`, `getTunnelState`). First,
+/// brass tunnels show their clients the stacks they distribute (`show_stacks`).
 pub fn tick_tunnels(lv: &mut ServerLevel<'_>) {
+    show_stacks(lv);
     let dim = lv.dim;
     let Some((new, kept, fresh, initialized)) = with_world(|w| {
         let d = &mut w.dims[dim];
@@ -511,6 +513,103 @@ pub fn show_tunnel_filters(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
         let data = mod_api::Compound::from([(SIDE_FILTERS.into(), mod_api::Tag::List(ids))]);
         let _ = e.merge_data(&mut *lv.host, data);
     }
+}
+
+/// The block entity key holding the stack a brass tunnel distributes, synced for its clients'
+/// goggles: `Item` (as a belt names it; empty: none) and `Count`.
+pub const DISTRIBUTING: &str = "Distributing";
+
+/// `BrassTunnelBlockEntity.sendData` of `stackToDistribute`: each brass tunnel of this level
+/// whose stack is not what its clients were last told writes it to `DISTRIBUTING`.
+fn show_stacks(lv: &mut ServerLevel<'_>) {
+    use mod_api::{Compound, Tag};
+    let dim = lv.dim;
+    let stale: Vec<([i32; 3], Option<(String, u8)>)> = with_world(|w| {
+        w.dims[dim]
+            .brass
+            .iter()
+            .filter(|(_, b)| b.shown.as_ref() != Some(&b.stack))
+            .map(|(p, b)| (*p, b.stack.clone()))
+            .collect()
+    })
+    .unwrap_or_default();
+    for (pos, stack) in stale {
+        let Some(e) = lv.host.block_entity(lv.level, pos) else {
+            continue;
+        };
+        let (item, count) = stack.clone().unwrap_or_default();
+        let shown = Compound::from([
+            ("Item".into(), Tag::String(item.as_str().into())),
+            ("Count".into(), Tag::Int(i32::from(count))),
+        ]);
+        let data = Compound::from([(DISTRIBUTING.into(), Tag::Compound(shown))]);
+        if e.merge_data(&mut *lv.host, data).is_ok() {
+            with_world(|w| {
+                if let Some(b) = w.dims[dim].brass.get_mut(&pos) {
+                    b.shown = Some(stack);
+                }
+            });
+        }
+    }
+}
+
+/// `BrassTunnelBlockEntity.addToGoggleTooltip` on a client: the stacks the brass tunnel at `pos`
+/// and the brass tunnels of its axis beside it hold (`grabAllStacksOfGroup(true)`: its own, then
+/// leftward, then rightward), as their block entities last showed them (`DISTRIBUTING`).
+pub(crate) fn goggle_lines(
+    host: &dyn mod_api::ClientHost,
+    pos: [i32; 3],
+    lines: &mut Vec<Vec<(String, u32)>>,
+) {
+    use mod_api::Tag;
+    let Some(level) = host.level(host.dimension()) else {
+        return;
+    };
+    let brass_axis = |p: [i32; 3]| {
+        let id = super::super::states::id(level.block_state(host, p)?)?;
+        super::super::client_table(host, |t| t.get(id).map(|(b, i)| (b, i.axis)))
+            .flatten()
+            .and_then(|(b, axis)| if b == Block::BrassTunnel { axis } else { None })
+    };
+    let Some(axis) = brass_axis(pos) else {
+        return;
+    };
+    let mut group = vec![pos];
+    for left in [true, false] {
+        let mut at = pos;
+        loop {
+            let next = tunnel::adjacent_pos(at, axis, left);
+            if brass_axis(next) != Some(axis) {
+                break;
+            }
+            group.push(next);
+            at = next;
+        }
+    }
+    let stacks: Vec<(String, u32)> = group
+        .into_iter()
+        .filter_map(|p| {
+            let data = host.block_entity(level, p)?.data(host)?;
+            let Some(Tag::Compound(c)) = data.get(&DISTRIBUTING.into()) else {
+                return None;
+            };
+            let (Some(Tag::String(item)), Some(Tag::Int(count))) =
+                (c.get(&"Item".into()), c.get(&"Count".into()))
+            else {
+                return None;
+            };
+            let item = item.to_string_lossy();
+            if item.is_empty() || *count <= 0 {
+                return None;
+            }
+            // `Component.translatable(item.getDescriptionId())`.
+            let name = super::items::stack_of(host, &item, 1)
+                .map_or_else(|| item.to_string(), |s| host.hover_name(&s));
+            Some((name, *count as u32))
+        })
+        .collect();
+    let tr = |key: &str| host.translate(key);
+    lines.extend(tunnel::goggle_lines(&stacks, &tr));
 }
 
 /// `selectionMode.withCallback`: the brass tunnel at `pos` and those connected with it take

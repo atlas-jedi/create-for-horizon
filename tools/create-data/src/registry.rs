@@ -155,6 +155,31 @@ fn gearbox_drops(doc: &mut Value) {
     }
 }
 
+/// `BeltBlock.getDrops`: a segment with a pulley (`BeltBlockEntity.hasPulley`: any part but
+/// `middle`) also drops what its shaft would (`SHAFT.getDefaultState().getDrops`, the shaft's
+/// own table: one shaft unless blown up), after the belt connector.
+fn belt_drops(doc: &mut Value) {
+    let shaft = serde_json::json!({
+        "bonus_rolls": 0.0,
+        "conditions": [
+            { "type": "minecraft:survives_explosion" },
+            {
+                "type": "minecraft:inverted",
+                "term": {
+                    "type": "minecraft:block_state_property",
+                    "block": "create:belt",
+                    "properties": { "part": "middle" }
+                }
+            }
+        ],
+        "entries": [{ "type": "minecraft:item", "name": "create:shaft" }],
+        "rolls": 1.0
+    });
+    if let Some(pools) = doc.get_mut("pools").and_then(Value::as_array_mut) {
+        pools.push(shaft);
+    }
+}
+
 /// The mod keeps the same toolbox data in vanilla custom data, not Create's Java-only
 /// component types. Copy the engine-saved slots and the port's saveAdditional fields.
 fn toolbox_drops(doc: &mut Value) {
@@ -494,7 +519,7 @@ const MANDATORY_NOTICES: &[(&str, &[u8])] = &[
 
 fn owned(path: &str) -> bool {
     (path.starts_with("data/create/")
-        && !path.starts_with("data/create/sunrise/")
+        && !path.starts_with("data/create/horizon/")
         && !compile_advancement(path))
         || path.starts_with("data/minecraft/tags/")
         || path.starts_with("data/c/tags/")
@@ -526,6 +551,8 @@ fn data_overlays(files: &BTreeMap<String, Vec<u8>>) -> Result<BTreeMap<String, V
             convert_loot(&mut doc);
             if path == "data/create/loot_table/blocks/gearbox.json" {
                 gearbox_drops(&mut doc);
+            } else if path == "data/create/loot_table/blocks/belt.json" {
+                belt_drops(&mut doc);
             } else if path.starts_with("data/create/loot_table/blocks/")
                 && path.ends_with("_toolbox.json")
             {
@@ -588,7 +615,7 @@ pub fn generate(
     let mut declarations = BTreeMap::new();
     crate::prepare::walk(
         mod_dir,
-        &mod_dir.join("data/create/sunrise"),
+        &mod_dir.join("data/create/horizon"),
         &mut declarations,
     )?;
     let models = crate::prepare::item_models(&declarations, |p| jar.index_for_name(p).is_some());
@@ -690,7 +717,7 @@ mod tests {
                 b"{}".to_vec(),
             ),
             (
-                "data/create/sunrise/block/shaft.json".into(),
+                "data/create/horizon/block/shaft.json".into(),
                 b"{}".to_vec(),
             ),
             ("data/create/tags/item/raw.json".into(), b"{}".to_vec()),
@@ -849,6 +876,22 @@ mod tests {
     }
 
     #[test]
+    fn belt_pulleys_drop_their_shaft() {
+        let mut t = json!({"type": "minecraft:block", "pools": [{
+            "conditions": [{"type": "minecraft:survives_explosion"}],
+            "entries": [{"type": "minecraft:item", "name": "create:belt_connector"}],
+            "rolls": 1.0}]});
+        belt_drops(&mut t);
+        let pools = t["pools"].as_array().unwrap();
+        assert_eq!(pools.len(), 2);
+        assert_eq!(pools[0]["entries"][0]["name"], "create:belt_connector");
+        assert_eq!(pools[1]["conditions"][0]["type"], "minecraft:survives_explosion");
+        assert_eq!(pools[1]["conditions"][1]["type"], "minecraft:inverted");
+        assert_eq!(pools[1]["conditions"][1]["term"]["properties"]["part"], "middle");
+        assert_eq!(pools[1]["entries"][0]["name"], "create:shaft");
+    }
+
+    #[test]
     fn keeps_only_the_fence() {
         assert!(kept("data/create/recipe/a.json"));
         assert!(kept("data/minecraft/tags/block/mineable/pickaxe.json"));
@@ -976,7 +1019,7 @@ mod c_tags_resolve {
                 .or_else(|| serde_json::from_slice(files.get(&rel)?).ok())?;
             doc["values"].as_array().cloned()
         };
-        let decl = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/data/create/sunrise");
+        let decl = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../create/data/create/horizon");
         let mut items = HashSet::new();
         for kind in ["item", "block"] {
             for e in fs::read_dir(decl.join(kind)).unwrap() {

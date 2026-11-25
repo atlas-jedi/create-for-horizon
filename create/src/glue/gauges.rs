@@ -113,7 +113,9 @@ impl Subsystem for Gauges {
             .and_then(|e| e.data(host))
             .and_then(|d| shown_of(&d))
             .unwrap_or_default();
-        lines.extend(create_engine::gauge::tooltip(kind, &shown));
+        // In the game's language (`CreateLang.translate`), en_us for a key the lang lacks.
+        let tr = |key: &str| host.translate(key);
+        lines.extend(create_engine::gauge::tooltip_in(kind, &shown, &tr));
     }
 }
 

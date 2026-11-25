@@ -32,6 +32,9 @@ pub fn tick_millstones(lv: &mut ServerLevel<'_>) {
             .iter()
             .flatten()
             .any(|(i, n)| *n >= stacks::limit(host, i));
+        // What its clients mill (their crumbs and noise, `ambient`).
+        let shown = input.clone().map(|i| (i, outputs_full));
+        super::ambient::show_input(lv, pos, super::ambient::MILL_KEY, shown);
         let seed = lv.seed_at(pos);
         let done = recipes::with(|r| {
             let done = processing::tick_millstone(

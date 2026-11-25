@@ -110,6 +110,10 @@ pub(super) fn goggle_overlay(host: &dyn ClientHost, draw: &mut dyn DrawContext) 
     let Some(player) = host.local_player() else {
         return;
     };
+    // `mc.gameMode.getPlayerMode() == GameType.SPECTATOR`: no overlay at all.
+    if player.is_spectator(host) == Some(true) {
+        return;
+    }
     let Some(pos) = aimed(host) else {
         HOVER.set(None);
         return;
@@ -146,18 +150,28 @@ pub(super) fn goggle_overlay(host: &dyn ClientHost, draw: &mut dyn DrawContext) 
         super::super::kinetics::shown_theory(host, l, pos)
     });
     // Create's tooltip: a header, then each stat indented by four spaces and its value by one
-    // more; a line may change colour along the way.
+    // more; a line may change colour along the way. Its texts are `CreateLang.translate`'s, in
+    // the game's language (en_us where the lang lacks a key).
+    let tr = |key: &str, english: &str| translated(host, &format!("create.{key}"), english);
     let mut lines: Vec<Vec<(String, u32)>> = Vec::new();
     let at_speed = |su: f32| {
         vec![
-            (format!("     {}su", number(su)), 0x55FFFF),
-            (" at current speed".to_owned(), 0x555555),
+            (
+                format!("     {}{}", number(su), tr("generic.unit.stress", "su")),
+                0x55FFFF,
+            ),
+            (
+                format!(" {}", tr("gui.goggles.at_current_speed", "at current speed")),
+                0x555555,
+            ),
         ]
     };
+    let header =
+        |key: &str, english: &str, color: u32| vec![(format!("    {}", tr(key, english)), color)];
     if goggles {
         if impact != 0.0 {
-            lines.push(vec![("    Kinetic Stats:".into(), 0xFFFFFF)]);
-            lines.push(vec![("    Kinetic Stress Impact:".into(), 0xAAAAAA)]);
+            lines.push(header("gui.goggles.kinetic_stats", "Kinetic Stats:", 0xFFFFFF));
+            lines.push(header("tooltip.stressImpact", "Kinetic Stress Impact:", 0xAAAAAA));
             lines.push(at_speed(impact * speed.abs()));
         }
         if capacity != 0.0 {
@@ -174,8 +188,8 @@ pub(super) fn goggle_overlay(host: &dyn ClientHost, draw: &mut dyn DrawContext) 
             } else {
                 capacity * generated.abs()
             };
-            lines.push(vec![("    Generator Stats:".into(), 0xFFFFFF)]);
-            lines.push(vec![("    Kinetic Stress Capacity:".into(), 0xAAAAAA)]);
+            lines.push(header("gui.goggles.generator_stats", "Generator Stats:", 0xFFFFFF));
+            lines.push(header("tooltip.capacityProvided", "Kinetic Stress Capacity:", 0xAAAAAA));
             lines.push(at_speed(total));
         }
         for s in super::super::SUBSYSTEMS {
@@ -188,11 +202,14 @@ pub(super) fn goggle_overlay(host: &dyn ClientHost, draw: &mut dyn DrawContext) 
         if !lines.is_empty() {
             lines.push(Vec::new());
         }
-        lines.push(vec![("    Overstressed".into(), 0xFFAA00)]);
+        lines.push(header("gui.stressometer.overstressed", "Overstressed", 0xFFAA00));
         lines.extend(cut_hint(
             draw,
-            "It appears that this contraption is _overstressed_. Add more sources or _slow_ \
-             _down_ the components with a high _stress_ _impact_.",
+            &tr(
+                "gui.contraptions.network_overstressed",
+                "It appears that this contraption is _overstressed_. Add more sources or _slow_ \
+                 _down_ the components with a high _stress_ _impact_.",
+            ),
         ));
     } else if let Some(required) = create_engine::gauge::minimum_speed(block) {
         // `notFastEnough`: turning (`getSpeed`), but slower than its speed level asks.
@@ -203,13 +220,19 @@ pub(super) fn goggle_overlay(host: &dyn ClientHost, draw: &mut dyn DrawContext) 
             if !lines.is_empty() {
                 lines.push(Vec::new());
             }
-            lines.push(vec![("    Speed Requirement:".into(), 0xFFAA00)]);
+            lines.push(header("tooltip.speedRequirement", "Speed Requirement:", 0xFFAA00));
+            // The block's name goes in as plain text (`I18n.get(getDescriptionId())`): only the
+            // hint's own underscored words are highlighted.
             let name = host
                 .translate(&format!("block.create.{}", block.name()))
                 .unwrap_or_else(|| block.name().to_owned());
+            let hint = tr(
+                "gui.contraptions.not_fast_enough",
+                "It appears that this %1$s is _not_ rotating with _enough_ _speed_.",
+            );
             lines.extend(cut_hint(
                 draw,
-                &format!("It appears that this _{name}_ is _not_ rotating with _enough_ _speed_."),
+                &hint.replacen("%1$s", &name, 1).replacen("%s", &name, 1),
             ));
         }
     }
@@ -228,6 +251,29 @@ pub(super) fn goggle_overlay(host: &dyn ClientHost, draw: &mut dyn DrawContext) 
                 "create.hint.empty_bearing",
                 "_Right-click_ the bearing with an _empty_ _hand_ to _attach_ the structure you \
                  just built in front of it.",
+            ),
+        ));
+    }
+    // `ArmBlockEntity.addToTooltip`: an arm with no targets says how to choose them (not while
+    // the player sneaks; the overstressed warning comes instead).
+    if !overstressed
+        && block == create_engine::Block::MechanicalArm
+        && crate::glue::logistics::client::arm_without_targets(pos)
+        && !host.local_player().is_some_and(|p| items::sneaking(host, p))
+    {
+        if !lines.is_empty() {
+            lines.push(Vec::new());
+        }
+        let title = translated(host, "create.hint.mechanical_arm_no_targets.title", "No Targets");
+        lines.push(vec![(format!("    {title}"), 0xFFAA00)]);
+        lines.extend(cut_hint(
+            draw,
+            &translated(
+                host,
+                "create.hint.mechanical_arm_no_targets",
+                "It appears this _Mechanical_ _Arm_ has not been assigned any _targets._ Select \
+                 belts, depots, funnels and other blocks by _right-clicking_ them while _holding_ \
+                 the _Mechanical_ _Arm_ in your _hand_.",
             ),
         ));
     }

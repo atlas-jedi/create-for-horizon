@@ -281,6 +281,11 @@ const IDLE_CHANCE: f64 = 1.0 / 1000.0;
 /// `PipeConnection.RIM_RADIUS`.
 const RIM_RADIUS: f64 = 1.0 / 4.0 + 1.0 / 64.0;
 
+/// `FluidFX.getFluidParticle` for the other fluid blocks (a spout's drips and splash).
+pub(super) fn fluid_particle_of(fluid: Fluid) -> Option<ParticleOptions> {
+    fluid_particle(KEYS.get()?, fluid)
+}
+
 /// `FluidFX.getFluidParticle`: `FluidStackParticle`, a crumb of the fluid's still sprite in
 /// 0.8 times its tint (`multiplyColor`).
 fn fluid_particle(keys: &Keys, fluid: Fluid) -> Option<ParticleOptions> {

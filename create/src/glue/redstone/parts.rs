@@ -57,8 +57,9 @@ pub(crate) fn dim_of(dimension: &str) -> Option<usize> {
 }
 
 /// Vanilla's containers (with the shulker boxes and copper chests of their tags): smart observers
-/// and threshold switches looking at one look again as soon as its contents change, as Create's
-/// do each tick (`VersionedInventoryTrackerBehaviour`), not only every lazy interval.
+/// looking at one look again as soon as its contents change, as Create's do each tick
+/// (`VersionedInventoryTrackerBehaviour`), not only every lazy interval. Threshold switches
+/// read theirs on their `lazyTick` alone (`observe::Detectors::contents_changed`).
 const VANILLA_CONTAINERS: [&str; 12] = [
     "minecraft:chest",
     "minecraft:trapped_chest",

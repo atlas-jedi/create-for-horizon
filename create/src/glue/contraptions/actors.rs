@@ -124,6 +124,7 @@ fn derived_key(k: &str) -> bool {
 /// The world closed: what moving contraptions carried goes with it.
 pub(super) fn forget() {
     STORAGE.with_borrow_mut(HashMap::clear);
+    STICKER_SOUNDS.with_borrow_mut(Vec::clear);
     NEXT_BREAKER.set(0);
     ROLLERS_PLACED.with_borrow_mut(Vec::clear);
     HELD.with_borrow_mut(HashMap::clear);
@@ -137,6 +138,72 @@ pub(super) fn register(r: &mut dyn Registrar) {
     r.block_part(roller, MountedPart);
     let roller_item = r.item_key("create:mechanical_roller");
     r.item_part(roller_item, RollerPlacement);
+    r.block_part(key(Block::Sticker), StickerPart);
+    let _ = ITEM_PARTICLE.set(r.particle_key("minecraft:item"));
+}
+
+/// `ParticleTypes.ITEM`, for a sticker's slime as it takes hold.
+static ITEM_PARTICLE: std::sync::OnceLock<mod_api::ParticleKey> = std::sync::OnceLock::new();
+
+/// The sticker states facing up (`isUprightSticker`), read once the block states are known (on
+/// both sides): the speed factor is asked with no host.
+static UPRIGHT_STICKERS: std::sync::RwLock<Option<std::collections::HashSet<mod_api::BlockState>>> =
+    std::sync::RwLock::new(None);
+
+/// Reads the upright sticker states, once.
+pub(super) fn note_upright_stickers(host: &dyn mod_api::Host) {
+    if UPRIGHT_STICKERS.read().is_ok_and(|u| u.is_some()) {
+        return;
+    }
+    let facts = mod_api::HostBlockStates::block_states(host);
+    let Some(range) = facts.states_of(key(Block::Sticker)) else {
+        return;
+    };
+    let upright: std::collections::HashSet<mod_api::BlockState> = range
+        .iter()
+        .filter(|s| s.property(&facts, "facing").ok().flatten() == Some("up"))
+        .collect();
+    if let Ok(mut u) = UPRIGHT_STICKERS.write() {
+        *u = Some(upright);
+    }
+}
+
+fn upright_sticker(state: mod_api::BlockState) -> bool {
+    UPRIGHT_STICKERS
+        .read()
+        .is_ok_and(|u| u.as_ref().is_some_and(|u| u.contains(&state)))
+}
+
+/// A sticker facing up is slime on top (`StickerBlock`'s slime block methods).
+struct StickerPart;
+
+#[mod_api::horizon_part]
+impl mod_api::BlockPart for StickerPart {
+    /// `updateEntityAfterFallOn`: an upright sticker bounces what falls on it as slime does
+    /// (`bounceUp`: its speed turned up, 0.8 of it for one not living, which the game applies
+    /// to the factor), unless it suppresses bounces. Its fall still hurts (`fallOn` deals the
+    /// damage in full), as the block's own landing does.
+    fn bounce_restitution(
+        &self,
+        _level: mod_api::LevelSide<'_>,
+        event: &mut mod_api::BounceRestitutionEvent<'_>,
+    ) {
+        if upright_sticker(event.state) {
+            event.factor = event.factor.max(1.0);
+        }
+    }
+
+    /// `stepOn`: walking on an upright sticker slows as on slime (`0.4 + |dy| × 0.2` of the
+    /// speed each tick, `|dy|` below 0.1), here as the block's speed factor of 0.4.
+    fn block_speed_factor(
+        &self,
+        _context: &dyn mod_api::LoopContext,
+        event: &mut mod_api::BlockSpeedFactorEvent,
+    ) {
+        if upright_sticker(event.state) {
+            event.factor = 0.4;
+        }
+    }
 }
 
 fn next_breaker() -> i32 {
@@ -185,6 +252,12 @@ pub(crate) fn lend_storage(
     storage: Vec<([i32; 3], Vec<Option<ItemStack>>)>,
 ) {
     STORAGE.with_borrow_mut(|m| m.insert((dim, key), storage));
+}
+
+/// What the other block entities of contraption `key` held is forgotten (a cart's, lent from
+/// what the cart keeps while its actors tick).
+pub(crate) fn forget_held(dim: usize, key: [i32; 3]) {
+    HELD.with_borrow_mut(|m| m.remove(&(dim, key)));
 }
 
 /// The storage lent under `key`, as the actors left it.
@@ -382,6 +455,16 @@ pub(super) fn sticky_sides(lv: &ServerLevel<'_>, p: [i32; 3]) -> u8 {
         | "create:windmill_bearing"
         | "create:clockwork_bearing" => facing(),
         "create:cart_assembler" => Dir::Up.bit(),
+        // `RadialChassisBlock.getGlueableSide`: its sides across its axis, where glued.
+        "create:radial_chassis" => {
+            let axis = super::axis_of(prop(&props, "axis"));
+            Dir::ALL.into_iter().fold(0, |acc, d| {
+                match create_engine::contraption::radial_side(axis, d) {
+                    Some(k) if flag(&props, k) => acc | d.bit(),
+                    _ => acc,
+                }
+            })
+        }
         "create:linear_chassis" | "create:secondary_linear_chassis" => {
             let (top, bottom) = match prop(&props, "axis").unwrap_or("y") {
                 "x" => (Dir::East, Dir::West),
@@ -406,7 +489,7 @@ pub(super) fn sticky_sides(lv: &ServerLevel<'_>, p: [i32; 3]) -> u8 {
 /// picked two corners with the glue item (its charges and reach aside).
 fn debug_glue(lv: &mut ServerLevel<'_>, from: [i32; 3], to: [i32; 3]) -> String {
     let dim = lv.dim;
-    let placed = glue::place(from, to, |p| found(lv, p).map(|_| sticky_sides(lv, p)));
+    let placed = glue::place(from, to, |p| found(lv, p), |p| sticky_sides(lv, p));
     match placed {
         Ok(g) => {
             with_world(|w| w.dims[dim].glue.push(g));
@@ -637,10 +720,88 @@ pub(super) fn glue_chunk_unload(dim: usize, chunk: [i32; 2]) {
 // ---------------------------------------------------------------------------------------------
 // Stickers
 
+thread_local! {
+    /// Stickers' sounds due (`StickerBlockEntity.tick` on clients): dimension, position, game
+    /// time, and whether it took hold (else let go).
+    static STICKER_SOUNDS: RefCell<Vec<(usize, [i32; 3], i64, bool)>> =
+        const { RefCell::new(Vec::new()) };
+}
+
+/// `StickerBlockEntity.isAttachedToBlock`: what the sticker at `pos` faces can hold glue on
+/// the face toward it (`SuperGlueEntity.isValidFace`).
+fn sticker_attached(lv: &ServerLevel<'_>, pos: [i32; 3], facing: Dir) -> bool {
+    glue::valid_face(found(lv, add(pos, facing.offset())).as_ref(), facing.opposite())
+}
+
+/// `SuperGlueItem.spawnParticles(level, pos, facing, true)`: forty bits of slime ball over the
+/// face of `pos` toward `facing`, flying out from its middle.
+fn sticker_slime(lv: &mut ServerLevel<'_>, pos: [i32; 3], facing: Dir) {
+    let (Some(&key), Some(ball)) = (
+        ITEM_PARTICLE.get(),
+        mod_api::Identifier::parse("minecraft:slime_ball")
+            .ok()
+            .and_then(|i| lv.host.item_key(&i)),
+    ) else {
+        return;
+    };
+    let options = mod_api::ParticleOptions::item_stack(key, mod_api::ItemStack::of(ball));
+    let n = facing.offset().map(f64::from);
+    let face = [0, 1, 2].map(|i| f64::from(pos[i]) + 0.5 + n[i] * 0.5);
+    let axis = [0, 1, 2]
+        .into_iter()
+        .find(|&i| n[i] != 0.0)
+        .unwrap_or(1);
+    let (a, b) = ((axis + 1) % 3, (axis + 2) % 3);
+    for _ in 0..40 {
+        // `VecHelper.rotate(plane, 360 × random, axis)` of the face's plane (1, 1).
+        let t = f64::from(lv.random_float()) * std::f64::consts::TAU;
+        let mut offset = [0.0; 3];
+        offset[a] = t.cos() - t.sin();
+        offset[b] = t.sin() + t.cos();
+        let len = (offset[a] * offset[a] + offset[b] * offset[b]).sqrt().max(1e-9);
+        let motion = offset.map(|v| v / len / 16.0);
+        let at = [0, 1, 2].map(|i| face[i] + offset[i].clamp(-0.5, 0.5));
+        let _ = lv
+            .level
+            .send_particles(&mut *lv.host, &options, None, at, motion, 1.0, 0);
+    }
+}
+
 /// Stickers whose neighbour changed (`StickerBlock.neighborChanged`): `powered` follows the
-/// signal and each rise flips `extended`. Nothing runs without a change.
+/// signal and each rise flips `extended`. As Create's client draws it, a sticker taking hold of
+/// a block sounds `SLIME_ADDED` (0.35, pitch 0.75) with slime on its face once its head is out
+/// (three ticks of its chase after the update), and one letting go at pitch 0.2 at once.
+/// Nothing runs without a change.
 pub(super) fn tick_stickers(lv: &mut ServerLevel<'_>) {
     let dim = lv.dim;
+    let now = lv.game_time();
+    let due: Vec<([i32; 3], bool)> = STICKER_SOUNDS.with_borrow_mut(|s| {
+        let due = s
+            .iter()
+            .filter(|e| e.0 == dim && e.2 <= now)
+            .map(|e| (e.1, e.3))
+            .collect();
+        s.retain(|e| e.0 != dim || e.2 > now);
+        due
+    });
+    for (pos, attach) in due {
+        let Some((name, props)) = lv.name_props(pos) else {
+            continue;
+        };
+        let facing = prop(&props, "facing").and_then(dir_of);
+        let (true, Some(facing)) = (name == "create:sticker", facing) else {
+            continue;
+        };
+        // Its head turned back before it got out: no hold.
+        if attach != flag(&props, "extended") || !sticker_attached(lv, pos, facing) {
+            continue;
+        }
+        if attach {
+            sticker_slime(lv, pos, facing);
+        }
+        let pitch = if attach { 0.75 } else { 0.2 };
+        super::play_entry(lv, super::SLIME_ADDED, pos, 0.35, pitch);
+    }
     let mut checks =
         with_world(|w| std::mem::take(&mut w.dims[dim].sticker_checks)).unwrap_or_default();
     if checks.is_empty() {
@@ -663,6 +824,9 @@ pub(super) fn tick_stickers(lv: &mut ServerLevel<'_>) {
         let text = |v: bool| if v { "true" } else { "false" };
         if e != extended {
             lv.set_property(pos, "extended", text(e), UPDATE_CLIENTS);
+            // The client hears the change next tick; its head is out three ticks later.
+            let at = now + if e { 4 } else { 1 };
+            STICKER_SOUNDS.with_borrow_mut(|s| s.push((dim, pos, at, e)));
         }
         lv.set_property(pos, "powered", text(p), UPDATE_CLIENTS);
     }
@@ -1333,6 +1497,62 @@ pub(crate) fn storage_stacks(dim: usize, key: [i32; 3]) -> Vec<ItemStack> {
     })
 }
 
+/// `MountedStorageManager.getFuelItems` for `Train.burnFuel`: the burn time of the first fuel
+/// item in contraption `key`'s storage blocks but vaults (`create:fuel_blacklist`). With `take`,
+/// one of it is taken out and its container item (a lava bucket's bucket) put back
+/// (`ItemHandlerHelper.insertItemStacked`: onto the same items first, then into an empty slot;
+/// lost without room).
+pub(crate) fn burn_fuel(lv: &ServerLevel<'_>, key: [i32; 3], take: bool) -> Option<i32> {
+    let dim = lv.dim;
+    let host = &*lv.host;
+    let fuel = |s: &Stored| s.len() != create_engine::vault::SLOTS;
+    STORAGE.with_borrow_mut(|m| {
+        let list = m.get_mut(&(dim, key))?;
+        let (si, i, burn) = list.iter().enumerate().find_map(|(si, (_, s))| {
+            if !fuel(s) {
+                return None;
+            }
+            s.iter().enumerate().find_map(|(i, slot)| {
+                let burn = host.item_burn_time(slot.as_ref()?.item())?;
+                (burn > 0).then_some((si, i, burn))
+            })
+        })?;
+        if !take {
+            return Some(burn);
+        }
+        let slot = &mut list[si].1[i];
+        let stack = slot.take()?;
+        let remainder = host.item_crafting_remainder(&stack);
+        *slot = stack.shrink(1);
+        let Some(remainder) = remainder else {
+            return Some(burn);
+        };
+        let limit = host.max_stack_size(remainder.item()).unwrap_or(64).min(64);
+        let mut left = remainder.count();
+        let into = |s: &&mut ([i32; 3], Stored)| fuel(&s.1) && takes_any(&s.1);
+        for (_, s) in list.iter_mut().filter(into) {
+            for slot in s.iter_mut().flatten() {
+                if left > 0 && same_stack(slot, &remainder) {
+                    let put = left.min(limit.saturating_sub(slot.count()));
+                    let _ = slot.set_count(slot.count() + put);
+                    left -= put;
+                }
+            }
+        }
+        for (_, s) in list.iter_mut().filter(into) {
+            for slot in s.iter_mut().filter(|s| s.is_none()) {
+                if left > 0 {
+                    let mut r = remainder.clone();
+                    let _ = r.set_count(left.min(limit));
+                    left -= left.min(limit);
+                    *slot = Some(r);
+                }
+            }
+        }
+        Some(burn)
+    })
+}
+
 /// What contraptions no longer kept (`keep(key)` false) carried is forgotten.
 pub(crate) fn retain_storage(dim: usize, keep: impl Fn([i32; 3]) -> bool) {
     STORAGE.with_borrow_mut(|m| m.retain(|(d, k), _| *d != dim || keep(*k)));
@@ -1942,7 +2162,7 @@ pub(crate) fn structure_actors(
 /// Create block's, or a lit campfire's (`AllMovementBehaviours`).
 fn actor_of(host: &dyn Host, o: [i32; 3], state: mod_api::BlockState) -> Option<Actor> {
     if let Some((block, info)) = states::id(state).and_then(create_info) {
-        let (kind, facing) = (Kind::of(block)?, info.facing?);
+        let (kind, facing) = (Kind::of_state(block, &info)?, info.facing?);
         return Some(Actor::new(o, kind, facing, -next_breaker()));
     }
     let text = host.block_state_string(state)?;
@@ -2184,8 +2404,201 @@ fn apply(lv: &mut ServerLevel<'_>, key: [i32; 3], a: &Actor, e: Effect) -> Optio
         Effect::Redeploy => return Some(deploy(lv, key, a, None)),
         Effect::Entities { pos, damage, boost } => hit_entities(lv, a, pos, damage, boost),
         Effect::Smoke { at, signal } => campfire_smoke(lv, at, signal),
+        Effect::Funnel(p) => funnel_moved(lv, key, a, p),
     }
     None
+}
+
+/// `FunnelMovementBehaviour.visitNewPosition` at block `pos`: an extracting funnel's `extract`
+/// (into an empty-collision block with no item lying where it drops, one pick of what its filter
+/// passes out of the contraption's storage, dropped still with a pickup delay of 5 and a quiet
+/// pickup sound), another's `succ` (each item lying in the block its filter passes goes into the
+/// storage as far as it fits). A brass funnel's filter and amount are what it carried
+/// (`Filter`, `FilterAmount`); an andesite funnel passes anything, exactly one at a time.
+fn funnel_moved(lv: &mut ServerLevel<'_>, key: [i32; 3], a: &Actor, pos: [i32; 3]) {
+    let Kind::Funnel {
+        brass, extracting, ..
+    } = a.kind
+    else {
+        return;
+    };
+    let dim = lv.dim;
+    let carried = HELD.with_borrow(|m| {
+        m.get(&(dim, key))?
+            .iter()
+            .find(|(o, _)| *o == a.local)
+            .and_then(|(_, d)| d.engine.clone())
+    });
+    let filter = carried
+        .as_ref()
+        .and_then(|c| c.get(&crate::glue::logistics::carried::FILTER.into()))
+        .and_then(|t| filters::filter_from_nbt(&*lv.host, t));
+    if !extracting {
+        let lo = pos.map(f64::from);
+        let hi = pos.map(|v| f64::from(v) + 1.0);
+        for d in lv.items_in(lo, hi) {
+            if !filters::passes(&*lv.host, filter.as_ref(), &d.stack) {
+                continue;
+            }
+            let left = insert_stacked(lv, key, d.stack.clone());
+            match left {
+                Some(l) if l.count() == d.stack.count() => {}
+                left => lv.set_dropped(&d, left, d.velocity),
+            }
+        }
+        return;
+    }
+    let Some(mut at) = a.position else {
+        return;
+    };
+    if a.facing != Dir::Down {
+        at[1] -= 0.5;
+    }
+    let solid = lv.block_state(pos).is_some_and(|state| {
+        lv.level
+            .block_shape(&*lv.host, state, pos, BlockShapeKind::Collision)
+            .is_some_and(|s| !s.is_empty())
+    });
+    if solid {
+        return;
+    }
+    let cell = at.map(f64::floor);
+    if !lv.items_in(cell, cell.map(|v| v + 1.0)).is_empty() {
+        return;
+    }
+    // `FilterAmount` and `UpTo` (a brass funnel's default: up to a stack); an andesite funnel's
+    // `hasFilter` is false: exactly one.
+    let (amount, up_to) = if brass {
+        match carried.as_ref().and_then(|c| c.get(&"FilterAmount".into())) {
+            Some(Tag::IntArray(v)) if v.len() == 2 => (v[0].clamp(0, 255) as u32, v[1] != 0),
+            _ => (0, true),
+        }
+    } else {
+        (1, false)
+    };
+    let amount = if amount == 0 { 64 } else { amount };
+    let taken = {
+        let host = &*lv.host;
+        extract_from(
+            lv,
+            key,
+            |s| filters::passes(host, filter.as_ref(), s),
+            amount,
+            !up_to,
+        )
+    };
+    let Some(stack) = taken else {
+        return;
+    };
+    lv.drop_stack(at, [0.0; 3], stack, 5);
+    lv.level.play_sound(
+        &mut *lv.host,
+        "minecraft:entity.item.pickup",
+        center(pos),
+        SoundSource::Blocks,
+        1.0 / 16.0,
+        0.1,
+    );
+}
+
+/// `ItemHandlerHelper.insertItemStacked` into contraption `key`'s storage: onto the same items
+/// first, then into empty slots, storage block by storage block (a toolbox takes none). What is
+/// left, None when it all went in.
+fn insert_stacked(lv: &ServerLevel<'_>, key: [i32; 3], stack: ItemStack) -> Option<ItemStack> {
+    let limit = slot_limit(lv, &stack);
+    let dim = lv.dim;
+    STORAGE.with_borrow_mut(|m| {
+        let Some(list) = m.get_mut(&(dim, key)) else {
+            return Some(stack);
+        };
+        let mut left = stack.count();
+        for empty in [false, true] {
+            for (_, s) in list.iter_mut().filter(|(_, s)| takes_any(s)) {
+                for slot in s.iter_mut() {
+                    if left == 0 {
+                        return None;
+                    }
+                    match slot {
+                        Some(s) if !empty && same_stack(s, &stack) => {
+                            let put = left.min(limit.saturating_sub(s.count()));
+                            let _ = s.set_count(s.count() + put);
+                            left -= put;
+                        }
+                        None if empty => {
+                            let put = left.min(limit);
+                            let mut s = stack.clone();
+                            let _ = s.set_count(put);
+                            *slot = Some(s);
+                            left -= put;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        (left > 0).then(|| {
+            let mut s = stack;
+            let _ = s.set_count(left);
+            s
+        })
+    })
+}
+
+/// `ItemHelper.extract` from contraption `key`'s storage (`getAllItems`): of the first item
+/// `test` passes, `amount` gathered from the slots in order (no more than a stack of it); with
+/// `exact` (`ExtractionCountMode.EXACTLY`) only an item there is that much of, the next one tried
+/// when there is too little, else (`UPTO`) as much as there is. None for nothing taken.
+fn extract_from(
+    lv: &ServerLevel<'_>,
+    key: [i32; 3],
+    test: impl Fn(&ItemStack) -> bool,
+    amount: u32,
+    exact: bool,
+) -> Option<ItemStack> {
+    let dim = lv.dim;
+    STORAGE.with_borrow_mut(|m| {
+        let list = m.get_mut(&(dim, key))?;
+        let mut tried: Vec<ItemStack> = Vec::new();
+        let mut kind = None;
+        for stack in list.iter().flat_map(|(_, s)| s.iter().flatten()) {
+            if !test(stack) || tried.iter().any(|t| same_stack(t, stack)) {
+                continue;
+            }
+            let want = amount.min(slot_limit(lv, stack).max(1));
+            let total: u32 = list
+                .iter()
+                .flat_map(|(_, s)| s.iter().flatten())
+                .filter(|s| same_stack(s, stack))
+                .map(ItemStack::count)
+                .sum();
+            if !exact || total >= want {
+                kind = Some((stack.clone(), want));
+                break;
+            }
+            tried.push(stack.clone());
+        }
+        let (kind, want) = kind?;
+        let mut taken = 0;
+        for (_, s) in list.iter_mut() {
+            for slot in s.iter_mut() {
+                if taken == want {
+                    break;
+                }
+                let Some(stack) = slot.as_ref() else {
+                    continue;
+                };
+                if !same_stack(stack, &kind) {
+                    continue;
+                }
+                let n = (want - taken).min(stack.count());
+                taken += n;
+                *slot = slot.take().and_then(|s| s.shrink(n));
+            }
+        }
+        let mut out = kind;
+        let _ = out.set_count(taken);
+        (taken > 0).then_some(out)
+    })
 }
 
 /// `CampfireMovementBehaviour.tick` (`CampfireBlock.makeParticles`' smoke): two or three puffs,
@@ -2961,45 +3374,10 @@ pub fn psi_insert(
     let Some(key) = psi_connected(lv, pos) else {
         return Err(stack);
     };
-    let limit = slot_limit(lv, &stack);
     let before = stack.count();
     let dim = lv.dim;
-    let left = STORAGE.with_borrow_mut(|m| {
-        let Some(list) = m.get_mut(&(dim, key)) else {
-            return Some(stack);
-        };
-        let mut left = stack.count();
-        // Same items first, then empty slots, storage block by storage block.
-        for empty in [false, true] {
-            for (_, s) in list.iter_mut().filter(|(_, s)| takes_any(s)) {
-                for slot in s.iter_mut() {
-                    if left == 0 {
-                        return None;
-                    }
-                    match slot {
-                        Some(s) if !empty && same_stack(s, &stack) => {
-                            let put = left.min(limit.saturating_sub(s.count()));
-                            let _ = s.set_count(s.count() + put);
-                            left -= put;
-                        }
-                        None if empty => {
-                            let put = left.min(limit);
-                            let mut s = stack.clone();
-                            let _ = s.set_count(put);
-                            *slot = Some(s);
-                            left -= put;
-                        }
-                        _ => {}
-                    }
-                }
-            }
-        }
-        (left > 0).then(|| {
-            let mut s = stack;
-            let _ = s.set_count(left);
-            s
-        })
-    });
+    // Same items first, then empty slots, storage block by storage block.
+    let left = insert_stacked(lv, key, stack);
     if left.as_ref().map_or(0, ItemStack::count) != before {
         psi_transferred(dim, pos);
         crate::glue::trains::cargo_moved(dim, key);
@@ -3418,11 +3796,11 @@ fn controls_status(
     if let Some(p) = player {
         let _ = p.action_bar(&mut *lv.host, line);
     }
-    lv.level.play_sound(
-        &mut *lv.host,
-        "create:controller_click",
-        center(at),
-        SoundSource::Blocks,
+    // `CONTROLLER_CLICK.play(level, null, pos, 1, disabled ? .8f : 1.5f)`.
+    super::play_entry(
+        lv,
+        super::CONTROLLER_CLICK,
+        at,
         1.0,
         if on { 1.5 } else { 0.8 },
     );
@@ -3512,7 +3890,9 @@ enum Holder {
     Gantry,
     Bearing,
     Lift,
-    Cart(mod_api::EntityRef),
+    /// A cart's rider, and which stabilized contraption riding the cart's (none: the cart's).
+    Cart(mod_api::EntityRef, Option<usize>),
+    Carriage,
 }
 
 /// Where a block of a moving contraption is in the world now, by its offset.
@@ -3541,8 +3921,11 @@ fn take_carried(lv: &mut ServerLevel<'_>, key: [i32; 3]) -> Option<(Holder, Carr
     if let Some((carried, place)) = super::lifts::take_lift(lv, key) {
         return Some((Holder::Lift, carried, place));
     }
-    let (rider, carried, place) = crate::glue::trains::take_cart_carried(lv, key)?;
-    Some((Holder::Cart(rider), carried, place))
+    if let Some((carried, place)) = crate::glue::trains::take_carriage_carried(lv, key) {
+        return Some((Holder::Carriage, carried, place));
+    }
+    let (rider, sub, carried, place) = crate::glue::trains::take_cart_carried(lv, key)?;
+    Some((Holder::Cart(rider, sub), carried, place))
 }
 
 /// What [`take_carried`] took goes back.
@@ -3567,7 +3950,10 @@ fn put_carried(lv: &mut ServerLevel<'_>, key: [i32; 3], holder: Holder, carried:
         }
         Holder::Bearing => super::bearings::put_turning(lv, key, carried),
         Holder::Lift => super::lifts::put_lift(lv, key, carried),
-        Holder::Cart(rider) => crate::glue::trains::put_cart_carried(lv, rider, carried),
+        Holder::Cart(rider, sub) => {
+            crate::glue::trains::put_cart_carried(lv, rider, sub, carried);
+        }
+        Holder::Carriage => crate::glue::trains::put_carriage_carried(lv, key, carried),
     }
 }
 
@@ -3602,11 +3988,28 @@ fn toggle_controls(
         }
     };
     let mut effects = Vec::new();
-    let kinds: Vec<&str> = carried.actors.iter().map(|a| a.kind.item()).collect();
+    let mut kinds: Vec<String> = carried
+        .actors
+        .iter()
+        .map(|a| a.kind.item().to_owned())
+        .collect();
+    // A carriage's sliding doors are actors its controls turn off too.
+    let carriage = matches!(holder, Holder::Carriage);
+    if carriage {
+        for d in crate::glue::trains::door_kinds(lv, key) {
+            if !kinds.contains(&d) {
+                kinds.push(d);
+            }
+        }
+    }
+    let kinds: Vec<&str> = kinds.iter().map(String::as_str).collect();
     let disable = actors::toggle(&mut carried.disabled, &filter, &kinds);
     actors::set_active(&mut carried.actors, &filter, !disable, &mut effects);
     let breaker = carried.actors.first().map_or(0, |a| a.breaker_id);
     put_carried(lv, key, holder, carried);
+    if carriage {
+        crate::glue::trains::doors_controlled(lv, key, &filter, !disable);
+    }
     // The actors turned off stop (`cancelStall`): cracks go, contacts look again.
     for e in effects {
         match e {

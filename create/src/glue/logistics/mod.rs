@@ -67,7 +67,7 @@ pub use arms::Arms;
 // What the processing machines hand their results to beside them: a belt or depot taking a stack
 // from a side, and the two facts every stack placed on one needs.
 pub(crate) use belt::{
-    belt_segment, belt_stack, direct_input_accepts, direct_input_at, insert_into_from,
+    belt_name, belt_segment, belt_stack, direct_input_accepts, direct_input_at, insert_into_from,
     put_on_from_above, set_casing,
 };
 pub(crate) use funnel::{export_up, funnel_at, funnel_passes};
@@ -133,6 +133,22 @@ impl Subsystem for Logistics {
         event: &mut crate::glue::Submit<'_>,
     ) {
         client::draw_carried(host, block, event);
+    }
+
+    /// `BrassTunnelBlockEntity.addToGoggleTooltip`: what a brass tunnel's group distributes;
+    /// `ChuteBlockEntity.addToGoggleTooltip`: a chute's fans, way and stack.
+    fn goggle_tooltip(
+        &self,
+        host: &dyn ClientHost,
+        pos: [i32; 3],
+        block: Block,
+        lines: &mut Vec<Vec<(String, u32)>>,
+    ) {
+        match block {
+            Block::BrassTunnel => tunnel::goggle_lines(host, pos, lines),
+            Block::Chute | Block::SmartChute => chute::chute_tooltip(host, pos, lines),
+            _ => {}
+        }
     }
 
     fn carry_out(
@@ -579,6 +595,10 @@ impl Subsystem for Entities {
             chute::CHUTE_ITEM,
             chute::CHUTE_POSITION,
             chute::CHUTE_MOTION,
+            chute::CHUTE_CONTENTS,
+            chute::CHUTE_COUNT,
+            chute::CHUTE_PULL,
+            chute::CHUTE_PUSH,
         ]
     }
 
@@ -697,9 +717,12 @@ fn use_block(
             chute::use_smart_chute(&mut lv, pos, click) || chute::use_chute(&mut lv, pos, click)
         }
         Block::Chute => chute::use_chute(&mut lv, pos, click),
+        // The filter slot's click first (`ValueSettingsInputHandler`), then `FunnelBlock.useItemOn`.
         Block::BrassFunnel | Block::BrassBeltFunnel => {
             funnel::use_funnel_filter(&mut lv, pos, click)
+                || funnel::use_funnel_insert(&mut lv, pos, click)
         }
+        Block::AndesiteFunnel => funnel::use_funnel_insert(&mut lv, pos, click),
         // `BrassTunnelBlock` has no `useItemOn`, so a held item reaches `useWithoutItem`.
         Block::BrassTunnel => {
             tunnel::use_tunnel_filter(&mut lv, pos, click)
@@ -711,14 +734,15 @@ fn use_block(
                 .stack
                 .map(|s| items::key_of(&*lv.host, s))
                 .filter(|k| create_engine::tank::split_potion_item(k).is_some());
-            belt::use_belt_with(
+            // `BeltBlock.useItemOn`'s own answer: its `FAIL` goes on to the item's use too.
+            return belt::use_belt_with(
                 &mut lv,
                 pos,
                 click.player,
                 click.hand,
                 potion.or(held).as_deref(),
                 (Dir::ALL[face as usize], click.hit.point),
-            )
+            );
         }
         _ => false,
     };
@@ -728,6 +752,22 @@ fn use_block(
 #[mod_api::horizon_part]
 impl BlockPart for LogisticsBlock {
     // Horizon: stepping on a block is the global `Hooks::block_step_on` (server), in lib.rs.
+
+    /// `AbstractChuteBlock` keeps `Block.hasAnalogOutputSignal`'s false: comparators read
+    /// nothing from a chute or smart chute, where their `minecraft:barrel` template would read
+    /// the stack in their slot.
+    fn has_analog_output(
+        &self,
+        _level: &dyn mod_api::LevelHost,
+        event: &mut mod_api::HasAnalogOutputEvent,
+    ) {
+        let chute = states::id(event.state)
+            .and_then(crate::glue::redstone::info)
+            .is_some_and(|(b, _)| matches!(b, Block::Chute | Block::SmartChute));
+        if chute {
+            event.output = false;
+        }
+    }
 
     fn use_item_on(
         &self,
@@ -742,9 +782,35 @@ impl BlockPart for LogisticsBlock {
         host: &mut dyn ServerHost,
         event: &mut UseWithoutItemEvent<'_>,
     ) -> Option<InteractionResult> {
+        // `BeltBlock` has no `useWithoutItem`: `BlockBehaviour`'s default `PASS`, so the held
+        // item is used next (a shaft placed against a belt's end). Its `useItemOn` already ran
+        // for this click, an empty hand's included, and must not run again.
+        let belt = states::id(event.state)
+            .and_then(|id| with_world(|w| w.table.get(id).map(|(b, _)| b)).flatten())
+            == Some(Block::Belt);
+        if belt {
+            return Some(InteractionResult::Pass);
+        }
         // Create's blocks open no menu: an unused click passes, so the held item is used (a
         // block placed against a depot's side), never the barrel template's menu.
         Some(use_block(host, event.state, event.click).unwrap_or(InteractionResult::Pass))
+    }
+
+    /// `BeltBlock.getCloneItemStack`: a belt is picked as the belt connector (the belt block has
+    /// no item of its own).
+    fn clone_item_stack(
+        &self,
+        host: &dyn mod_api::Host,
+        event: &mut mod_api::CloneItemStackEvent<'_>,
+    ) -> Option<mod_api::ItemStack> {
+        let belt = states::id(event.state)
+            .and_then(|id| with_world(|w| w.table.get(id).map(|(b, _)| b)).flatten())
+            == Some(Block::Belt);
+        if !belt {
+            return None;
+        }
+        let id = mod_api::Identifier::parse(create_engine::belt_connector::ITEM).ok()?;
+        mod_api::ItemStack::new(host.item_key(&id)?, 1)
     }
 
     /// `BeltBlock.updateEntityAfterFallOn` / `entityInside` for an item, and
@@ -860,9 +926,11 @@ fn contents_changed(lv: &ServerLevel<'_>, pos: [i32; 3]) {
     match block {
         Block::Chute | Block::SmartChute => {
             if chute::chute_stack(lv, pos).is_some() {
+                // `ChuteItemHandler.insertItem` → `setItem(stack)`.
+                let at = chute::start_position(lv, pos);
                 with_world(|w| {
                     if !w.dims[dim].chutes.contains_key(&pos) {
-                        w.set_chute_position(dim, pos, 1.0);
+                        w.set_chute_position(dim, pos, at);
                     }
                 });
             }
@@ -903,16 +971,21 @@ fn item_landed(
     };
     match block {
         Block::Chute | Block::SmartChute => {
-            if chute::chute_take(lv, spot, &s) {
+            if chute::chute_landed(lv, spot, &s) {
                 *stack = None;
             }
         }
         Block::AndesiteFunnel | Block::BrassFunnel => {
-            // FunnelBlock.entityInside, inserting: into the inventory it is on, as much as fits.
+            // FunnelBlock.entityInside, inserting: an item past its opening (`projectedDiff`) into
+            // the inventory it is on, as much as fits.
             let Some(f) = funnel::funnel_at(lv, spot) else {
                 return;
             };
-            if f.extracting || f.powered || !funnel::funnel_passes(lv, spot, &s) {
+            if f.extracting
+                || f.powered
+                || !create_engine::funnel::past_opening(spot, f.facing, at)
+                || !funnel::funnel_passes(lv, spot, &s)
+            {
                 return;
             }
             let behind = create_engine::funnel::behind(spot, f.facing);
@@ -934,7 +1007,7 @@ fn item_landed(
                 let key = items::key_of(&*lv.host, &s);
                 let count = s.count().min(255) as u8;
                 let motion = create_engine::depot::Held::new(
-                    items::random_angle(lv, spot),
+                    items::stack_angle(lv, spot, &key),
                     items::upright(&*lv.host, &key),
                 );
                 let left = arms::depot_insert(lv, spot, &key, count, motion, false);
@@ -957,12 +1030,22 @@ fn item_landed(
             }
             *stack = s.shrink(count);
             let held = create_engine::depot::Held::new(
-                items::random_angle(lv, spot),
+                items::stack_angle(lv, spot, &id),
                 items::upright(&*lv.host, &id),
             );
             with_world(|w| w.depot_put(dim, spot, Some(held)));
+            depot::inserted_sound(lv, spot, &held);
         }
         _ => {
+            // `BeltBlock.entityInside`: not under a tunnel
+            // (`BeltTunnelInteractionHandler.getTunnelOnPosition`, the block above the segment).
+            let above = [spot[0], spot[1] + 1, spot[2]];
+            if matches!(
+                kind(lv, above),
+                Some(Block::AndesiteTunnel | Block::BrassTunnel)
+            ) {
+                return;
+            }
             // A belt carries the stack by its name, components and all (a sequenced
             // assembly's progress apart).
             let (id, progress) = belt::belt_name(&*lv.host, &s);

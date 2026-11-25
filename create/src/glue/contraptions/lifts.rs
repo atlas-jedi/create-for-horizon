@@ -39,6 +39,12 @@ use mod_api::{
 use std::cell::RefCell;
 use std::collections::HashMap;
 
+/// `Block.UPDATE_CLIENTS | Block.UPDATE_MOVE_BY_PISTON`: a pulley taking up or laying its rope
+/// (`removeRopes`, `disassemble`), which no rope hears as broken.
+fn rope_flags() -> mod_api::BlockUpdateFlags {
+    UPDATE_CLIENTS | mod_api::BlockUpdateFlags::MOVE_BY_PISTON
+}
+
 /// An elevator column's floors.
 type Floors = Vec<create_engine::elevator::Floor>;
 
@@ -70,6 +76,355 @@ thread_local! {
     /// The floors each running elevator's clients were last told of (`ElevatorFloorListPacket`).
     static FLOORS_SENT: RefCell<HashMap<(usize, [i32; 3]), Floors>> =
         RefCell::new(HashMap::new());
+    /// Rope, magnets and rope pulleys whose block changed (`onRemove`), by dimension: where,
+    /// and the engine states before and after. The level tick collapses what hung from them.
+    static ROPE_REMOVED: RefCell<Vec<(usize, [i32; 3], u32, u32)>> =
+        const { RefCell::new(Vec::new()) };
+    /// Rope pulleys mirroring another (`PulleyBlockEntity.mirrorParent`), by dimension and the
+    /// mirroring pulley: the pulley whose structure they hang on to. Saved with that pulley
+    /// (`MirrorChildren`).
+    static MIRRORS: RefCell<HashMap<(usize, [i32; 3]), [i32; 3]>> = RefCell::new(HashMap::new());
+    /// The actors of running clocks' hands and of what hangs from them (`hourHand`,
+    /// `minuteHand`, each a structure with its actors), by dimension and clock, found from
+    /// their blocks the first tick they run (also after a load).
+    static CLOCK_ACTORS: RefCell<HashMap<(usize, [i32; 3]), ClockActors>> =
+        RefCell::new(HashMap::new());
+    /// Which hands of each running clock an actor stalls (`isStalled`): held where they are.
+    static CLOCK_HELD: RefCell<HashMap<(usize, [i32; 3]), (bool, bool)>> =
+        RefCell::new(HashMap::new());
+}
+
+/// A running clock's actors: its hour and minute hands', and each stabilized structure's.
+#[derive(Clone, Default)]
+struct ClockActors {
+    hands: [Carried; 2],
+    subs: Vec<Carried>,
+}
+
+/// `ControlledContraptionEntity.tickActors` for the hands of the running clock at `pos` (and
+/// what hangs from them): each actor works where its hand has turned to, its kinds turned off
+/// by the clock's controls. Returns which hands an actor stalls.
+fn tick_clock_actors(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    c: &create_engine::lifts::RunningClock,
+) -> (bool, bool) {
+    use create_engine::contraption::sub_key;
+    let dim = lv.dim;
+    let keys = [pos, create_engine::clock::minute_key(pos)];
+    let mut a = CLOCK_ACTORS
+        .with_borrow_mut(|m| m.remove(&(dim, pos)))
+        .unwrap_or_else(|| {
+            // Each hand's actors with what it carries (its controls and the kinds they turned
+            // off), each riding structure's with its own.
+            let found = |b: &[([i32; 3], u32)], e: &Carried| {
+                actors::with_extras(actors::bearing_actors(&*lv.host, b), e)
+            };
+            let extras = |k: [i32; 3]| {
+                PULLEY_CARRIED
+                    .with_borrow(|m| m.get(&(dim, k)).cloned())
+                    .unwrap_or_default()
+            };
+            ClockActors {
+                hands: [
+                    found(&c.hour, &extras(keys[0])),
+                    found(
+                        c.minute.as_ref().map_or(&[][..], |(_, m)| m),
+                        &extras(keys[1]),
+                    ),
+                ],
+                subs: c.subs.iter().map(|(_, s)| found(&s.blocks, &s.extras)).collect(),
+            }
+        });
+    let axis = c.facing.axis();
+    let degs = [c.clock.hour, c.clock.minute];
+    let mut held = [false; 2];
+    for (h, carried) in a.hands.iter_mut().enumerate() {
+        if !carried.actors.is_empty() {
+            let deg = f64::from(degs[h]);
+            let s = actors::tick_turning_actors(lv, keys[h], carried, pos, axis, deg);
+            carried.stalled = s;
+            held[h] |= s;
+        }
+    }
+    for (i, ((hand, sub), carried)) in c.subs.iter().zip(a.subs.iter_mut()).enumerate() {
+        if carried.actors.is_empty() {
+            continue;
+        }
+        let h = usize::from(*hand).min(1);
+        let shift = sub.shift(axis, f64::from(degs[h]));
+        let pivot = [0, 1, 2].map(|k| f64::from(pos[k]) + 0.5 + shift[k]);
+        let still = create_engine::actors::one_turn(axis, 0.0);
+        let s = actors::tick_posed_actors(lv, sub_key(pos, i), carried, pivot, &still);
+        carried.stalled = s;
+        held[h] |= s;
+    }
+    // Its clients see each hand's and riding structure's actors and controls, each with the
+    // kinds its own controls turned off.
+    let riding: Vec<([i32; 3], &Carried)> = std::iter::once((keys[1], &a.hands[1]))
+        .chain(a.subs.iter().enumerate().map(|(i, c)| (sub_key(pos, i), c)))
+        .collect();
+    super::actor_draw::show_actors_riding(lv, pos, pos, &a.hands[0], &riding);
+    CLOCK_ACTORS.with_borrow_mut(|m| m.insert((dim, pos), a));
+    (held[0], held[1])
+}
+
+/// What part of a running clock a key names: its hour hand (the bearing's position), its
+/// minute hand (`clock::minute_key`), or the `i`th structure riding its hands
+/// (`contraption::sub_key`); with the clock's position.
+#[derive(Clone, Copy, PartialEq)]
+enum ClockPart {
+    Hour,
+    Minute,
+    Sub(usize),
+}
+
+fn clock_part(dim: usize, key: [i32; 3]) -> Option<([i32; 3], ClockPart)> {
+    use create_engine::contraption::{SUB_KEY_STEP, sub_of_key};
+    with_world(|w| {
+        let clocks = &w.dims[dim].lifts.clocks;
+        if clocks.contains_key(&key) {
+            return Some((key, ClockPart::Hour));
+        }
+        let up = [key[0], key[1].wrapping_add(SUB_KEY_STEP), key[2]];
+        if clocks.contains_key(&up) && create_engine::clock::minute_key(up) == key {
+            return Some((up, ClockPart::Minute));
+        }
+        let (p, i) = sub_of_key(key)?;
+        (clocks.get(&p)?.subs.len() > i).then_some((p, ClockPart::Sub(i)))
+    })
+    .flatten()
+}
+
+/// The actors of the clock at `pos` stop working (it comes apart, or its controls changed and
+/// they are found again).
+fn cancel_clock_actors(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    let dim = lv.dim;
+    CLOCK_HELD.with_borrow_mut(|m| m.remove(&(dim, pos)));
+    let Some(mut a) = CLOCK_ACTORS.with_borrow_mut(|m| m.remove(&(dim, pos))) else {
+        return;
+    };
+    let keys = [pos, create_engine::clock::minute_key(pos)];
+    for (c, key) in a.hands.iter_mut().zip(keys) {
+        actors::cancel_actors(lv, key, c);
+    }
+    for (i, c) in a.subs.iter_mut().enumerate() {
+        actors::cancel_actors(lv, create_engine::contraption::sub_key(pos, i), c);
+    }
+}
+
+/// Whether the rope pulley at `pos` mirrors another (`isPassive`: its speed and clicks do
+/// nothing, its rope follows the other's structure).
+pub(super) fn mirroring(dim: usize, pos: [i32; 3]) -> bool {
+    MIRRORS.with_borrow(|m| m.contains_key(&(dim, pos)))
+}
+
+/// The pulleys mirroring the pulley at `master` (`mirrorChildren`).
+fn mirrors_of(dim: usize, master: [i32; 3]) -> Vec<[i32; 3]> {
+    let mut v: Vec<[i32; 3]> = MIRRORS.with_borrow(|m| {
+        m.iter()
+            .filter(|((d, _), p)| *d == dim && **p == master)
+            .map(|((_, c), _)| *c)
+            .collect()
+    });
+    v.sort();
+    v
+}
+
+/// The rope and magnet under the pulley at `pos`, how many blocks (`maxRopeLength` at most),
+/// and whether each is in water.
+fn rope_below(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Vec<bool> {
+    let mut out = Vec::new();
+    for i in 1..=create_engine::pulley::MAX_ROPE_LENGTH {
+        match lv.name_props(below(pos, i)) {
+            Some((n, props)) if n == "create:rope" || n == "create:pulley_magnet" => {
+                out.push(super::flag(&props, "waterlogged"));
+            }
+            _ => break,
+        }
+    }
+    out
+}
+
+/// `removeRopes`: the rope under the pulley at `pos`, `wet` telling which were in water, leaves
+/// (water where it was in water).
+fn take_up_rope(lv: &mut ServerLevel<'_>, pos: [i32; 3], wet: &[bool]) {
+    for (j, wet) in wet.iter().enumerate() {
+        let c = below(pos, j as i32 + 1);
+        if *wet && let Some(water) = lv.host.block_state_id("minecraft:water") {
+            lv.set_state(c, water, rope_flags());
+        } else {
+            lv.set_air(c, rope_flags());
+        }
+    }
+}
+
+/// `disassemble`'s `shouldCreateRopes`: the magnet `grid` blocks under the pulley at `pos` and
+/// rope above it, in water where water is, each but where nothing can be broken.
+fn lay_rope(lv: &mut ServerLevel<'_>, pos: [i32; 3], grid: i32) {
+    let (rope_cells, magnet) = create_engine::pulley::rope_cells(pos, grid);
+    for (c, name) in magnet
+        .map(|m| (m, "create:pulley_magnet"))
+        .into_iter()
+        .chain(rope_cells.into_iter().map(|r| (r, "create:rope")))
+    {
+        // `getDestroySpeed != -1`: what is there breaks, unless it can't.
+        if super::indestructible(lv, c) {
+            continue;
+        }
+        let wet = lv.block_name(c).is_some_and(|n| n == "minecraft:water");
+        let w = if wet { "true" } else { "false" };
+        if let Some(s) = state_with(&*lv.host, name, &[("waterlogged", w)]) {
+            lv.set_num(c, s, rope_flags());
+        }
+    }
+}
+
+/// `PulleyBlockEntity.assemble`'s mirrors: each block of the structure's top row (nothing of
+/// it above, `createColliders(UP)` at height 0) under a rope pulley at the pulley's own height
+/// has that pulley mirror this one (`startMirroringOther`): it takes up its rope (unless it has
+/// none to give or is out its whole length, by its own speed) and hangs on to this structure.
+/// A pulley running a structure of its own is left alone.
+fn start_mirrors(lv: &mut ServerLevel<'_>, pos: [i32; 3], p: &create_engine::pulley::Pulley) {
+    let dim = lv.dim;
+    for c in create_engine::pulley::mirror_cells(pos, p.anchor, &p.blocks) {
+        if !matches!(create_info(lv.block(c)), Some((Block::RopePulley, _))) {
+            continue;
+        }
+        let busy = with_world(|w| w.dims[dim].lifts.pulleys.contains_key(&c)) != Some(false);
+        if busy || mirroring(dim, c) {
+            continue;
+        }
+        MIRRORS.with_borrow_mut(|m| m.insert((dim, c), pos));
+        let wet = rope_below(lv, c);
+        let offset = wet.len() as i32;
+        let range = create_engine::pulley::extension_range(c[1], lv.build_range().0);
+        let rpm = speed(dim, c);
+        if !((offset >= range && rpm > 0.0) || (offset <= 0 && rpm < 0.0)) {
+            take_up_rope(lv, c, &wet);
+        }
+        mark_unsaved(lv, c);
+    }
+}
+
+/// `notifyMirrorsOfDisassembly`: the pulleys mirroring the one at `master`, which stopped at
+/// whole offset `grid`, lay their rope down to there (`getGridOffset` in their own range) and
+/// mirror it no more.
+fn release_mirrors(lv: &mut ServerLevel<'_>, master: [i32; 3], grid: i32) {
+    let dim = lv.dim;
+    for c in mirrors_of(dim, master) {
+        MIRRORS.with_borrow_mut(|m| m.remove(&(dim, c)));
+        if !matches!(create_info(lv.block(c)), Some((Block::RopePulley, _))) {
+            continue;
+        }
+        let range = create_engine::pulley::extension_range(c[1], lv.build_range().0);
+        let at = grid.clamp(0, range);
+        lay_rope(lv, c, at);
+        draw::set_pulley_rest(lv, c, at);
+        draw::hide(lv, c);
+        mark_unsaved(lv, c);
+    }
+}
+
+/// The pulleys mirroring `master` to their clients: rope down to where its structure hangs
+/// (`getBlockEntityOffset` of the shared structure), gliding with it.
+fn show_mirrors(lv: &mut ServerLevel<'_>, master: [i32; 3], glide: &draw::Glide<'_>) {
+    for c in mirrors_of(lv.dim, master) {
+        draw::show_glide(
+            lv,
+            c,
+            draw::Glide {
+                key: c,
+                origin: [0; 3],
+                blocks: &[],
+                ..*glide
+            },
+        );
+    }
+}
+
+/// The global `block_changed` (inside the write): a rope or magnet changed by anything but a
+/// structure moving it (`onRemove`'s `isMoving`), or a rope pulley, is looked at in the level
+/// tick (`RopeBlockBase.onRemove`, `PulleyBlock.onRemove`).
+pub(super) fn rope_changed(dim: usize, pos: [i32; 3], old: u32, new: u32) {
+    let rope = |id: u32| {
+        matches!(
+            create_info(id).map(|(b, _)| b),
+            Some(Block::Rope | Block::PulleyMagnet | Block::RopePulley)
+        )
+    };
+    if !rope(old) || (super::super::server::moving_write() && !pulley_state(old)) {
+        return;
+    }
+    ROPE_REMOVED.with_borrow_mut(|r| r.push((dim, pos, old, new)));
+}
+
+/// Whether engine state `id` is a rope pulley's.
+fn pulley_state(id: u32) -> bool {
+    matches!(create_info(id), Some((Block::RopePulley, _)))
+}
+
+/// `RopeBlockBase.onRemove` for rope and magnets removed (not by water filling or leaving it,
+/// not moving): a rope pulley right above forgets its rope (`onRopeBroken`: `initialOffset = 0`
+/// and `onLengthBroken`, its offset back to 0), and the rope and magnets right above and below
+/// break (dropping what they drop), each in turn breaking the next. `PulleyBlock.onRemove`: a
+/// rope pulley gone (not just turned) breaks the rope or magnet under it.
+fn collapse_ropes(lv: &mut ServerLevel<'_>) {
+    let dim = lv.dim;
+    let rope_at = |lv: &ServerLevel<'_>, p: [i32; 3]| {
+        matches!(lv.create_block(p), Some(Block::Rope | Block::PulleyMagnet))
+    };
+    // Each break is heard again as it happens: until nothing more falls.
+    for _ in 0..=create_engine::pulley::MAX_ROPE_LENGTH * 2 + 2 {
+        let batch: Vec<([i32; 3], u32, u32)> = ROPE_REMOVED.with_borrow_mut(|r| {
+            let mine = r
+                .iter()
+                .filter(|e| e.0 == dim)
+                .map(|e| (e.1, e.2, e.3))
+                .collect();
+            r.retain(|e| e.0 != dim);
+            mine
+        });
+        if batch.is_empty() {
+            return;
+        }
+        for (pos, old, new) in batch {
+            let up = [pos[0], pos[1] + 1, pos[2]];
+            let down = below(pos, 1);
+            if pulley_state(old) {
+                if pulley_state(new) {
+                    continue;
+                }
+                // A mirroring pulley broken: it mirrors no more (`remove`, no rope laid).
+                if MIRRORS.with_borrow_mut(|m| m.remove(&(dim, pos))).is_some() {
+                    draw::hide(lv, pos);
+                }
+                if rope_at(lv, down) {
+                    lv.destroy_block(down, true);
+                }
+                continue;
+            }
+            // Water coming or going keeps the rope (`WATERLOGGED` alone changed).
+            let waterlogged =
+                |id: u32| super::name_props(&*lv.host, id).map(|(n, p)| (n, super::flag(&p, "waterlogged")));
+            if let (Some((on, ow)), Some((nn, nw))) = (waterlogged(old), waterlogged(new))
+                && (on == nn || ow != nw)
+                && matches!(nn.as_str(), "create:rope" | "create:pulley_magnet")
+            {
+                continue;
+            }
+            if lv.create_block(up) == Some(Block::RopePulley)
+                && with_world(|w| !w.dims[dim].lifts.pulleys.contains_key(&up)) == Some(true)
+            {
+                draw::set_pulley_rest(lv, up, 0);
+            }
+            for p in [up, down] {
+                if rope_at(lv, p) {
+                    lv.destroy_block(p, true);
+                }
+            }
+        }
+    }
 }
 
 /// The key in an elevator pulley's data under which its column's floors are, for its
@@ -78,6 +433,10 @@ thread_local! {
 pub const FLOORS: &str = "Floors";
 
 pub(super) fn forget() {
+    ROPE_REMOVED.with_borrow_mut(Vec::clear);
+    MIRRORS.with_borrow_mut(HashMap::clear);
+    CLOCK_ACTORS.with_borrow_mut(HashMap::clear);
+    CLOCK_HELD.with_borrow_mut(HashMap::clear);
     ELEVATOR_MOVED.with_borrow_mut(std::collections::HashSet::clear);
     PULLEY_CARRIED.with_borrow_mut(HashMap::clear);
     CLOCK_SHOWN.with_borrow_mut(HashMap::clear);
@@ -111,6 +470,44 @@ fn speed(dim: usize, pos: [i32; 3]) -> f32 {
     with_world(|w| w.speed(dim, pos)).flatten().unwrap_or(0.0)
 }
 
+/// What the `n` stabilized structures riding a clock at `pos`'s hands kept of their block
+/// entities waits for their blocks, which go back where they were taken from.
+fn expect_clock_subs(lv: &mut ServerLevel<'_>, pos: [i32; 3], n: usize) {
+    for i in 0..n {
+        actors::expect_back(lv, create_engine::contraption::sub_key(pos, i), |o| add(pos, o));
+    }
+}
+
+/// The stabilized structures riding a clock at `pos`'s hands (`subs`) went back where they
+/// were taken from (`disassemble`'s riders, after the hands): their storage and block data,
+/// what stood on them, and each one's sound (`AbstractContraptionEntity.disassemble`, at its
+/// anchor).
+fn lift_sub_riders(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    subs: &[(u8, create_engine::contraption::Stabilized)],
+) {
+    let placed = Pose::translated(pos.map(f64::from));
+    for (i, (_, sub)) in subs.iter().enumerate() {
+        let key = create_engine::contraption::sub_key(pos, i);
+        actors::release_storage(lv, key, |o| add(pos, o));
+        actors::release_extras(lv, &mut sub.extras.clone(), |o| add(pos, o));
+        colliders::lift_riders(lv, Owner::Anchor(pos, 2 + i as u8), placed);
+        super::disassemble_sound(lv, add(pos, sub.front()));
+    }
+}
+
+/// The minute hand of the clock at `pos`, turned back to 0, gives back what it carried: its
+/// storage blocks' items, glue and controls, each where its block went back.
+fn release_minute(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    let dim = lv.dim;
+    let key = create_engine::clock::minute_key(pos);
+    let mut carried = PULLEY_CARRIED
+        .with_borrow_mut(|c| c.remove(&(dim, key)))
+        .unwrap_or_default();
+    actors::release(lv, key, pos, &mut carried);
+}
+
 /// Blocks a structure took go back: each where it was, or dropped where something else took
 /// its place (`Contraption.addBlocksToWorld`).
 fn lift_put_back(
@@ -126,6 +523,8 @@ fn lift_put_back(
     for n in 0..2 {
         colliders::lift_riders(lv, Owner::Anchor(key, n), placed);
     }
+    // `AbstractContraptionEntity.disassemble`, at the structure's anchor.
+    super::disassemble_sound(lv, origin);
 }
 
 fn mark_unsaved(lv: &ServerLevel<'_>, pos: [i32; 3]) {
@@ -142,6 +541,7 @@ impl ServerLevel<'_> {
 /// Clockwork bearings, rope pulleys, elevators and contacts, after the kinetic solve. Nothing
 /// runs while none of them has anything to do.
 pub(super) fn tick_lifts(lv: &mut ServerLevel<'_>) {
+    collapse_ropes(lv);
     let dim = lv.dim;
     // `ElevatorContraption.tickStorage`: every 10 ticks each elevator's clients hear of its
     // column's floors when they changed.
@@ -182,7 +582,19 @@ pub(super) fn tick_lifts(lv: &mut ServerLevel<'_>) {
             // A clock's hands go back turned to 0, where they started.
             Held::Clock(_) => Some(pos),
         };
+        if let Held::Clock(c) = &held {
+            cancel_clock_actors(lv, pos);
+            expect_clock_subs(lv, pos, c.subs.len());
+        }
         lift_put_back(lv, pos, origin.unwrap_or(pos), &held.put_back(pos));
+        if let Held::Clock(c) = &held {
+            lift_sub_riders(lv, pos, &c.subs);
+            release_minute(lv, pos);
+        }
+        // A broken pulley lays no rope of its own (`shouldCreateRopes`); its mirrors do.
+        if let Held::Pulley(p) = &held {
+            release_mirrors(lv, pos, create_engine::pulley::grid_offset(p.offset, p.range));
+        }
         // What rode with it (its storage too, kept apart from its actors) goes back.
         if let Some(origin) = origin {
             let mut carried = PULLEY_CARRIED
@@ -246,8 +658,23 @@ fn show_clock(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
     let Some(c) = with_world(|w| w.dims[dim].lifts.clocks.get(&pos).cloned()).flatten() else {
         return;
     };
-    let speeds = c.clock.speeds(&sky(lv, c.rpm, c.facing));
+    let (h, m) = c.clock.speeds(&sky(lv, c.rpm, c.facing));
+    // A hand an actor stalls is shown still.
+    let held = CLOCK_HELD
+        .with_borrow(|s| s.get(&(dim, pos)).copied())
+        .unwrap_or_default();
+    let speeds = (if held.0 { 0.0 } else { h }, if held.1 { 0.0 } else { m });
     CLOCK_SHOWN.with_borrow_mut(|s| s.insert((dim, pos), speeds));
+    // Each hand's on-axis mechanical bearings' tops turn back against it
+    // (`ClockworkContraption.canBeStabilized`, from the hand's anchor).
+    let o = c.facing.offset();
+    let along = |n: i32| [o[0] * n, o[1] * n, o[2] * n];
+    let rule = |f, l| create_engine::contraption::clockwork_stabilizes(c.facing, f, l);
+    let facing_of = super::mechanical_bearing_facing;
+    let mut still = create_engine::contraption::still_tops(&c.hour, along(1), facing_of, rule);
+    if let Some((reach, m)) = &c.minute {
+        still.extend(create_engine::contraption::still_tops(m, along(reach + 1), facing_of, rule));
+    }
     draw::show_clock(
         lv,
         pos,
@@ -257,6 +684,8 @@ fn show_clock(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
             axis: c.facing.axis(),
             angles: (c.clock.hour, c.clock.minute),
             speeds,
+            subs: &c.subs,
+            still: &still,
         },
     );
 }
@@ -303,16 +732,26 @@ fn tick_clocks(lv: &mut ServerLevel<'_>) {
             .collect()
     })
     .unwrap_or_default();
+    // A clock no longer running here (its column unloaded) finds its actors again when it is.
+    let runs = |k: &(usize, [i32; 3])| k.0 != dim || running.iter().any(|r| r.0 == k.1);
+    CLOCK_ACTORS.with_borrow_mut(|m| m.retain(|k, _| runs(k)));
+    CLOCK_HELD.with_borrow_mut(|m| m.retain(|k, _| runs(k)));
     for (pos, rpm, facing) in running {
         if rpm == 0.0 {
             continue;
         }
         let sky = sky(lv, rpm, facing);
+        let Some(clock) = with_world(|w| w.dims[dim].lifts.clocks.get(&pos).cloned()).flatten()
+        else {
+            continue;
+        };
+        let held = tick_clock_actors(lv, pos, &clock);
+        CLOCK_HELD.with_borrow_mut(|m| m.insert((dim, pos), held));
         let speeds = with_world(|w| {
             let c = w.dims[dim].lifts.clocks.get_mut(&pos)?;
-            let speeds = c.clock.speeds(&sky);
-            c.clock.tick(&sky);
-            Some(speeds)
+            let (h, m) = c.clock.speeds(&sky);
+            c.clock.tick_holding(&sky, held);
+            Some((if held.0 { 0.0 } else { h }, if held.1 { 0.0 } else { m }))
         })
         .flatten();
         let shown = CLOCK_SHOWN.with_borrow(|s| s.get(&(dim, pos)).copied());
@@ -344,7 +783,19 @@ pub(super) fn clock_hands_set(lv: &mut ServerLevel<'_>, pos: [i32; 3], index: u8
 /// `ClockworkBearingBlockEntity.assemble`: the hour hand and the minute hand leave the world.
 fn assemble_clock(lv: &mut ServerLevel<'_>, pos: [i32; 3], facing: Dir, rpm: f32) {
     let dim = lv.dim;
-    let hands = match create_engine::clock::gather(pos, facing, |p| found(lv, p)) {
+    let gathered = super::gather_moving(
+        lv,
+        |lv| create_engine::clock::gather(pos, facing, |p| found(lv, p)),
+        |g| {
+            let Some(h) = g else { return Vec::new() };
+            let mut all = super::cells_of(pos, &h.hour);
+            if let Some((_, m)) = &h.minute {
+                all.extend(super::cells_of(pos, m));
+            }
+            all
+        },
+    );
+    let hands = match gathered {
         Ok(Some(hands)) => hands,
         Ok(None) => return,
         Err(r) => {
@@ -353,15 +804,15 @@ fn assemble_clock(lv: &mut ServerLevel<'_>, pos: [i32; 3], facing: Dir, rpm: f32
         }
     };
     super::set_exception(lv, pos, None);
-    let mut all = hands.hour.clone();
-    if let Some((_, m)) = &hands.minute {
-        all.extend(m.iter().copied());
-    }
-    actors::carry_storage(lv, pos, pos, &all);
-    let extras = actors::carry_extras(lv, pos, &all, |p| p == pos);
-    if !extras.controls.is_empty() || !extras.glue.is_empty() {
-        PULLEY_CARRIED.with_borrow_mut(|c| c.insert((dim, pos), extras));
-    }
+    // Each hand is a contraption of its own (`hourHand`, `minuteHand`), with its own storage,
+    // glue, contraption controls and kinds they turned off.
+    let minute_key = create_engine::clock::minute_key(pos);
+    actors::carry_storage(lv, pos, pos, &hands.hour);
+    let extras = actors::carry_extras(lv, pos, &hands.hour, |p| p == pos);
+    let minute_extras = hands.minute.as_ref().map(|(_, m)| {
+        actors::carry_storage(lv, minute_key, pos, m);
+        actors::carry_extras(lv, pos, m, |p| p == pos)
+    });
     crate::glue::advancements::clock_assembled(
         lv,
         pos,
@@ -371,6 +822,21 @@ fn assemble_clock(lv: &mut ServerLevel<'_>, pos: [i32; 3], facing: Dir, rpm: f32
     take_blocks(lv, pos, &hands.hour);
     if let Some((_, m)) = &hands.minute {
         take_blocks(lv, pos, m);
+    }
+    // What the stabilized bearings on the hands face rides them (`onEntityCreated`), each
+    // with its own glue and controls; it goes back where it was taken from (the hands turn
+    // back to 0 first).
+    let mut subs = Vec::new();
+    for &(hand, bearing, facing) in &hands.subs {
+        let key = create_engine::contraption::sub_key(pos, subs.len());
+        if let Some(sub) = super::bearings::assemble_sub(lv, pos, key, bearing, facing) {
+            subs.push((hand, sub));
+        }
+    }
+    for (k, e) in [(pos, Some(extras)), (minute_key, minute_extras)] {
+        if let Some(e) = e.filter(|e| !e.controls.is_empty() || !e.glue.is_empty()) {
+            PULLEY_CARRIED.with_borrow_mut(|c| c.insert((dim, k), e));
+        }
     }
     let arrangement = create_engine::clock::Hands::from_index(super::option_at(dim, pos) as u8);
     let c = create_engine::lifts::RunningClock {
@@ -382,6 +848,7 @@ fn assemble_clock(lv: &mut ServerLevel<'_>, pos: [i32; 3], facing: Dir, rpm: f32
         rpm,
         hour: hands.hour,
         minute: hands.minute,
+        subs,
     };
     with_world(|w| {
         w.dims[dim].lifts.clocks.insert(pos, c);
@@ -397,13 +864,18 @@ fn disassemble_clock(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
         return;
     };
     CLOCK_SHOWN.with_borrow_mut(|s| s.remove(&(dim, pos)));
+    cancel_clock_actors(lv, pos);
+    let riders = c.subs.clone();
     let held = Held::Clock(c);
+    expect_clock_subs(lv, pos, riders.len());
     lift_put_back(lv, pos, pos, &held.put_back(pos));
+    lift_sub_riders(lv, pos, &riders);
     actors::release_storage(lv, pos, |o| add(pos, o));
     // The hands turned back to 0: their glue and controls go back where they were.
     if let Some(mut carried) = PULLEY_CARRIED.with_borrow_mut(|c| c.remove(&(dim, pos))) {
         actors::release_extras(lv, &mut carried, |o| add(pos, o));
     }
+    release_minute(lv, pos);
     draw::hide(lv, pos);
     mark_unsaved(lv, pos);
 }
@@ -455,7 +927,10 @@ fn tick_pulleys(lv: &mut ServerLevel<'_>) {
     checks.dedup();
     let mut later = Vec::new();
     for &pos in &checks {
-        if !matches!(create_info(lv.block(pos)), Some((Block::RopePulley, _))) {
+        // A mirroring pulley follows its master only (`isPassive`).
+        if !matches!(create_info(lv.block(pos)), Some((Block::RopePulley, _)))
+            || mirroring(dim, pos)
+        {
             continue;
         }
         // Loaded moving, it goes on once its network has a speed.
@@ -528,12 +1003,9 @@ fn tick_pulleys(lv: &mut ServerLevel<'_>) {
                                 .is_some_and(|k| actors::breaker_clears(lv, pos, k, l, c))
                         })
                 },
-                |c| {
-                    found(lv, c).is_some_and(|f| f.movable)
-                        && lv
-                            .block_name(c)
-                            .is_none_or(|n| n != "create:rope" && n != "create:pulley_magnet")
-                },
+                // `visitNewPosition`: a block that needs moving and isn't brittle (rope and
+                // magnets are).
+                |c| found(lv, c).is_some_and(|f| !f.brittle),
             )
         };
         if before < 200.0 && p.offset >= 200.0 {
@@ -556,24 +1028,21 @@ fn tick_pulleys(lv: &mut ServerLevel<'_>) {
 /// `PulleyBlockEntity.assemble`: the rope and magnet under the pulley set its offset; the
 /// structure under them and the rope leave the world.
 fn assemble_pulley(lv: &mut ServerLevel<'_>, pos: [i32; 3], rpm: f32) {
-    use create_engine::pulley::{self, MAX_ROPE_LENGTH, Pulley};
+    use create_engine::pulley::{self, Pulley};
     let dim = lv.dim;
-    let rope_at = |lv: &ServerLevel<'_>, p: [i32; 3]| {
-        lv.name_props(p)
-            .filter(|(n, _)| n == "create:rope" || n == "create:pulley_magnet")
-            .map(|(_, props)| super::flag(&props, "waterlogged"))
-    };
-    let mut i = 1;
-    while i <= MAX_ROPE_LENGTH && rope_at(lv, below(pos, i)).is_some() {
-        i += 1;
-    }
-    let offset = i - 1;
+    let wet = rope_below(lv, pos);
+    let offset = wet.len() as i32;
     let range = pulley::extension_range(pos[1], lv.build_range().0);
     if (offset >= range && rpm > 0.0) || (offset <= 0 && rpm < 0.0) {
         return;
     }
     let anchor = below(pos, offset + 1);
-    let blocks = match pulley::gather(anchor, offset, |p| found(lv, p)) {
+    let gathered = super::gather_moving(
+        lv,
+        |lv| pulley::gather(anchor, offset, |p| found(lv, p)),
+        |g| super::cells_of(anchor, g),
+    );
+    let blocks = match gathered {
         Ok(b) => b,
         Err(r) => {
             super::set_exception(lv, pos, Some(&r));
@@ -594,16 +1063,7 @@ fn assemble_pulley(lv: &mut ServerLevel<'_>, pos: [i32; 3], rpm: f32) {
         return;
     }
     // `removeRopes`: rope in water leaves water.
-    for j in 1..=offset {
-        let c = below(pos, j);
-        if rope_at(lv, c) == Some(true)
-            && let Some(water) = lv.host.block_state_id("minecraft:water")
-        {
-            lv.set_state(c, water, UPDATE_CLIENTS);
-        } else {
-            lv.set_air(c, UPDATE_CLIENTS);
-        }
-    }
+    take_up_rope(lv, pos, &wet);
     // Its actors, storage, glue and controls ride with it (`Contraption.addBlock`).
     let carried = actors::carry(lv, pos, anchor, &p.blocks, |_| false);
     if !carried.actors.is_empty() || !carried.controls.is_empty() || !carried.glue.is_empty() {
@@ -611,6 +1071,9 @@ fn assemble_pulley(lv: &mut ServerLevel<'_>, pos: [i32; 3], rpm: f32) {
     }
     crate::glue::advancements::assembled(lv, pos, &p.blocks);
     take_blocks(lv, anchor, &p.blocks);
+    if !p.blocks.is_empty() {
+        start_mirrors(lv, pos, &p);
+    }
     with_world(|w| w.dims[dim].lifts.pulleys.insert(pos, p));
     show_pulley(lv, pos);
     mark_unsaved(lv, pos);
@@ -649,22 +1112,7 @@ fn stop_pulley(lv: &mut ServerLevel<'_>, pos: [i32; 3], grid: i32) {
     let Some(mut p) = with_world(|w| w.dims[dim].lifts.pulleys.remove(&pos)).flatten() else {
         return;
     };
-    let (rope_cells, magnet) = create_engine::pulley::rope_cells(pos, grid);
-    for (c, name) in magnet
-        .map(|m| (m, "create:pulley_magnet"))
-        .into_iter()
-        .chain(rope_cells.into_iter().map(|r| (r, "create:rope")))
-    {
-        // `getDestroySpeed != -1`: what is there breaks, unless it can't.
-        if found(lv, c).is_some_and(|f| !f.movable) {
-            continue;
-        }
-        let wet = lv.block_name(c).is_some_and(|n| n == "minecraft:water");
-        let w = if wet { "true" } else { "false" };
-        if let Some(s) = state_with(&*lv.host, name, &[("waterlogged", w)]) {
-            lv.set_num(c, s, UPDATE_CLIENTS);
-        }
-    }
+    lay_rope(lv, pos, grid);
     p.offset = grid as f32;
     draw::set_pulley_rest(lv, pos, grid);
     let origin = p.placed_at(create_engine::pulley::grid_offset(p.offset, p.range));
@@ -677,6 +1125,7 @@ fn stop_pulley(lv: &mut ServerLevel<'_>, pos: [i32; 3], grid: i32) {
     actors::release(lv, pos, origin, &mut carried);
     draw::hide(lv, pos);
     mark_unsaved(lv, pos);
+    release_mirrors(lv, pos, grid);
 }
 
 /// A rope pulley to its clients: its structure (offsets from its anchor) gliding down from its
@@ -693,23 +1142,21 @@ fn show_pulley(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
         p.anchor[1] + p.initial - pos[1],
         p.anchor[2] - pos[2],
     ];
-    draw::show_glide(
-        lv,
-        pos,
-        draw::Glide {
-            key: pos,
-            origin,
-            blocks: &blocks,
-            dir: [0, -1, 0],
-            offset: p.offset,
-            per_tick: if p.waiting { 0.0 } else { p.speed(p.rpm) },
-            clamp: Some(match p.limit {
-                Some(l) => ((p.offset - l).max(0.0), (p.offset + l).min(p.range as f32)),
-                None => (0.0, p.range as f32),
-            }),
-            rope: true,
-        },
-    );
+    let glide = draw::Glide {
+        key: pos,
+        origin,
+        blocks: &blocks,
+        dir: [0, -1, 0],
+        offset: p.offset,
+        per_tick: if p.waiting { 0.0 } else { p.speed(p.rpm) },
+        clamp: Some(match p.limit {
+            Some(l) => ((p.offset - l).max(0.0), (p.offset + l).min(p.range as f32)),
+            None => (0.0, p.range as f32),
+        }),
+        rope: true,
+    };
+    show_mirrors(lv, pos, &glide);
+    draw::show_glide(lv, pos, glide);
 }
 
 fn show_elevator(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
@@ -823,6 +1270,42 @@ pub fn floors_of(nbt: &Compound) -> Vec<create_engine::elevator::Floor> {
 /// is now; None for anything else (an elevator's controls pick floors).
 pub(super) fn take_lift(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Option<(Carried, actors::Place)> {
     let dim = lv.dim;
+    // A clock's hand (or what hangs from one) by its key: what it carries, its actors (whose
+    // kinds its own controls turn off) and its blocks where they have turned to.
+    if let Some((clock, part)) = clock_part(dim, pos) {
+        let c = with_world(|w| w.dims[dim].lifts.clocks.get(&clock).cloned()).flatten()?;
+        let mut carried = match part {
+            ClockPart::Sub(i) => c.subs.get(i)?.1.extras.clone(),
+            _ => PULLEY_CARRIED
+                .with_borrow(|m| m.get(&(dim, pos)).cloned())
+                .unwrap_or_default(),
+        };
+        if let Some(a) = CLOCK_ACTORS.with_borrow(|m| m.get(&(dim, clock)).cloned()) {
+            let found = match part {
+                ClockPart::Hour => Some(&a.hands[0]),
+                ClockPart::Minute => Some(&a.hands[1]),
+                ClockPart::Sub(i) => a.subs.get(i),
+            };
+            carried.actors = found.map(|f| f.actors.clone()).unwrap_or_default();
+        }
+        let axis = c.facing.axis();
+        let place = move |o: [i32; 3]| {
+            let at = match part {
+                ClockPart::Sub(i) => {
+                    let (hand, sub) = &c.subs[i];
+                    let deg = if *hand == 0 { c.clock.hour } else { c.clock.minute };
+                    let shift = sub.shift(axis, f64::from(deg));
+                    [0, 1, 2].map(|k| f64::from(o[k]) + shift[k])
+                }
+                ClockPart::Hour | ClockPart::Minute => {
+                    let deg = if part == ClockPart::Hour { c.clock.hour } else { c.clock.minute };
+                    create_engine::actors::turn_vec(o.map(f64::from), axis, f64::from(deg))
+                }
+            };
+            [0, 1, 2].map(|k| (f64::from(clock[k]) + 0.5 + at[k]).floor() as i32)
+        };
+        return Some((carried, Box::new(place)));
+    }
     let origin = with_world(|w| {
         let l = &w.dims[dim].lifts;
         if let Some(p) = l.pulleys.get(&pos) {
@@ -838,8 +1321,49 @@ pub(super) fn take_lift(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Option<(Carried,
 }
 
 /// What [`take_lift`] took, changed by its controls, goes back.
-pub(super) fn put_lift(lv: &mut ServerLevel<'_>, pos: [i32; 3], carried: Carried) {
+pub(super) fn put_lift(lv: &mut ServerLevel<'_>, pos: [i32; 3], mut carried: Carried) {
     let dim = lv.dim;
+    // A clock's part: its actors (in the order `take_lift` gave them) go back with their kinds
+    // turned on or off (`setActorsActive`); its controls and the kinds they turned off to what
+    // it carries.
+    if let Some((clock, part)) = clock_part(dim, pos) {
+        let mut taken = std::mem::take(&mut carried.actors).into_iter();
+        CLOCK_ACTORS.with_borrow_mut(|m| {
+            let Some(a) = m.get_mut(&(dim, clock)) else {
+                return;
+            };
+            let c = match part {
+                ClockPart::Hour => Some(&mut a.hands[0]),
+                ClockPart::Minute => Some(&mut a.hands[1]),
+                ClockPart::Sub(i) => a.subs.get_mut(i),
+            };
+            if let Some(c) = c {
+                for slot in &mut c.actors {
+                    if let Some(x) = taken.next() {
+                        *slot = x;
+                    }
+                }
+                c.controls.clone_from(&carried.controls);
+                c.disabled.clone_from(&carried.disabled);
+            }
+        });
+        match part {
+            ClockPart::Sub(i) => {
+                with_world(|w| {
+                    let clocks = &mut w.dims[dim].lifts.clocks;
+                    if let Some(s) = clocks.get_mut(&clock).and_then(|c| c.subs.get_mut(i)) {
+                        s.1.extras.controls.clone_from(&carried.controls);
+                        s.1.extras.disabled.clone_from(&carried.disabled);
+                    }
+                });
+            }
+            _ => {
+                PULLEY_CARRIED.with_borrow_mut(|c| c.insert((dim, pos), carried));
+            }
+        }
+        mark_unsaved(lv, clock);
+        return;
+    }
     let empty = carried.actors.is_empty() && carried.controls.is_empty() && carried.glue.is_empty();
     if !empty {
         PULLEY_CARRIED.with_borrow_mut(|c| c.insert((dim, pos), carried));
@@ -868,24 +1392,11 @@ pub(super) fn elevator_controls_clicked(
         e.y + f64::from(local[1]) + 0.5,
         f64::from(e.anchor[2] + local[2]) + 0.5,
     ];
-    let pos = at.map(|v| v.floor() + 0.5);
-    let blocks = mod_api::SoundSource::Blocks;
-    lv.level.play_sound(
-        &mut *lv.host,
-        "create:controller_click",
-        pos,
-        blocks,
-        1.0,
-        1.5,
-    );
-    lv.level.play_sound(
-        &mut *lv.host,
-        "create:contraption_assemble",
-        pos,
-        blocks,
-        0.75,
-        0.8,
-    );
+    // `CONTROLLER_CLICK.play(level, null, pos, 1, 1.5f)` and
+    // `CONTRAPTION_ASSEMBLE.play(level, null, pos, .75f, .8f)`.
+    let pos = at.map(|v| v.floor() as i32);
+    super::play_entry(lv, super::CONTROLLER_CLICK, pos, 1.0, 1.5);
+    super::play_entry(lv, super::CONTRAPTION_ASSEMBLE, pos, 0.75, 0.8);
     let Some(y) = target else {
         return true;
     };
@@ -990,6 +1501,14 @@ fn tick_elevators(lv: &mut ServerLevel<'_>) {
             }
         }
         elevator_doors(lv, pos);
+        // Arrived (`!wasArrived`): `CONTRAPTION_DISASSEMBLE` at .75 and .8 where its top is.
+        if reached.is_some() {
+            let offset = with_world(|w| w.dims[dim].lifts.elevators.get(&pos).map(|e| e.offset))
+                .flatten()
+                .unwrap_or(0.0);
+            let at = [pos[0], pos[1] - offset as i32, pos[2]];
+            super::play_entry(lv, super::CONTRAPTION_DISASSEMBLE, at, 0.75, 0.8);
+        }
         // `triggerContact`: an elevator contact there that isn't lit lights on its next tick.
         if let Some(c) = reached
             && let Some((Block::ElevatorContact, info)) = create_info(lv.block(c))
@@ -1174,14 +1693,14 @@ fn elevator_doors(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
         if prop("open") == Some(if open { "true" } else { "false" }) {
             continue;
         }
+        // `toggleDoor` cycles `OPEN`; the door rides hidden (`Contraption.capture`), which an
+        // elevator assembled before structures hid their doors learns here.
         let set: Vec<(&str, &str)> = props
             .iter()
-            .map(|(k, v)| {
-                if k == "open" {
-                    (k.as_str(), if open { "true" } else { "false" })
-                } else {
-                    (k.as_str(), v.as_str())
-                }
+            .map(|(k, v)| match k.as_str() {
+                "open" => (k.as_str(), if open { "true" } else { "false" }),
+                "visible" => (k.as_str(), "false"),
+                _ => (k.as_str(), v.as_str()),
             })
             .collect();
         if let Some(id) = state_with(&*lv.host, name, &set) {
@@ -1259,8 +1778,18 @@ fn assemble_elevator(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
     }
     let offset = i - 1;
     let anchor = below(pos, offset + 1);
-    let Ok(blocks) = pulley::gather(anchor, offset, |p| found(lv, p)) else {
-        return;
+    let gathered = super::gather_moving(
+        lv,
+        |lv| pulley::gather(anchor, offset, |p| found(lv, p)),
+        |g| super::cells_of(anchor, g),
+    );
+    let blocks = match gathered {
+        Ok(blocks) if !blocks.is_empty() => blocks,
+        Ok(_) => return,
+        Err(r) => {
+            super::set_exception(lv, pos, Some(&r));
+            return;
+        }
     };
     // `ElevatorContraption.capture`: its redstone contacts facing sideways; one, no more.
     let contacts: Vec<([i32; 3], Dir)> = blocks
@@ -1272,7 +1801,15 @@ fn assemble_elevator(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
             _ => None,
         })
         .collect();
+    // `ElevatorContraption.assemble`: one contact, no more, on a column no other elevator runs.
+    use create_engine::contraption::Refused;
     let [(local, facing)] = contacts[..] else {
+        let r = if contacts.is_empty() {
+            Refused::NoContacts
+        } else {
+            Refused::TooManyContacts
+        };
+        super::set_exception(lv, pos, Some(&r));
         return;
     };
     let (column, contact_y) = elevator::contraption_column(anchor, local, facing);
@@ -1284,8 +1821,10 @@ fn assemble_elevator(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
             .is_some_and(|c| c.active)
     });
     if conflict != Some(false) {
+        super::set_exception(lv, pos, Some(&Refused::ColumnConflict));
         return;
     }
+    super::set_exception(lv, pos, None);
     let mut carried = actors::carry(lv, pos, anchor, &blocks, |_| false);
     // An elevator's controls choose floors: none turns its kind off as it starts
     // (`ElevatorContraption.disableActorOnStart` does nothing), and they forget their filters
@@ -1793,6 +2332,39 @@ pub(super) fn chunk_save(lv: &ServerLevel<'_>, chunk: [i32; 2], data: &mut Compo
                     if let Some((_, m)) = &k.minute {
                         blocks_tags(&mut c, "2", m);
                     }
+                    // The minute hand's storage, glue and controls, apart from the hour
+                    // hand's.
+                    let minute = create_engine::clock::minute_key(*pos);
+                    if let Some(t) = actors::storage_to_nbt(lv, minute) {
+                        c.insert("storage2".into(), t);
+                    }
+                    PULLEY_CARRIED.with_borrow(|m| {
+                        if let Some(e) = m.get(&(dim, minute)) {
+                            let mut x = Compound::new();
+                            actors::extras_to_nbt(&mut x, e);
+                            c.insert("extras2".into(), Tag::Compound(x));
+                        }
+                    });
+                    // `SubContraptions`: what rides its hands.
+                    if !k.subs.is_empty() {
+                        let mut heads = Vec::new();
+                        for (i, (hand, s)) in k.subs.iter().enumerate() {
+                            heads.extend(s.bearing);
+                            heads.push(Dir::ALL.iter().position(|d| *d == s.facing).unwrap_or(0) as i32);
+                            heads.push(i32::from(*hand));
+                            blocks_tags(&mut c, &format!("s{i}"), &s.blocks);
+                            let key = create_engine::contraption::sub_key(*pos, i);
+                            if let Some(t) = actors::storage_to_nbt(lv, key) {
+                                c.insert(format!("storage_s{i}").as_str().into(), t);
+                            }
+                            let mut x = Compound::new();
+                            actors::extras_to_nbt(&mut x, &s.extras);
+                            if !x.is_empty() {
+                                c.insert(format!("extras_s{i}").as_str().into(), Tag::Compound(x));
+                            }
+                        }
+                        c.insert("subs".into(), Tag::IntArray(heads));
+                    }
                     (
                         0,
                         vec![
@@ -1808,6 +2380,14 @@ pub(super) fn chunk_save(lv: &ServerLevel<'_>, chunk: [i32; 2], data: &mut Compo
                 Held::Pulley(p) => {
                     blocks_tags(&mut c, "", &p.blocks);
                     super::limit_to_nbt(&mut c, p.limit);
+                    // `MirrorChildren`: the pulleys mirroring it.
+                    let mirrors = mirrors_of(dim, *pos);
+                    if !mirrors.is_empty() {
+                        c.insert(
+                            "mirrors".into(),
+                            Tag::IntArray(mirrors.into_iter().flatten().collect()),
+                        );
+                    }
                     (
                         1,
                         vec![
@@ -1911,6 +2491,14 @@ pub(super) fn chunk_load(lv: &mut ServerLevel<'_>, data: &Compound) {
             }
             let at = |i: usize| n.get(i).copied();
             let mut call = None;
+            if kind == 0 {
+                let minute = create_engine::clock::minute_key(pos);
+                actors::storage_from_nbt(lv, minute, c.get(&"storage2".into()));
+                if let Some(Tag::Compound(x)) = c.get(&"extras2".into()) {
+                    let e = actors::extras_from_nbt(x);
+                    PULLEY_CARRIED.with_borrow_mut(|m| m.insert((lv.dim, minute), e));
+                }
+            }
             let held = match kind {
                 0 => Held::Clock(RunningClock {
                     clock: create_engine::clock::Clock {
@@ -1922,6 +2510,31 @@ pub(super) fn chunk_load(lv: &mut ServerLevel<'_>, data: &Compound) {
                     rpm: f(at(4)?),
                     hour: blocks(c, "")?,
                     minute: blocks(c, "2").map(|b| (at(5).unwrap_or(0), b)),
+                    subs: match c.get(&"subs".into()) {
+                        Some(Tag::IntArray(h)) => h
+                            .as_chunks::<5>()
+                            .0
+                            .iter()
+                            .enumerate()
+                            .filter_map(|(i, h)| {
+                                let key = create_engine::contraption::sub_key(pos, i);
+                                let saved = c.get(&format!("storage_s{i}").as_str().into());
+                                actors::storage_from_nbt(lv, key, saved);
+                                let sub = create_engine::contraption::Stabilized {
+                                    bearing: [h[0], h[1], h[2]],
+                                    facing: dir(h[3]),
+                                    blocks: blocks(c, &format!("s{i}"))?,
+                                    extras: match c.get(&format!("extras_s{i}").as_str().into())
+                                    {
+                                        Some(Tag::Compound(x)) => actors::extras_from_nbt(x),
+                                        _ => Default::default(),
+                                    },
+                                };
+                                Some((h[4].clamp(0, 1) as u8, sub))
+                            })
+                            .collect(),
+                        _ => Vec::new(),
+                    },
                 }),
                 1 => {
                     let mut x = create_engine::pulley::Pulley::new(
@@ -1934,6 +2547,14 @@ pub(super) fn chunk_load(lv: &mut ServerLevel<'_>, data: &Compound) {
                     x.rpm = f(at(6)?);
                     x.waiting = at(7) == Some(1);
                     x.limit = super::limit_from_nbt(lv.dim, pos, c);
+                    if let Some(Tag::IntArray(m)) = c.get(&"mirrors".into()) {
+                        let dim = lv.dim;
+                        MIRRORS.with_borrow_mut(|mirrors| {
+                            for child in m.as_chunks::<3>().0 {
+                                mirrors.insert((dim, *child), pos);
+                            }
+                        });
+                    }
                     Held::Pulley(x)
                 }
                 2 => {

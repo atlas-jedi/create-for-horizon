@@ -98,6 +98,22 @@ pub fn amount(brass: bool) -> u32 {
     if brass { 64 } else { 1 }
 }
 
+/// `AllSoundEvents.FUNNEL_FLAP`, which `FunnelBlockEntity.flap` plays at the funnel at volume and
+/// pitch 1: the vanilla sounds it is made of (`playExisting`), each with its volume and pitch.
+pub const FLAP_SOUNDS: [(&str, f32, f32); 2] = [
+    ("minecraft:entity.item_frame.rotate_item", 0.125, 1.5),
+    ("minecraft:block.wool.break", 0.0425, 0.75),
+];
+
+/// `createChasingFlap`'s `startWithValue(.25f)` (`FunnelBlockEntity`, `BeltTunnelBlockEntity`):
+/// where a funnel's or tunnel's flaps start when its block entity appears on a client, swinging
+/// back to rest from there.
+pub const FLAP_AT_START: f32 = 0.25;
+
+/// `ItemEntity.setDefaultPickUpDelay`: the ticks before a stack an extracting funnel drops can be
+/// picked up (`activateExtractor`).
+pub const OUTPUT_PICKUP_DELAY: u32 = 10;
+
 /// Where an extracted stack appears and how it moves (`activateExtractor`).
 pub fn output(pos: [i32; 3], facing: Dir) -> ([f64; 3], [f64; 3]) {
     let o = facing.offset().map(f64::from);
@@ -292,6 +308,50 @@ pub fn filter_slot(facing: Dir, shape: Option<BeltShape>, side: Dir) -> Option<[
     })
 }
 
+/// `FunnelBlock.useItemOn`: whether a click on face `face` of a funnel facing `facing` (not a
+/// belt funnel: `BeltFunnelBlock` has no `useItemOn`) puts the held item `held` into the
+/// inventory behind it: on its opening, while it inserts and is unpowered
+/// (`canInsertIntoFunnel`), with anything but a wrench or a mechanical arm. An empty hand's click
+/// is taken too (`SUCCESS`), moving nothing.
+pub fn inserts_click(
+    facing: Dir,
+    extracting: bool,
+    powered: bool,
+    face: Dir,
+    held: Option<&str>,
+) -> bool {
+    !matches!(held, Some("create:wrench" | "create:mechanical_arm"))
+        && !extracting
+        && !powered
+        && face == facing
+}
+
+/// `FunnelFilterSlotPositioning.rotate`: how the filter slot on `side` of a funnel facing
+/// `facing` (a belt funnel: its `shape`) turns, in degrees about y, then about x. A vertical
+/// funnel's and a retracted belt funnel's turn as `Sided.rotate` (the side's horizontal angle
+/// plus 180°, 90° up on top, 270° below); a sideways funnel's and a pulling or pushing belt
+/// funnel's tilt back 22.5° more; an extended belt funnel's slot on its top turns with the
+/// funnel's facing (`horizontalAngle(facing)`, 90° up).
+pub fn filter_rotation(facing: Dir, shape: Option<BeltShape>, side: Dir) -> (f32, f32) {
+    use crate::decor::horizontal_angle;
+    let sided = (
+        horizontal_angle(side) + 180.0,
+        match side {
+            Dir::Up => 90.0,
+            Dir::Down => 270.0,
+            _ => 0.0,
+        },
+    );
+    if facing.axis() == crate::kinetics::Axis::Y {
+        return sided;
+    }
+    match shape {
+        Some(BeltShape::Extended) => (horizontal_angle(facing), 90.0),
+        Some(BeltShape::Retracted) => sided,
+        Some(BeltShape::Pulling | BeltShape::Pushing) | None => (sided.0, sided.1 - 22.5),
+    }
+}
+
 /// `FunnelBlock.entityInside`'s test for an item at `at` in the funnel at `pos` facing `facing`:
 /// on the open side of its opening (the centre moved a quarter block toward its back), seen
 /// along its facing.
@@ -372,6 +432,48 @@ mod tests {
         // An extended belt funnel: on top only.
         assert!(filter_slot(Dir::North, Some(BeltShape::Extended), Dir::Up).is_some());
         assert!(filter_slot(Dir::North, Some(BeltShape::Extended), Dir::North).is_none());
+    }
+
+    #[test]
+    fn a_click_on_an_inserting_funnels_opening_puts_the_held_item_in() {
+        let click = |extracting, powered, face, held| {
+            inserts_click(Dir::North, extracting, powered, face, held)
+        };
+        assert!(click(false, false, Dir::North, Some("minecraft:cobblestone")));
+        assert!(click(false, false, Dir::North, None));
+        // Not on another face, not while extracting or powered.
+        assert!(!click(false, false, Dir::South, Some("minecraft:cobblestone")));
+        assert!(!click(true, false, Dir::North, Some("minecraft:cobblestone")));
+        assert!(!click(false, true, Dir::North, Some("minecraft:cobblestone")));
+        // A wrench or an arm passes on to its own use.
+        assert!(!click(false, false, Dir::North, Some("create:wrench")));
+        assert!(!click(false, false, Dir::North, Some("create:mechanical_arm")));
+    }
+
+    #[test]
+    fn a_funnels_filter_slot_turns_as_create_s_does() {
+        // A wall funnel facing east: `Sided.rotate` for the east face (-270° + 180°), tilted back.
+        assert_eq!(filter_rotation(Dir::East, None, Dir::East), (-90.0, -22.5));
+        // A floor funnel's slot on its north side: no tilt.
+        assert_eq!(filter_rotation(Dir::Up, None, Dir::North), (360.0, 0.0));
+        // A retracted belt funnel: no tilt; a pulling one: tilted.
+        assert_eq!(
+            filter_rotation(Dir::North, Some(BeltShape::Retracted), Dir::North),
+            (360.0, 0.0)
+        );
+        assert_eq!(
+            filter_rotation(Dir::South, Some(BeltShape::Pulling), Dir::South),
+            (180.0, -22.5)
+        );
+        // An extended belt funnel's slot on top turns with its facing, not as a top face's.
+        assert_eq!(
+            filter_rotation(Dir::East, Some(BeltShape::Extended), Dir::Up),
+            (-270.0, 90.0)
+        );
+        assert_eq!(
+            filter_rotation(Dir::South, Some(BeltShape::Extended), Dir::Up),
+            (0.0, 90.0)
+        );
     }
 
     #[test]

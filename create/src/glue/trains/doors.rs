@@ -2,11 +2,15 @@
 //! `DoorControlBehaviour`): while a train stands still at a station, the sliding doors on its
 //! carriages facing a way the station's door control lets open (all, one side, or none) open,
 //! as does a door in the world right in front of one; they close when it leaves. The mode is the
-//! station's block entity data (`DoorControl`, Create's key), set from its screen. Doors are
-//! looked at every 4 ticks, not every tick as Create's movement behaviour does.
+//! station's block entity data (`DoorControl`, Create's key), set from its screen. A door whose
+//! kind the carriage's contraption controls turned off stays shut (`context.disabled`). Doors
+//! are looked at every 4 ticks, not every tick as Create's movement behaviour does.
 //!
-//! A carriage's blocks are vanilla block displays here, so an open door is shown as Create's
-//! door once its panels are hidden (`open`, not `visible`), not sliding aside on the way.
+//! A carriage's blocks are vanilla block displays here. A door rides hidden (`visible` false,
+//! `Contraption.capture`), and its displays show what `SlidingDoorRenderer` draws: its halves
+//! closed, slid aside when open, or a folding door's leaves (`visuals::slide_door`), gliding
+//! evenly over the panel's 7 ticks where Create's panel moves by the square of how far it has
+//! got.
 
 use super::super::server::{ServerLevel, update_all};
 use super::super::world::with_world;
@@ -71,9 +75,10 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
     let host = &*lv.host;
     // Each train: its id, the station it stands still at, and each carriage's doors (offset,
     // state, open now, local facing) with the carriage's centre, turn and pivot.
+    // Each door also says whether contraption controls turned its kind off.
     type CarDoors = (
         usize,
-        Vec<([i32; 3], u32, bool, Dir)>,
+        Vec<([i32; 3], u32, bool, Dir, bool)>,
         [f64; 3],
         i32,
         [f64; 3],
@@ -89,7 +94,7 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
                     .iter()
                     .enumerate()
                     .filter_map(|(c, car)| {
-                        let doors: Vec<([i32; 3], u32, bool, Dir)> = car
+                        let doors: Vec<([i32; 3], u32, bool, Dir, bool)> = car
                             .iter()
                             .filter_map(|(o, s)| {
                                 let st = super::car_state(*s)?;
@@ -101,7 +106,8 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
                                     props.iter().find(|(n, _)| n == k).map(|(_, v)| v.as_str())
                                 };
                                 let facing = prop("facing").and_then(dir_named)?;
-                                Some((*o, *s, prop("open") == Some("true"), facing))
+                                let off = super::actors::door_off(dim, t.id, c, &name);
+                                Some((*o, *s, prop("open") == Some("true"), facing, off))
                             })
                             .collect();
                         if doors.is_empty() {
@@ -137,7 +143,7 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
     for (id, station, cars) in trains {
         let mode = station.map(|p| mode(lv, p));
         for (c, doors, centre, quarter, pivot) in cars {
-            for (o, s, open, facing) in doors {
+            for (o, s, open, facing, off) in doors {
                 // `getDoorFacing`: the positive way along its axis, turned outward from the
                 // carriage's centre, then turned with the carriage.
                 let axis = facing.axis();
@@ -160,7 +166,8 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
                 let Some(world) = Dir::ALL.into_iter().find(|d| d.offset() == turned) else {
                     continue;
                 };
-                let should = mode.is_some_and(|m| matches(m, world));
+                // `shouldOpen`: never while its kind is turned off (`context.disabled`).
+                let should = !off && mode.is_some_and(|m| matches(m, world));
                 if should == open {
                     continue;
                 }
@@ -177,17 +184,15 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
     if changes.is_empty() {
         return;
     }
-    let mut touched: Vec<(u32, usize)> = Vec::new();
     for (id, c, o, s, block, world, open) in changes {
         let Some(st) = super::car_state(s) else {
             continue;
         };
-        let (o_, v) = if open {
-            ("true", "false")
-        } else {
-            ("false", "true")
-        };
-        let Some(next) = super::with_props(&*lv.host, st, &[("open", o_), ("visible", v)]) else {
+        // `toggleDoor` cycles `OPEN`; the door rides hidden (`Contraption.capture`), which a
+        // train assembled before structures hid their doors learns here.
+        let o_ = if open { "true" } else { "false" };
+        let Some(next) = super::with_props(&*lv.host, st, &[("open", o_), ("visible", "false")])
+        else {
             continue;
         };
         let next = super::car_id(next);
@@ -202,9 +207,7 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
         if let Some(col) = column {
             super::super::persist::mark_unsaved(dim, [col.0, col.1]);
         }
-        if !touched.contains(&(id, c)) {
-            touched.push((id, c));
-        }
+        super::visuals::slide_door(lv, id, c, o, open);
         // A door in the world in front of it, along the same axis, opens and closes with it.
         let f = world.offset();
         let front = [block[0] + f[0], block[1] + f[1], block[2] + f[2]];
@@ -234,8 +237,5 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
                 1.0,
             );
         }
-    }
-    for (id, c) in touched {
-        super::visuals::refresh_car(lv, id, c);
     }
 }

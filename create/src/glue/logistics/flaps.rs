@@ -1,6 +1,7 @@
 //! Funnels' and tunnels' flaps: the server notes each flap (`FunnelBlockEntity.flap`,
 //! `BeltTunnelBlockEntity.flap`) and writes them to its block entity after the tick (as
-//! `FunnelFlapPacket`, `TunnelFlapPacket` bring them); clients swing them back to rest
+//! `FunnelFlapPacket`, `TunnelFlapPacket` bring them), with a funnel's sound (`FUNNEL_FLAP`,
+//! which Create's client plays as the packet arrives); clients swing them back to rest
 //! (`LerpedFloat` chasing 0) and draw them
 //! (`FlapStuffs.renderFlaps`).
 
@@ -22,19 +23,43 @@ thread_local! {
     /// Flaps noted this tick: level, block, side and inward.
     #[allow(clippy::type_complexity)]
     static FLAPS: RefCell<Vec<(usize, [i32; 3], u8, bool)>> = const { RefCell::new(Vec::new()) };
+    /// Funnels heard this tick (`FunnelFlapPacket`): level and block.
+    static SOUNDS: RefCell<Vec<(usize, [i32; 3])>> = const { RefCell::new(Vec::new()) };
 }
 
-/// `FunnelBlockEntity.flap`: the funnel at `pos` flaps in or out, when it has a flap
-/// (`hasFlap`: facing sideways).
-pub fn funnel(lv: &ServerLevel<'_>, pos: [i32; 3], inward: bool) {
-    let Some((block, info)) = info_at(lv, pos) else {
-        return;
-    };
-    if !create_engine::funnel::is_funnel(block) || info.facing.is_none_or(|f| f.axis() == Axis::Y) {
-        return;
+/// Whether the funnel at `pos` has a flap (`hasFlap`: facing sideways); None for no funnel.
+fn has_flap(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Option<bool> {
+    let (block, info) = info_at(lv, pos)?;
+    if !create_engine::funnel::is_funnel(block) {
+        return None;
     }
-    let dim = lv.dim;
-    FLAPS.with_borrow_mut(|f| f.push((dim, pos, FUNNEL, inward)));
+    Some(info.facing.is_some_and(|f| f.axis() != Axis::Y))
+}
+
+/// `FunnelBlockEntity.flap` where Create asks `hasFlap` first (`AbstractFunnelBlock.tryInsert`)
+/// or on a belt funnel (always sideways): the funnel at `pos` flaps in or out, and is heard,
+/// when it has a flap.
+pub fn funnel(lv: &ServerLevel<'_>, pos: [i32; 3], inward: bool) {
+    if has_flap(lv, pos) == Some(true) {
+        note_funnel(lv.dim, pos, Some(inward));
+    }
+}
+
+/// `FunnelBlockEntity.flap(false)` from `activateExtractor`, which does not ask `hasFlap`: the
+/// funnel at `pos` is heard whatever its facing; one facing sideways also flaps out.
+pub fn funnel_extracted(lv: &ServerLevel<'_>, pos: [i32; 3]) {
+    if let Some(flap) = has_flap(lv, pos) {
+        note_funnel(lv.dim, pos, flap.then_some(false));
+    }
+}
+
+/// A funnel's `flap` in level `dim`: its sound, and its flap in (`Some(true)`) or out when it
+/// swings one.
+fn note_funnel(dim: usize, pos: [i32; 3], flap: Option<bool>) {
+    if let Some(inward) = flap {
+        FLAPS.with_borrow_mut(|f| f.push((dim, pos, FUNNEL, inward)));
+    }
+    SOUNDS.with_borrow_mut(|s| s.push((dim, pos)));
 }
 
 /// `BeltTunnelInteractionHandler.flapTunnel`: the tunnel over the belt segment `segment` flaps
@@ -51,9 +76,33 @@ pub fn tunnel(lv: &ServerLevel<'_>, segment: [i32; 3], side: Dir, inward: bool) 
 }
 
 /// This tick's flaps of this level go to their block entities (`FunnelFlapPacket`,
-/// `TunnelFlapPacket`), for their clients to swing them.
+/// `TunnelFlapPacket`), for their clients to swing them; each funnel heard plays
+/// `FUNNEL_FLAP` at its centre, once a tick.
 pub fn send(lv: &mut ServerLevel<'_>) {
     let dim = lv.dim;
+    let mut heard: Vec<[i32; 3]> = SOUNDS.with_borrow_mut(|s| {
+        if s.is_empty() {
+            return Vec::new();
+        }
+        let mine = s.iter().filter(|e| e.0 == dim).map(|e| e.1).collect();
+        s.retain(|e| e.0 != dim);
+        mine
+    });
+    heard.sort_unstable();
+    heard.dedup();
+    for pos in heard {
+        let at = pos.map(|v| f64::from(v) + 0.5);
+        for (sound, volume, pitch) in create_engine::funnel::FLAP_SOUNDS {
+            let _ = lv.level.play_sound(
+                &mut *lv.host,
+                sound,
+                at,
+                mod_api::SoundSource::Blocks,
+                volume,
+                pitch,
+            );
+        }
+    }
     let mut mine: Vec<([i32; 3], u8, bool)> = FLAPS.with_borrow_mut(|f| {
         if f.is_empty() {
             return Vec::new();

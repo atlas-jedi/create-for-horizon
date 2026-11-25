@@ -27,10 +27,14 @@ use mod_api::{
     Registrar, ServerHost, SoundSource, UseItemOnEvent,
 };
 
-/// Attaches the clicks to shafts and to every block with a cog.
+/// Attaches the clicks to shafts, to every block with a cog and to the speed controller.
 pub fn register(r: &mut dyn Registrar) {
     for &block in Block::ALL.iter() {
-        if matches!(block, Block::Shaft | Block::PoweredShaft) || has_cog(block) {
+        if matches!(
+            block,
+            Block::Shaft | Block::PoweredShaft | Block::RotationSpeedController
+        ) || has_cog(block)
+        {
             r.block_part(states::key(block), Clicked);
         }
     }
@@ -200,9 +204,42 @@ impl mod_api::BlockPart for Clicked {
             Block::Cogwheel | Block::LargeCogwheel => {
                 encase(&mut lv, block, info.axis?, pos, &item)
             }
+            // SpeedControllerBlock.useItemOn (its `PlacementHelper`): a large cog clicked on any
+            // face of the controller goes above it, across its axis.
+            Block::RotationSpeedController if item == "create:large_cogwheel" => {
+                let (at, axis) = controller_target(&lv, pos, info.axis?)?;
+                Some(place_helped(
+                    &mut lv,
+                    player,
+                    click,
+                    stack,
+                    Block::LargeCogwheel,
+                    at,
+                    axis,
+                ))
+            }
             _ => None,
         }
     }
+}
+
+/// `SpeedControllerBlock.PlacementHelper.getOffset`: the large cog's place above the controller
+/// at `pos` on its horizontal `axis` and the cog's axis across it, when that place can be
+/// replaced and a large cog may stand there (`isValidCogwheelPosition`).
+fn controller_target(
+    lv: &ServerLevel<'_>,
+    pos: [i32; 3],
+    axis: Axis,
+) -> Option<([i32; 3], Axis)> {
+    let above = add(pos, Dir::Up);
+    if !lv.free(above) {
+        return None;
+    }
+    let across = if axis == Axis::X { Axis::Z } else { Axis::X };
+    let dim = lv.dim;
+    with_world(|w| w.valid_cog_position(dim, above, true, across))
+        .unwrap_or(false)
+        .then_some((above, across))
 }
 
 /// The cog helpers: where a cog item clicked on the cog at `pos` goes, placed there.
@@ -264,11 +301,19 @@ fn pole_target(
             pos,
             axis,
             hit,
+            // `PoleHelper.matchesAxis`: an `AbstractSimpleShaftBlock` (shaft, cog, large cog) or
+            // a powered shaft along the axis; the line runs on through cogs.
             |p| {
                 w.state_at(dim, p)
                     .and_then(|s| w.table.get(s))
                     .is_some_and(|(b, i)| {
-                        matches!(b, Block::Shaft | Block::PoweredShaft) && i.axis == Some(axis)
+                        matches!(
+                            b,
+                            Block::Shaft
+                                | Block::PoweredShaft
+                                | Block::Cogwheel
+                                | Block::LargeCogwheel
+                        ) && i.axis == Some(axis)
                     })
             },
             |p| lv.free(p),
@@ -306,6 +351,9 @@ pub(crate) fn helper_target(
             let along = info.axis?;
             pole_target(lv, pos, point, along).map(|at| (at, axis(along)))
         }
+        Block::RotationSpeedController if large == Some(true) => {
+            controller_target(lv, pos, info.axis?).map(|(at, a)| (at, axis(a)))
+        }
         _ => None,
     }
 }
@@ -331,8 +379,10 @@ fn pole(
     Some(place_helped(lv, player, click, stack, block, at, axis))
 }
 
-/// `PlacementOffset.placeInWorld`: the held block at `at` on `axis` (waterlogged in water), its
-/// place sound, one used up outside creative.
+/// `PlacementOffset.placeInWorld`: the held block at `at` on `axis` (waterlogged in a water
+/// source), heard by the subsystems as a player's placement (`EntityPlaceEvent` and
+/// `setPlacedBy`: the symmetry wand, the block's owner, its rotation indicators, the Shifting
+/// Gears advancement), its place sound, one used up outside creative.
 fn place_helped(
     lv: &mut ServerLevel<'_>,
     player: PlayerRef,
@@ -351,10 +401,11 @@ fn place_helped(
     } else {
         block
     };
+    // `getFluidState(pos).getType() == Fluids.WATER`: a source, not flowing water.
     let water = lv
         .block_state(at)
         .and_then(|s| lv.host.block_state_string(s))
-        .is_some_and(|t| t.starts_with("minecraft:water"));
+        .is_some_and(|t| t == "minecraft:water[level=0]" || t == "minecraft:water");
     let props = [
         ("axis", axis_name(axis)),
         ("waterlogged", if water { "true" } else { "false" }),
@@ -362,6 +413,19 @@ fn place_helped(
     let Some(state) = state_of(&*lv.host, block, &props) else {
         return InteractionResult::Pass;
     };
+    // `BlockEvent.EntityPlaceEvent` and `setPlacedBy`, as the deployer's placement is heard; a
+    // subsystem that cancels it keeps the block from being placed.
+    let mut placed = super::subsystem::Placed {
+        placer: Some(player.entity()),
+        pos: mod_api::BlockPos::new(at[0], at[1], at[2]),
+        state,
+        cancelled: false,
+    };
+    for s in super::SUBSYSTEMS {
+        if let mod_api::Flow::Cancel = s.entity_place(&mut *lv.host, &mut placed) {
+            return InteractionResult::Fail;
+        }
+    }
     lv.set_state(at, state, update_all());
     lv.place_sound(at);
     use_one(&mut *lv.host, player, click.hand, stack);

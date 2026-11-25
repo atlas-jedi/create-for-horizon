@@ -1,10 +1,15 @@
 //! Create's mechanical saw facing up (`SawBlockEntity` processing): an item dropped on it is
 //! cut by its cutting recipes (taking turns when several fit), then thrown off the way it turns.
+//! A package is opened instead, its contents thrown off.
 
 use crate::processing::{Recipe, Rng, roll};
 use crate::sequenced::{Advanced, Assembly, Progress};
 
-/// The saw's inventory (`ProcessingInventory`): the input, then up to 9 results.
+/// The result slots after the input's (`ProcessingInventory`'s 32 slots, slot 0 the input's).
+pub const RESULTS: usize = 31;
+
+/// The saw's inventory (`ProcessingInventory`): the input, then up to 31 results. Items are
+/// named as the glue names stacks: an id, or an id with its components for a stack with some.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Saw {
     pub slots: Vec<(String, u8)>,
@@ -121,7 +126,20 @@ impl Saw {
                 crate::processing::add_to_list(&mut list, r.to_owned(), 1, &max);
             }
         }
-        list.truncate(9);
+        list.truncate(RESULTS);
+        self.slots = list;
+        self.progress = None;
+    }
+
+    /// `applyRecipe` for a package (`PackageItem.isPackage`, ahead of any recipe): the package
+    /// goes (`inventory.clear()`) and its `contents` take the result slots, merged into stacks
+    /// of at most `max` (`ItemHelper.addToList`). An empty package leaves nothing.
+    pub fn unpack(&mut self, contents: &[(String, u8)], max: impl Fn(&str) -> u8) {
+        let mut list: Vec<(String, u8)> = Vec::new();
+        for (item, n) in contents {
+            crate::processing::add_to_list(&mut list, item.clone(), *n, &max);
+        }
+        list.truncate(RESULTS);
         self.slots = list;
         self.progress = None;
     }
@@ -156,7 +174,7 @@ impl Saw {
             }
         }
         self.slots = list;
-        self.slots.truncate(9);
+        self.slots.truncate(RESULTS);
     }
 }
 
@@ -264,6 +282,50 @@ mod tests {
         assert_eq!(none.insert(2, "minecraft:dirt", &[], true), 0);
         none.insert(0, "minecraft:dirt", &[], true);
         assert_eq!(none.remaining, 10.0);
+    }
+
+    #[test]
+    fn a_package_is_opened_into_its_contents() {
+        // Create: no cutting recipe takes a package, so it waits 10 ticks (`start`), then
+        // `applyRecipe` opens it instead of cutting: its stacks, merged, are the results.
+        let package = "create:cardboard_package_12x12#0a";
+        let mut s = Saw::default();
+        assert_eq!(s.insert(0, package, &[], true), 1);
+        assert_eq!(s.remaining, 10.0);
+        let mut ticks = 1;
+        while s.tick(32.0) != Step::Apply {
+            ticks += 1;
+        }
+        assert_eq!(ticks, 4, "10 at 1.33 a tick: under 5 on the 4th tick");
+        let contents = [
+            ("minecraft:cobblestone".to_owned(), 40),
+            ("minecraft:cobblestone".to_owned(), 40),
+            ("minecraft:ender_pearl".to_owned(), 10),
+            ("minecraft:ender_pearl".to_owned(), 10),
+            ("minecraft:stone#0b".to_owned(), 3),
+        ];
+        let max = |i: &str| if i == "minecraft:ender_pearl" { 16 } else { 64 };
+        s.unpack(&contents, max);
+        assert_eq!(
+            s.slots,
+            vec![
+                ("minecraft:cobblestone".to_owned(), 64),
+                ("minecraft:cobblestone".to_owned(), 16),
+                ("minecraft:ender_pearl".to_owned(), 16),
+                ("minecraft:ender_pearl".to_owned(), 4),
+                ("minecraft:stone#0b".to_owned(), 3),
+            ]
+        );
+        assert!(s.applied);
+        // Thrown off as any cut is.
+        while s.tick(32.0) != Step::Out {}
+        // An empty package leaves nothing.
+        let mut empty = Saw {
+            slots: vec![(package.to_owned(), 1)],
+            ..Saw::default()
+        };
+        empty.unpack(&[], |_| 64);
+        assert!(empty.slots.is_empty());
     }
 
     #[test]

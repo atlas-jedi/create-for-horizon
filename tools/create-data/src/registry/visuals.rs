@@ -7,8 +7,8 @@ const COUPLING: &str = "assets/create/models/block/minecart_coupling/";
 const CHAIN: &str = "assets/create/models/block/chain_conveyor/chain_";
 const BLOCK_ATLAS: &str = "assets/minecraft/atlases/blocks.json";
 const SHADER: &str = "assets/create/shaders/pipeline/textured.wgsl";
-const CONNECTED: &str = "assets/create/sunrise/connected/";
-const CONNECTED_TABLES: &str = "assets/create/sunrise/connected_tables/";
+const CONNECTED: &str = "assets/create/horizon/connected/";
+const CONNECTED_TABLES: &str = "assets/create/horizon/connected_tables/";
 
 pub(crate) const SPINNING_TOOLS: [(&str, &[&str]); 3] = [
     ("wrench", &["item", "gear"]),

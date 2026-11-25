@@ -19,7 +19,8 @@
 //! logistics' `insert_into_from`, which in turn hands belts' items to upward saws, basins,
 //! millstones and crushing wheels (`belt_input`). A basin turns its spout toward such a taker
 //! diagonally below it (`spoutput`). The basin's, the upward saw's and the deployer's filter
-//! slots are `filtering`'s.
+//! slots are `filtering`'s. What the mixer, millstone, crushing wheels and blaze burner do on a
+//! client alone (their noise, crumbs and flames) is `ambient`'s.
 //!
 //! Left out, the API having no way yet:
 //! - A toolbox's one item kind per compartment: `ModContainer` has no per-slot insert check.
@@ -33,11 +34,17 @@
 //! - The deployer's punch at full strength (`DeployerFakePlayer.getCurrentItemAttackStrengthDelay`
 //!   of 1/64): the game's fake player attacks with its own, uncharged, attack strength, so a
 //!   punch deals about a fifth of its damage.
+//! - A lit blaze burner's smoke, crackle and lava or soul sparks (`LitBlazeBurnerBlock
+//!   .animateTick`): the game calls no `animateTick` for a mod's block, and this one has no block
+//!   entity whose client tick could stand in (the burner's and the controller's do, `ambient`).
+//! - A basin's fluid surface specks (`BasinBlockEntity.createFluidParticles`, Create's
+//!   `basin_fluid` particle): Create's own particle types with their data can't be registered.
 //!
 //! A blaze burner carried by a moving structure is drawn by the structure's anchor
 //! (`burner_draw::draw_moving`): its blaze faces its front rather than the nearest player.
 
 mod air;
+mod ambient;
 mod application;
 pub(crate) mod basin;
 pub(crate) mod burner_draw;
@@ -60,6 +67,7 @@ pub mod recipes;
 pub(crate) mod saw;
 mod spoutput;
 mod stacks;
+pub(crate) use stacks::item_tagged;
 pub(crate) mod toolbelt;
 
 pub use containers::TOOLBOX_TYPE;
@@ -146,6 +154,8 @@ impl Subsystem for Processing {
             crafter::CRAFTER_KEY,
             saw::SAW_KEY,
             spoutput::VISUALIZED_KEY,
+            ambient::MILL_KEY,
+            ambient::CRUSH_KEY,
         ]
     }
 
@@ -158,6 +168,7 @@ impl Subsystem for Processing {
         let kind = r.block_entity_type_key(super::kinetics::TYPE);
         r.block_entity_capability_before_game(&mod_api::ITEMS, &kind, crate::glue::compat::be_offer(provide_items));
         client::register(r);
+        ambient::register(r);
         air::register(r);
         // Entity Part state is offered to native mods only.
         #[cfg(not(target_arch = "wasm32"))]
@@ -171,6 +182,9 @@ impl Subsystem for Processing {
             r.block_part(super::states::key(block), saw::Blades);
         }
         r.block_part(super::states::key(Block::BlazeBurner), BurnerPlacement);
+        for block in [Block::Basin, Block::CrushingWheel] {
+            r.block_part(super::states::key(block), Survival);
+        }
         toolbelt::register(r);
         operator::register(r);
         for b in Block::ALL
@@ -191,6 +205,7 @@ impl Subsystem for Processing {
         spoutput::clear();
         crafter::clear();
         fist::clear();
+        ambient::clear();
     }
 
     fn tags_updated(&self, cx: &dyn mod_api::Host) {
@@ -234,6 +249,16 @@ impl Subsystem for Processing {
         fields: &mut Compound,
     ) {
         persist::live_fields(dim, pos, block, fields);
+    }
+
+    /// `DrillBlock.neighborChanged` (the drill looks at the block in front again) and
+    /// `EncasedFanBlock.neighborChanged` (`blockInFrontChanged`: the current is rebuilt).
+    fn neighbor_changed(&self, dim: usize, pos: [i32; 3], state: u32) {
+        match with_world(|w| w.table.get(state).map(|(b, _)| b)).flatten() {
+            Some(Block::MechanicalDrill) => saw::neighbor_changed(dim, pos),
+            Some(Block::EncasedFan) => fan::neighbor_changed(dim, pos),
+            _ => {}
+        }
     }
 
     /// Legacy `level_tick_post` order: crafters, millstones, fans, crushers, burners, mixers.
@@ -302,6 +327,23 @@ impl Subsystem for Processing {
         true
     }
 
+    /// `BasinBlockEntity.addToGoggleTooltip`: what the basin holds.
+    /// `DeployerBlockEntity.addToGoggleTooltip`: its mode and what it holds.
+    fn goggle_tooltip(
+        &self,
+        host: &dyn ClientHost,
+        pos: [i32; 3],
+        block: Block,
+        lines: &mut Vec<Vec<(String, u32)>>,
+    ) {
+        if block == Block::Basin {
+            basin::goggle_lines(host, pos, lines);
+        }
+        if block == Block::Deployer {
+            client::deployer_goggles(host, pos, lines);
+        }
+    }
+
     fn player_joined(&self, host: &mut dyn ServerHost, player: PlayerRef) {
         press::player_joined(host, player);
         deployer::player_joined(host, player);
@@ -337,6 +379,7 @@ impl Subsystem for Processing {
 
     fn client_tick(&self, host: &mut dyn ClientHost) {
         client::tick(host);
+        ambient::tick(host);
         toolbelt::client_tick(host);
         air::tick(host);
     }
@@ -356,6 +399,7 @@ impl Subsystem for Processing {
 
     fn client_reset(&self) {
         air::reset();
+        ambient::reset();
         client::reset();
         toolbelt::client_reset();
     }
@@ -470,7 +514,12 @@ impl Subsystem for Processing {
                     return mod_api::Flow::Cancel;
                 }
                 if let Some(block) = block
-                    && passes_item_use(&*host, block, click.stack)
+                    && passes_item_use(
+                        &*host,
+                        block,
+                        click.stack,
+                        block == Block::Basin && basin::shown_fluid(&*host, click.pos),
+                    )
                 {
                     *event.use_block = mod_api::TriState::False;
                 }
@@ -510,16 +559,20 @@ fn passes_item_use(
     host: &dyn mod_api::Host,
     block: Block,
     stack: Option<&mod_api::ItemStack>,
+    sponge: bool,
 ) -> bool {
     let Some(stack) = stack else {
         return false;
     };
     match block {
         Block::Millstone => true,
-        // `BasinBlock.useItemOn`: what isn't a fluid container (only buckets here).
+        // `BasinBlock.useItemOn`: what isn't a fluid container (only buckets here), nor a
+        // sponge while the basin holds fluid (`sponge` tells).
         Block::Basin => {
             let id = stacks::id(host, stack);
-            id != "minecraft:bucket" && create_engine::tank::Fluid::of_bucket(&id).is_none()
+            id != "minecraft:bucket"
+                && create_engine::tank::Fluid::of_bucket(&id).is_none()
+                && !(id == "minecraft:sponge" && sponge)
         }
         _ => false,
     }
@@ -584,8 +637,8 @@ fn provide_items(
 /// The basin, the saw and the millstone taking an item that lands on them
 /// (`updateEntityAfterFallOn`): a basin puts it into its inputs, a saw
 /// facing up takes it to cut, a millstone into its input when it can mill it. Stacks with
-/// components stay entities, but on a saw a sequenced assembly's transitional item (its
-/// progress with it).
+/// components stay entities, but on a saw, which keeps any stack whole (a package to open, a
+/// sequenced assembly's transitional item with its progress).
 struct Landing;
 
 #[mod_api::horizon_part]
@@ -606,9 +659,7 @@ impl BlockPart for Landing {
             return mod_api::Flow::Continue;
         };
         let block = lv.info(pos).map(|(b, _)| b);
-        let carried = block == Some(Block::MechanicalSaw)
-            && stack.damage() == 0
-            && stacks::sequenced_progress(stack).is_some();
+        let carried = block == Some(Block::MechanicalSaw);
         if (stack.components().is_some() || stack.damage() != 0) && !carried {
             return mod_api::Flow::Continue;
         }
@@ -619,6 +670,46 @@ impl BlockPart for Landing {
             _ => {}
         }
         mod_api::Flow::Continue
+    }
+}
+
+/// Where a basin or a crushing wheel may be placed (`canSurvive`; their templates never ask it
+/// again after): a basin not right under a mixer or press (`BasinBlock`), a crushing wheel
+/// touching other wheels only along its axis and on it, and no controller across it
+/// (`CrushingWheelBlock`).
+struct Survival;
+
+#[mod_api::horizon_part]
+impl BlockPart for Survival {
+    fn can_survive(
+        &self,
+        level: &dyn mod_api::LevelHost,
+        event: &mut mod_api::CanSurviveEvent,
+    ) -> Option<bool> {
+        // Horizon passes no side here; treated as the server's view.
+        let level = mod_api::LevelSide::Server(level);
+        let (level, _) = super::states::level_view(level);
+        let (block, info) = super::states::level_info(level, event.state)?;
+        let pos = [event.pos.x, event.pos.y, event.pos.z];
+        let at = |d: Dir| super::states::level_info_at(level, step(pos, d, 1));
+        let fits = match block {
+            Block::Basin => !matches!(
+                at(Dir::Up),
+                Some((Block::MechanicalPress | Block::MechanicalMixer, _))
+            ),
+            Block::CrushingWheel => {
+                let axis = info.axis?;
+                Dir::ALL.into_iter().all(|d| match at(d) {
+                    Some((Block::CrushingWheelController, _)) => d.axis() == axis,
+                    Some((Block::CrushingWheel, other)) => {
+                        other.axis == Some(axis) && d.axis() == axis
+                    }
+                    _ => true,
+                })
+            }
+            _ => return None,
+        };
+        (!fits).then_some(false)
     }
 }
 
@@ -701,13 +792,15 @@ fn use_block(host: &mut dyn ServerHost, event: &mut RightClickBlockEvent<'_>) ->
             basin::use_lit_burner(&mut lv, pos, player, click.hand, click.stack)
         }
         Block::Basin if main => basin::use_basin(&mut lv, pos, player, click.stack),
+        Block::MechanicalSaw => saw::use_saw(&mut lv, pos, player, click.stack),
         _ => false,
     };
     if used {
         *event.cancellation_result = mod_api::InteractionResult::Success;
         return mod_api::Flow::Cancel;
     }
-    if passes_item_use(&*lv.host, block, click.stack) {
+    let sponge = block == Block::Basin && basin::basin_tanks(lv.dim, pos) != Default::default();
+    if passes_item_use(&*lv.host, block, click.stack, sponge) {
         *event.use_block = mod_api::TriState::False;
     }
     mod_api::Flow::Continue

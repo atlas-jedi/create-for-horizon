@@ -263,6 +263,17 @@ pub fn tick_fans(lv: &mut ServerLevel<'_>) {
     tell_currents(lv);
 }
 
+/// `EncasedFanBlock.neighborChanged` (`blockInFrontChanged`): the fan at `pos` rebuilds its
+/// current on its next tick, so a block or catalyst put in front of it, or taken away, counts
+/// at once rather than at its next check (`fanBlockCheckRate`, 30 ticks).
+pub(super) fn neighbor_changed(dim: usize, pos: [i32; 3]) {
+    with_world(|w| {
+        if let Some(f) = w.dims[dim].fans.get_mut(&pos) {
+            f.rebuild = true;
+        }
+    });
+}
+
 /// Nozzles whose neighbour changed break, with their drops, when the block behind them is no
 /// longer an encased fan facing their way (`NozzleBlock.neighborChanged`, `canSurvive`).
 fn check_nozzles(lv: &mut ServerLevel<'_>) {
@@ -718,6 +729,8 @@ impl EntityPartState for Haunted {
 /// `HauntingType.affectEntity` for a horse: 100 ticks in a haunting current, with the soul
 /// escape sound every 10th rising in pitch, then the extinguish sound and a skeleton horse from
 /// the horse's saved data (its UUID left out) where it stood, its armour dropped, the horse gone.
+/// Each tick a soul flame rises a block from its middle, now and then with smoke (Create's
+/// client half of `affectEntity`, sent from here).
 fn haunt_horse(lv: &mut ServerLevel<'_>, entity: EntityRef) {
     let host = &mut *lv.host;
     if entity.kind(&*host).map(|k| k.name(&*host)).as_deref() != Some("minecraft:horse") {
@@ -726,6 +739,8 @@ fn haunt_horse(lv: &mut ServerLevel<'_>, entity: EntityRef) {
     let Some(at) = entity.position(&*host) else {
         return;
     };
+    horse_souls(lv, at);
+    let host = &mut *lv.host;
     let block = at.map(|v| v.floor() + 0.5);
     let Ok(progress) = Haunted::edit_state(host, entity, |_, n| {
         let was = *n;
@@ -790,6 +805,46 @@ fn haunt_horse(lv: &mut ServerLevel<'_>, entity: EntityRef) {
         s.merge_nbt(&mut *lv.host, saved);
     }
     entity.discard(&mut *lv.host);
+}
+
+/// `HauntingType.affectEntity` on Create's client for a horse at `at`: a soul flame a block
+/// out from its middle (`offsetRandomly(ZERO, r, 1).multiply(1, .2, 1).normalize()`) rising at
+/// 0.1, and one tick in three a large smoke puff from its middle drifting up to 1/4 aside.
+fn horse_souls(lv: &mut ServerLevel<'_>, at: [f64; 3]) {
+    let Some(keys) = super::air::KEYS.get() else {
+        return;
+    };
+    let o = [1.0, 0.2, 1.0].map(|m| f64::from((particle_random() - 0.5) * 2.0) * m);
+    let len = o.iter().map(|v| v * v).sum::<f64>().sqrt();
+    let o = if len < 1e-4 {
+        [0.0; 3]
+    } else {
+        o.map(|v| v / len)
+    };
+    let middle = [at[0], at[1] + 0.5, at[2]];
+    let flame = std::array::from_fn(|i| middle[i] + o[i]);
+    let _ = lv.level.send_particles(
+        &mut *lv.host,
+        &ParticleOptions::simple(keys.soul_fire_flame),
+        None,
+        flame,
+        [0.0, 0.1, 0.0],
+        1.0,
+        0,
+    );
+    if particle_random() * 3.0 < 1.0 {
+        let drift = || f64::from((particle_random() - 0.5) * 0.5);
+        let v = [drift(), 0.1, drift()];
+        let _ = lv.level.send_particles(
+            &mut *lv.host,
+            &ParticleOptions::simple(keys.large_smoke),
+            None,
+            middle,
+            v,
+            1.0,
+            0,
+        );
+    }
 }
 
 /// The depots and belts in a current, with the processing type each is in.

@@ -519,9 +519,11 @@ impl Item {
         })
     }
 
-    /// `new TransportedItemStack(stack)`.
+    /// `new TransportedItemStack(stack)`: `angle` is the random turn drawn for it, 180 for an
+    /// upright item, and a package's square turn (`transported_angle`).
     pub fn new(item: &str, count: u8, angle: i32, upright: bool) -> Item {
-        let angle = if upright { 180 } else { angle };
+        let package = crate::package::is_package(crate::arm::item_id(item));
+        let angle = transported_angle(angle, upright, package);
         let mut i = Item {
             position: 0.0,
             side_offset: 0.0,
@@ -557,13 +559,32 @@ impl Item {
         } else {
             item
         };
-        Item::new(&item, count, angle, upright)
+        let mut i = Item::new(&item, count, angle, upright);
+        // `stack.angle = nbt.getInt("Angle")`: the saved turn comes back as it was, a package's
+        // too.
+        if !upright {
+            i.angle = angle;
+            i.side_offset = i.target_side_offset();
+        }
+        i
     }
 
     /// `getTargetSideOffset`.
     pub fn target_side_offset(&self) -> f32 {
         (self.angle - 180) as f32 / (360.0 * 3.0)
     }
+}
+
+/// `TransportedItemStack`'s turn (`TransportedItemStack.java:39-41`): `random` (the
+/// `R.nextInt(360)` drawn for it) for most items, 180 for an upright one, and for a package
+/// `R.nextInt(4) * 90 + R.nextInt(20) - 10`, square to the belt within ten degrees. The two
+/// draws a package takes come from `random`: its quarter turn from `random % 4`, its tilt from
+/// `random / 4`.
+pub fn transported_angle(random: i32, upright: bool, package: bool) -> i32 {
+    if package {
+        return random.rem_euclid(4) * 90 + random.div_euclid(4).rem_euclid(20) - 10;
+    }
+    if upright { 180 } else { random }
 }
 
 /// Catnip's `AngleHelper.horizontalAngle`: south 0°, west 90°, north 180°, east 270°, the x
@@ -2198,6 +2219,26 @@ mod tests {
         assert_eq!(direction_aware_speed(48.0, Dir::East), -0.1);
         assert_eq!(movement_facing(48.0, Dir::East), Dir::West);
         assert_eq!(movement_facing(-48.0, Dir::East), Dir::East);
+    }
+
+    #[test]
+    fn packages_lie_square_and_keep_their_saved_turn() {
+        // TransportedItemStack: a package turns a quarter at a time, within ten degrees.
+        for random in 0..360 {
+            let a = transported_angle(random, false, true);
+            let off = (a + 10).rem_euclid(90) - 10;
+            assert!((-10..10).contains(&off), "{random} -> {a}");
+        }
+        assert_eq!(transported_angle(137, false, false), 137);
+        assert_eq!(transported_angle(137, true, false), 180);
+        let p = Item::new("create:cardboard_package_12x12#{x}", 1, 137, false);
+        assert_eq!(p.angle, transported_angle(137, false, true));
+        assert_eq!(p.side_offset, p.target_side_offset());
+        assert_eq!(Item::new("minecraft:dirt", 1, 137, false).angle, 137);
+        // TransportedItemStack.read: the saved turn as it was.
+        let saved = Item::from_saved("create:cardboard_package_12x12", 1, 263, false);
+        assert_eq!(saved.angle, 263);
+        assert_eq!(saved.side_offset, saved.target_side_offset());
     }
 
     #[test]

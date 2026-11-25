@@ -119,7 +119,7 @@ impl Subsystem for Arms {
             ..Default::default()
         };
         e.launcher.clamp(ejector::MAX_DISTANCE);
-        e.max_stack = max.clamp(0, 64) as u8;
+        e.max_stack = max.clamp(0, i32::from(create_engine::depot::ABSOLUTE_MAX_STACK)) as u8;
         let dim = lv.dim;
         with_world(|w| w.dims[dim].ejector_saved.insert(pos, e));
     }
@@ -338,6 +338,26 @@ pub fn vanilla_point_kind(name: &str) -> Option<Kind> {
     })
 }
 
+/// What `canCreatePoint` reads from the block's state beyond its type: `BeltType`'s belt that
+/// carries items (`BeltBlock.canTransportObjects`) with no tunnel over it, `FunnelType`'s funnel
+/// neither extracting nor a belt funnel pushing onto its belt, `SawType`'s saw facing up (its
+/// speed is the server's to add). The client asks it too, so that a click Create would not
+/// take as a selection places the arm.
+pub fn point_state_allows(
+    kind: Kind,
+    info: &create_engine::parts::StateInfo,
+    tunnel_above: bool,
+) -> bool {
+    match kind {
+        Kind::Belt => !tunnel_above && info.belt.is_some_and(|s| s.transports()),
+        Kind::Funnel => {
+            !info.extracting && info.belt_funnel != Some(create_engine::funnel::BeltShape::Pushing)
+        }
+        Kind::Saw => info.facing == Some(Dir::Up),
+        _ => true,
+    }
+}
+
 /// The block at `pos` as an arm interaction point (`canCreatePoint`).
 pub fn arm_point(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Option<Point> {
     let Some((block, info)) = info_at(lv, pos) else {
@@ -349,10 +369,18 @@ pub fn arm_point(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Option<Point> {
         });
     };
     let kind = point_kind(block)?;
+    let tunnel_above = kind == Kind::Belt
+        && matches!(
+            info_at(lv, [pos[0], pos[1] + 1, pos[2]]),
+            Some((Block::AndesiteTunnel | Block::BrassTunnel, _))
+        );
+    if !point_state_allows(kind, &info, tunnel_above) {
+        return None;
+    }
     if kind == Kind::Saw {
         let dim = lv.dim;
         let speed = with_world(|w| w.speed(dim, pos)).flatten().unwrap_or(0.0);
-        if info.facing != Some(Dir::Up) || speed == 0.0 {
+        if speed == 0.0 {
             return None;
         }
     }
@@ -496,6 +524,14 @@ fn put_slots(
 /// An arm's points as the game holds them, for its tick.
 struct ArmWorld<'a, 'l> {
     lv: &'a mut ServerLevel<'l>,
+    /// What the last real insert gave back for a stack it used up whole (a burner's bucket).
+    given: Option<Stack>,
+}
+
+impl<'a, 'l> ArmWorld<'a, 'l> {
+    fn new(lv: &'a mut ServerLevel<'l>) -> Self {
+        ArmWorld { lv, given: None }
+    }
 }
 
 impl arm::World for ArmWorld<'_, '_> {
@@ -503,30 +539,37 @@ impl arm::World for ArmWorld<'_, '_> {
         crate::glue::advancements::arm_deposited(self.lv, arm, musical);
     }
 
-    /// `isValid`: still a block of its type (`canCreatePoint`).
+    /// `isValid`: still a block of its type (`canCreatePoint`, `arm_point`).
     fn valid(&mut self, p: &Point) -> bool {
-        let Some(now) = arm_point(self.lv, p.pos) else {
-            return false;
-        };
-        if now.kind != p.kind {
-            return false;
-        }
-        match p.kind {
-            // BeltType: a belt that carries items, with no tunnel over it.
-            Kind::Belt => {
-                let above = [p.pos[0], p.pos[1] + 1, p.pos[2]];
-                let tunnel = matches!(
-                    info_at(self.lv, above),
-                    Some((Block::AndesiteTunnel | Block::BrassTunnel, _))
-                );
-                !tunnel && belt_segment(self.lv, p.pos).is_some_and(|(_, _, seg)| seg.transports())
-            }
-            // FunnelType: not extracting, not a belt funnel pushing onto its belt.
-            Kind::Funnel => funnel_at(self.lv, p.pos).is_some_and(|f| {
-                !f.extracting && f.belt != Some(create_engine::funnel::BeltShape::Pushing)
-            }),
-            _ => true,
-        }
+        arm_point(self.lv, p.pos).is_some_and(|now| now.kind == p.kind)
+    }
+
+    /// The point's facing now (a funnel, crafter or deployer turned by a wrench).
+    fn facing(&mut self, p: &Point) -> Option<Dir> {
+        arm_point(self.lv, p.pos).map_or(p.facing, |now| now.facing)
+    }
+
+    /// `collectItem`'s `ITEM_PICKUP` at the arm (`SoundSource.BLOCKS`, .125,
+    /// `.5f + Create.RANDOM.nextFloat() * .25f`).
+    fn collected(&mut self, arm: [i32; 3]) {
+        let r = self
+            .lv
+            .level
+            .with_random(&mut *self.lv.host, |r| mod_api::RandomSource::next_float(r))
+            .unwrap_or(0.5);
+        let at = arm.map(|v| f64::from(v) + 0.5);
+        self.lv.level.play_sound(
+            &mut *self.lv.host,
+            "minecraft:entity.item.pickup",
+            at,
+            mod_api::SoundSource::Blocks,
+            0.125,
+            0.5 + r * 0.25,
+        );
+    }
+
+    fn remainder(&mut self) -> Option<Stack> {
+        self.given.take()
     }
 
     /// `checkForMusic`: a jukebox point with a record in it.
@@ -669,7 +712,8 @@ impl arm::World for ArmWorld<'_, '_> {
             // ItemHandlerBeltSegment.insertItem: onto the segment from above while nothing just
             // put there is in the way.
             Kind::Belt => put_on_from_above(lv, pos, item, count, None, simulate).unwrap_or(count),
-            // ChuteItemHandler: while it is empty and takes the item, a stack from the top.
+            // ChuteItemHandler: while it is empty and takes the item, a stack where `setItem`
+            // starts it (the top while it falls, the bottom while the fans carry it up).
             Kind::Chute => {
                 let Some((block, powered)) = chute_at(lv, pos) else {
                     return count;
@@ -683,12 +727,14 @@ impl arm::World for ArmWorld<'_, '_> {
                 let n = count.min(max);
                 if !simulate {
                     set_chute_stack(lv, pos, items::stack_of(&*lv.host, item, u32::from(n)));
-                    with_world(|w| w.set_chute_position(dim, pos, 1.0));
+                    let at = super::chute::start_position(lv, pos);
+                    with_world(|w| w.set_chute_position(dim, pos, at));
                 }
                 count - n
             }
             // FunnelPoint: not while powered, only what its filter lets through; into the
-            // inventory behind it.
+            // inventory behind it. Something went: `onTransfer` (smart observers, the funnel
+            // advancement) and the flap swings in (`flap(true)`).
             Kind::Funnel => {
                 let Some(f) = funnel_at(lv, pos) else {
                     return count;
@@ -707,8 +753,13 @@ impl arm::World for ArmWorld<'_, '_> {
                     let room = items::insert_room(lv, behind, face(f.facing), &stack).unwrap_or(0);
                     return count - room.min(u32::from(count)) as u8;
                 }
-                items::insert_item(lv, behind, face(f.facing), stack)
-                    .map_or(0, |l| l.count().min(255) as u8)
+                let left = items::insert_item(lv, behind, face(f.facing), stack.clone())
+                    .map_or(0, |l| l.count().min(255) as u8);
+                if left != count {
+                    super::flaps::funnel(lv, pos, true);
+                    crate::glue::redstone::detectors::funnel_transfer(lv, pos, &stack);
+                }
+                left
             }
             // MillstoneInventoryHandler.isItemValid: only what it can mill (`canProcess`).
             Kind::Millstone => {
@@ -721,7 +772,8 @@ impl arm::World for ArmWorld<'_, '_> {
                 put_slots(lv, pos, 0..1, item, count, simulate)
             }
             // BlazeBurnerPoint: one at a time (`tryInsert` uses one up); a container left over
-            // (a lava bucket's) comes back to the arm while it held only one, else drops.
+            // (a lava bucket's) comes back to the arm while it held only one (the remainder
+            // the arm then holds, `remainder`), else drops.
             Kind::BlazeBurner => {
                 let Some(one) = items::stack_of(&*lv.host, item, 1) else {
                     return count;
@@ -731,9 +783,14 @@ impl arm::World for ArmWorld<'_, '_> {
                 else {
                     return count;
                 };
-                if !simulate && let Some(r) = rest.filter(|_| count > 1) {
-                    let at = pos.map(f64::from);
-                    items::drop_stack(lv, at, [0.0; 3], r, 10);
+                if !simulate && let Some(r) = rest {
+                    if count > 1 {
+                        let at = pos.map(f64::from);
+                        items::drop_stack(lv, at, [0.0; 3], r, 10);
+                    } else {
+                        let key = items::key_of(&*lv.host, &r);
+                        self.given = Some((key, r.count().min(255) as u8));
+                    }
                 }
                 count - 1
             }
@@ -777,11 +834,14 @@ impl arm::World for ArmWorld<'_, '_> {
                 if !free {
                     return count;
                 }
-                // One at a time (`ProcessingInventory`'s slot limit without bulk cutting).
-                let id = create_engine::arm::item_id(item);
-                let progress = items::stack_of(&*lv.host, item, 1)
-                    .and_then(|s| crate::glue::processing::sequenced_progress(&s));
-                if !simulate && !crate::glue::processing::saw::saw_put(lv, pos, id, progress) {
+                // One at a time (`ProcessingInventory`'s slot limit without bulk cutting), kept
+                // whole as a belt keeps it (a package's contents, an assembly's progress).
+                let Some((name, progress)) = items::stack_of(&*lv.host, item, 1)
+                    .map(|s| super::belt::belt_name(&*lv.host, &s))
+                else {
+                    return count;
+                };
+                if !simulate && !crate::glue::processing::saw::saw_put(lv, pos, &name, progress) {
                     return count;
                 }
                 count - 1
@@ -1002,6 +1062,7 @@ pub(super) fn depot_insert(
             return count;
         }
         with_world(|w| w.depot_put(dim, pos, Some(motion)));
+        super::depot::inserted_sound(lv, pos, &motion);
     }
     count - n
 }
@@ -1041,7 +1102,7 @@ fn tick_arm_signals(lv: &mut ServerLevel<'_>) {
         let powered = lv.has_neighbor_signal(pos);
         let arm = with_world(|w| w.dims[dim].arms.arms.remove(&pos)).flatten();
         if let Some(mut a) = arm {
-            let changed = a.set_powered(pos, powered, &mut ArmWorld { lv: &mut *lv });
+            let changed = a.set_powered(pos, powered, &mut ArmWorld::new(&mut *lv));
             with_world(|w| {
                 let arms = &mut w.dims[dim].arms;
                 arms.arms.insert(pos, a);
@@ -1058,6 +1119,7 @@ fn tick_arm_signals(lv: &mut ServerLevel<'_>) {
 /// ones (`ArmBlockEntity.tick`); what removed arms held drops; clients see the arms whose target
 /// or phase changed. Nothing runs without an awake arm.
 fn tick_arms(lv: &mut ServerLevel<'_>) {
+    drop_unheld_selections(&mut *lv.host);
     tick_arm_signals(lv);
     let dim = lv.dim;
     let now = lv.game_time().max(0) as u64;
@@ -1082,7 +1144,7 @@ fn tick_arms(lv: &mut ServerLevel<'_>) {
             .collect();
         arms.tick(
             |p| speeds.get(&p).copied().unwrap_or(0.0),
-            &mut ArmWorld { lv: &mut *lv },
+            &mut ArmWorld::new(&mut *lv),
         );
         with_world(|w| {
             let back = std::mem::replace(&mut w.dims[dim].arms, arms);
@@ -1271,8 +1333,10 @@ fn land(
     // An ejector merges what lands onto what it holds (`enableMerging`), arriving from above
     // at the centre (`tryInsertingFromSide(UP)`).
     if is_ejector(dim, target) {
-        let motion =
-            create_engine::depot::Held::new(random_angle(lv, target), upright(&*lv.host, item));
+        let motion = create_engine::depot::Held::new(
+            items::stack_angle(lv, target, item),
+            upright(&*lv.host, item),
+        );
         return Some(depot_insert(lv, target, item, count, motion, simulate));
     }
     let is_depot = with_world(|w| w.dims[dim].depots.contains_key(&target)) == Some(true);
@@ -1286,9 +1350,12 @@ fn land(
             if !items::set_slot(lv, target, 0, stack) {
                 return None;
             }
-            let h =
-                create_engine::depot::Held::new(random_angle(lv, target), upright(&*lv.host, item));
+            let h = create_engine::depot::Held::new(
+                items::stack_angle(lv, target, item),
+                upright(&*lv.host, item),
+            );
             with_world(|w| w.depot_put(dim, target, Some(h)));
+            super::depot::inserted_sound(lv, target, &h);
         }
         return Some(count - n);
     }
@@ -1377,6 +1444,8 @@ impl ejector::World for EjectorWorld<'_, '_> {
             }
             return Vec::new();
         }
+        // Observers watching the ejector see it fire (`updateShape` from it).
+        watching_observers_see(self.lv, pos);
         // The held stack, every incoming one, then each output.
         let Some(slots) = items::slots(self.lv, pos, depot::SLOTS as u32) else {
             return Vec::new();
@@ -1420,6 +1489,86 @@ impl ejector::World for EjectorWorld<'_, '_> {
 
     fn extracting_funnel(&mut self, pos: [i32; 3]) -> bool {
         funnel_at(self.lv, pos).is_some_and(|f| f.belt.is_none() && f.extracting)
+    }
+
+    fn sound(&mut self, sound: ejector::Sound) {
+        let at = self.pos.map(|v| f64::from(v) + 0.5);
+        for (event, volume, pitch) in sound.events() {
+            self.lv.level.play_sound(
+                &mut *self.lv.host,
+                event,
+                at,
+                mod_api::SoundSource::Blocks,
+                volume,
+                pitch,
+            );
+        }
+    }
+
+    fn game_time(&mut self) -> i64 {
+        self.lv.game_time()
+    }
+}
+
+thread_local! {
+    /// Observers an ejector fired in front of: dimension, position, the game time their
+    /// scheduled tick is due (`ObserverBlock.startSignal`: two ticks on).
+    static OBSERVERS: std::cell::RefCell<Vec<(usize, [i32; 3], i64)>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// `launchItems`' observers: each unpowered vanilla observer beside the ejector at `pos` facing
+/// it (`FACING == d.getOpposite()`) is told of a shape update from it, and schedules its tick
+/// two ticks on (`startSignal`). The mod API cannot send the update itself or schedule the
+/// observer's tick from here, so the tick is run when due (`flush_observers`).
+fn watching_observers_see(lv: &ServerLevel<'_>, pos: [i32; 3]) {
+    const SIDES: [([i32; 3], &str); 6] = [
+        ([0, -1, 0], "up"),
+        ([0, 1, 0], "down"),
+        ([0, 0, -1], "south"),
+        ([0, 0, 1], "north"),
+        ([-1, 0, 0], "east"),
+        ([1, 0, 0], "west"),
+    ];
+    let due = lv.game_time() + 2;
+    for (o, facing) in SIDES {
+        let at = [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]];
+        if lv.block_name(at).as_deref() != Some("minecraft:observer")
+            || property(lv, at, "facing").as_deref() != Some(facing)
+            || property(lv, at, "powered").as_deref() != Some("false")
+        {
+            continue;
+        }
+        let dim = lv.dim;
+        OBSERVERS.with_borrow_mut(|l| {
+            if !l.iter().any(|e| e.0 == dim && e.1 == at) {
+                l.push((dim, at, due));
+            }
+        });
+    }
+}
+
+/// The observers `watching_observers_see` noted in this level whose tick is due: one still
+/// unpowered runs it (`ObserverBlock.tick`: it powers, and schedules its own unpowering).
+fn flush_observers(lv: &mut ServerLevel<'_>) {
+    let dim = lv.dim;
+    let now = lv.game_time();
+    let due = OBSERVERS.with_borrow_mut(|l| {
+        if l.is_empty() {
+            return Vec::new();
+        }
+        let (due, rest) = std::mem::take(l)
+            .into_iter()
+            .partition::<Vec<_>, _>(|e| e.0 == dim && e.2 <= now);
+        *l = rest;
+        due
+    });
+    for (_, at, _) in due {
+        if lv.block_name(at).as_deref() == Some("minecraft:observer")
+            && property(lv, at, "powered").as_deref() == Some("false")
+        {
+            lv.level.block_tick(&mut *lv.host, at);
+        }
     }
 }
 
@@ -1465,6 +1614,7 @@ pub(crate) fn tick_ejector(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
 /// Ejectors after the walk: stacks of removed ones drop, clients see those whose plate or
 /// flight changed.
 pub(super) fn flush_ejectors(lv: &mut ServerLevel<'_>) {
+    flush_observers(lv);
     let dim = lv.dim;
     let (drops, changes) = with_world(|w| {
         let d = &mut w.dims[dim];
@@ -1815,7 +1965,7 @@ fn ejector_from_tag(c: &Compound) -> Option<([i32; 3], ejector::Ejector)> {
     e.lid.previous = lid;
     e.lid.target = lid;
     e.powered = v[7] != 0;
-    e.max_stack = v[8].clamp(0, 64) as u8;
+    e.max_stack = v[8].clamp(0, i32::from(create_engine::depot::ABSOLUTE_MAX_STACK)) as u8;
     let items: Vec<String> = match c.get(&"flying".into()) {
         Some(Tag::List(l)) => l.iter().map(|t| text(Some(t))).collect(),
         _ => Vec::new(),
@@ -1953,7 +2103,8 @@ fn is_arm_item(host: &dyn mod_api::Host, stack: Option<&mod_api::ItemStack>) -> 
 /// `ArmInteractionPointHandler.rightClickingBlocksSelectsThem`: with the arm in the main hand,
 /// a click on a block an arm can work with selects it, first as an input (a funnel, only ever
 /// an output), and each click after swaps its mode; the action bar says which. The click is the
-/// selection's, so no arm is placed. On a client it only keeps the arm from being placed there.
+/// selection's, so no arm is placed. On a client it only keeps the arm from being placed there
+/// (by the block's state, `point_state_allows`; a saw's speed is left to the server).
 pub fn select_point(
     host: mod_api::HostSide,
     event: &mut mod_api::RightClickBlockEvent<'_>,
@@ -1964,10 +2115,25 @@ pub fn select_point(
             let state = host
                 .level(host.dimension())
                 .and_then(|l| l.block_state(&*host, click.pos));
+            let block_at = |pos: [i32; 3]| {
+                let state = host
+                    .level(host.dimension())
+                    .and_then(|l| l.block_state(&*host, pos))?;
+                let id = super::super::states::id(state)?;
+                super::super::client_table(&*host, |t| t.get(id).map(|(b, i)| (b, *i))).flatten()
+            };
             let kind = state.and_then(|state| match super::super::states::id(state) {
-                Some(id) => super::super::client_table(&*host, |t| t.get(id).map(|(b, _)| b))
-                    .flatten()
-                    .and_then(point_kind),
+                Some(_) => {
+                    let (block, info) = block_at(click.pos)?;
+                    let kind = point_kind(block)?;
+                    let above = [click.pos[0], click.pos[1] + 1, click.pos[2]];
+                    let tunnel_above = kind == Kind::Belt
+                        && matches!(
+                            block_at(above),
+                            Some((Block::AndesiteTunnel | Block::BrassTunnel, _))
+                        );
+                    point_state_allows(kind, &info, tunnel_above).then_some(kind)
+                }
                 None => {
                     let text = host.block_state_string(state)?;
                     vanilla_point_kind(super::super::states::split(&text).0)
@@ -2076,6 +2242,7 @@ fn select_on_server(host: &mut dyn ServerHost, click: &mod_api::BlockClick<'_>) 
     // stays an output.
     let take = SELECTION.with_borrow_mut(|s| {
         let list = s.entry(click.player).or_default();
+        drop_invalid(&lv, list);
         let i = match list.iter().position(|(p, _)| p.pos == point.pos) {
             Some(i) => i,
             None => {
@@ -2099,6 +2266,35 @@ fn select_on_server(host: &mut dyn ServerHost, click: &mod_api::BlockClick<'_>) 
     let line = coloured(mod_api::Text::translate(key, vec![name]), color);
     let _ = player.action_bar(&mut *lv.host, line);
     true
+}
+
+/// `drawOutlines`' `!point.isValid()` (and `ArmInteractionPoint.deserialize` when the arm is
+/// placed): chosen points whose block is no longer of their type leave the selection.
+fn drop_invalid(lv: &ServerLevel<'_>, list: &mut Vec<(Point, bool)>) {
+    list.retain(|(p, _)| arm_point(lv, p.pos).is_some_and(|now| now.kind == p.kind));
+}
+
+/// `ArmInteractionPointHandler.tick`: a selection lasts while an arm stays in the main hand
+/// (`currentSelection.clear()` once another stack is held there); a player who put the arm
+/// away, or left, chooses again.
+fn drop_unheld_selections(host: &mut dyn ServerHost) {
+    let gone: Vec<u128> = SELECTION.with_borrow(|s| {
+        s.keys()
+            .copied()
+            .filter(|uuid| {
+                host.player(*uuid).is_none_or(|p| {
+                    let held = crate::glue::items::held(&*host, p, mod_api::Hand::Main);
+                    !is_arm_item(&*host, held.as_ref())
+                })
+            })
+            .collect()
+    });
+    for uuid in gone {
+        SELECTION.with_borrow_mut(|s| s.remove(&uuid));
+        if let Some(player) = host.player(uuid) {
+            send_selection(host, player);
+        }
+    }
 }
 
 /// The arm points the player chose, to their client, which outlines them while the arm is in
@@ -2151,6 +2347,15 @@ pub fn arm_placed(host: &mut dyn ServerHost, event: &crate::glue::subsystem::Pla
         return;
     };
     send_selection(host, player);
+    let Some(dimension) = placer.level(&*host).and_then(|l| l.dimension().id(&*host)) else {
+        return;
+    };
+    let Some(lv) = ServerLevel::new(host, &dimension) else {
+        return;
+    };
+    // Points that went since they were chosen are dropped before they are counted.
+    drop_invalid(&lv, &mut chosen);
+    let (host, dim) = (lv.host, lv.dim);
     let pos = [event.pos.x, event.pos.y, event.pos.z];
     // `BlockPos.closerThan(pos, range)`.
     let near = |p: [i32; 3]| {
@@ -2186,13 +2391,6 @@ pub fn arm_placed(host: &mut dyn ServerHost, event: &crate::glue::subsystem::Pla
     if let Some(line) = line {
         let _ = player.action_bar(host, line);
     }
-    let Some(dim) = placer
-        .level(&*host)
-        .and_then(|l| l.dimension().id(&*host))
-        .and_then(|d| super::super::world::level_index(&d))
-    else {
-        return;
-    };
     let (inputs, outputs): (Vec<_>, Vec<_>) = chosen.into_iter().partition(|(_, take)| *take);
     let mut arm = arm::Arm::new(info.ceiling);
     arm.set_points(
@@ -2269,6 +2467,8 @@ pub fn select_ejector_target(
 /// `leftClickingBlocksDeselectsThem`: with the arm item in the main hand, a left click on a
 /// chosen point drops it (`ArmInteractionPointHandler`); sneaking with an ejector, one on the
 /// chosen target drops it (`EjectorTargetHandler`). The click is then taken: nothing is dug.
+/// With the arm in hand no block an arm can work with is dug, chosen or not
+/// (`ArmItem.canAttackBlock`).
 pub fn left_click(host: &mut dyn ServerHost, pos: [i32; 3]) -> mod_api::Flow {
     let Some(player) = host.players().acting_player() else {
         return mod_api::Flow::Continue;
@@ -2286,7 +2486,16 @@ pub fn left_click(host: &mut dyn ServerHost, pos: [i32; 3]) -> mod_api::Flow {
             send_selection(host, player);
             return mod_api::Flow::Cancel;
         }
-        return mod_api::Flow::Continue;
+        let interactable = match player.dimension(&*host).map(|d| d.to_string()) {
+            Some(dimension) => ServerLevel::new(&mut *host, &dimension)
+                .is_some_and(|lv| arm_point(&lv, pos).is_some()),
+            None => false,
+        };
+        return if interactable {
+            mod_api::Flow::Cancel
+        } else {
+            mod_api::Flow::Continue
+        };
     }
     let ejector = held
         .as_ref()

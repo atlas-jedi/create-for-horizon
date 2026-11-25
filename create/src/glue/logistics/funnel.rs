@@ -76,6 +76,54 @@ pub fn use_funnel_filter(
     true
 }
 
+/// `FunnelBlock.useItemOn`: a click on the opening of an inserting, unpowered funnel (not a belt
+/// funnel) puts the held stack into the inventory behind it as far as it fits and the filter
+/// passes it (`tryInsert`, which flaps the funnel in), the rest left in the hand. True when the
+/// click was the funnel's (`create_engine::funnel::inserts_click`).
+pub fn use_funnel_insert(
+    lv: &mut ServerLevel<'_>,
+    pos: [i32; 3],
+    click: &mod_api::BlockClick<'_>,
+) -> bool {
+    let Some(f) = funnel_at(lv, pos) else {
+        return false;
+    };
+    let held = click.stack.map(|s| items::id_of(&*lv.host, s));
+    let Some(clicked) = Dir::from_offset(click.hit.face) else {
+        return false;
+    };
+    if f.belt.is_some()
+        || !create_engine::funnel::inserts_click(
+            f.facing,
+            f.extracting,
+            f.powered,
+            clicked,
+            held.as_deref(),
+        )
+    {
+        return false;
+    }
+    let Some(stack) = click.stack.filter(|s| s.count() > 0).cloned() else {
+        return true;
+    };
+    if !funnel_passes(lv, pos, &stack) {
+        return true;
+    }
+    let behind = create_engine::funnel::behind(pos, f.facing);
+    let count = stack.count();
+    let moved = stack.clone();
+    let left = items::insert_item(lv, behind, face(f.facing), stack);
+    if left.as_ref().is_some_and(|l| l.count() == count) {
+        return true;
+    }
+    if let Some(p) = lv.host.player(click.player) {
+        crate::glue::items::set_held(lv.host, p, click.hand, left);
+    }
+    super::flaps::funnel(lv, pos, true);
+    crate::glue::redstone::detectors::funnel_transfer(lv, pos, &moved);
+    true
+}
+
 /// `FilteringBehaviour.onShortInteract` on the brass funnel at `pos`: the stack in `hand`
 /// becomes its filter (a filter item taken from the hand, the one it held given back), an empty
 /// hand clears it; an exact amount fits the new filter's stack size.
@@ -326,10 +374,14 @@ fn push_onto_depot(
     let held = create_engine::depot::Held {
         position: 0.0,
         from: create_engine::depot::Side::from_dir(facing),
-        ..create_engine::depot::Held::new(random_angle(lv, below), upright(&*lv.host, &id))
+        ..create_engine::depot::Held::new(
+            items::stack_angle(lv, below, &id),
+            upright(&*lv.host, &id),
+        )
     };
     let dim = lv.dim;
     with_world(|w| w.depot_put(dim, below, Some(held)));
+    super::depot::inserted_sound(lv, below, &held);
     super::flaps::funnel(lv, pos, false);
     crate::glue::redstone::detectors::funnel_transfer(lv, pos, &moved);
     Some(Some(true))
@@ -611,8 +663,11 @@ fn extract_in_front(
         return Some(None);
     };
     let moved = stack.clone();
-    items::drop_stack(lv, at, v, stack, 0);
-    super::flaps::funnel(lv, pos, false);
+    // `setDefaultPickUpDelay`.
+    let delay = create_engine::funnel::OUTPUT_PICKUP_DELAY;
+    items::drop_stack(lv, at, v, stack, delay);
+    // `flap(false)` without `hasFlap`: a vertical funnel is heard too.
+    super::flaps::funnel_extracted(lv, pos);
     crate::glue::redstone::detectors::funnel_transfer(lv, pos, &moved);
     Some(Some(true))
 }

@@ -75,7 +75,8 @@ pub(super) fn level_tick(lv: &mut ServerLevel<'_>) {
 /// `KineticBlock.getParticleInitialRadius` and `getParticleTargetRadius`.
 fn radii(block: Block) -> (f32, f32) {
     match block {
-        Block::Shaft | Block::PoweredShaft => (0.125, 0.35),
+        // `ShaftBlock`'s; a powered shaft is an `AbstractShaftBlock`, with the defaults.
+        Block::Shaft => (0.125, 0.35),
         Block::GantryShaft => (0.25, 0.35),
         Block::Cogwheel => (0.75, 0.65),
         Block::LargeCogwheel => (1.0, 1.125),

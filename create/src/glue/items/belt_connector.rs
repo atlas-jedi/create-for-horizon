@@ -351,7 +351,8 @@ fn use_on(host: &mut dyn ServerHost, event: &UseOnEvent<'_>) -> Option<Interacti
             player.set_item_cooldown(lv.host, "create:belt_connector", 5);
             InteractionResult::Success
         }
-        bc::Click::Refused => InteractionResult::Success,
+        // `if (!canConnect(world, firstPulley, pos)) return InteractionResult.FAIL`.
+        bc::Click::Refused => InteractionResult::Fail,
         bc::Click::Connect(start) => {
             create_belts(&mut lv, start, pos);
             super::super::advancements::award(lv.host, player, "belt");

@@ -6,10 +6,13 @@
 //! green (a copy of the model with every face tinted, made by `create-data prepare`).
 //!
 //! The server keeps what clients need in the station's block entity data (`KEY`), refreshed
-//! every ten ticks and when its train comes or goes. The station keeps no facing along its track
-//! here (Create's `TrackTargetingBehaviour.targetDirection`, set from the placing player's
-//! look): the flag is turned by the assembly direction last used, else the track's positive way.
-//! The flag's sounds (`CONTRAPTION_ASSEMBLE` / `DISASSEMBLE` as it moves) are not played: the
+//! every ten ticks and when its train comes or goes. A station placed on its track with its item
+//! faces the way it picked (`TrackTargetingBehaviour.targetDirection`): its flag turns to it
+//! (`resolveFlagAngle`) and its marker stands where the pick is, on straight, diagonal, sloped or
+//! curved track (`prepareTrackOverlay`, worked out on the server). One with no pick of its own
+//! (placed by a command, or saved before stations kept one) binds to the straight track beside
+//! it, its flag turned by the assembly direction last used, else the track's positive way. The
+//! flag's sounds (`CONTRAPTION_ASSEMBLE` / `DISASSEMBLE` as it moves) are not played: the
 //! drawing has no host to play them from.
 
 use super::super::server::ServerLevel;
@@ -64,6 +67,9 @@ struct Shown {
     /// light can't be read; the station's own cell is dark inside its block): packed as the
     /// draw context takes it.
     light: [i32; 2],
+    /// Its marker's transform from its track block's corner (`prepareTrackOverlay`, a row-major
+    /// 3×4), for a station that picked its track; none for one bound beside it.
+    pose: Option<[f32; 12]>,
 }
 
 impl Shown {
@@ -76,6 +82,11 @@ impl Shown {
             ("n".into(), Tag::Int(self.length)),
             ("b".into(), Tag::IntArray(self.bogeys.clone())),
             ("l".into(), Tag::IntArray(self.light.to_vec())),
+            (
+                "m".into(),
+                self.pose
+                    .map_or_else(crate::glue::kinetics::absent, pose_tag),
+            ),
         ])
     }
 
@@ -100,20 +111,35 @@ impl Shown {
             light: ints("l")
                 .and_then(|l| Some([*l.first()?, *l.get(1)?]))
                 .unwrap_or([0xF0, 0xF0]),
+            pose: c.get(&"m".into()).and_then(pose_of),
         })
     }
+}
+
+/// A marker's transform as its data carries it: the twelve floats' bits.
+fn pose_tag(m: [f32; 12]) -> Tag {
+    Tag::IntArray(m.iter().map(|v| v.to_bits() as i32).collect())
+}
+
+fn pose_of(t: &Tag) -> Option<[f32; 12]> {
+    let Tag::IntArray(v) = t else {
+        return None;
+    };
+    let v: &[i32; 12] = v.as_slice().try_into().ok()?;
+    Some(v.map(|b| f32::from_bits(b as u32)))
 }
 
 /// A station by level and position.
 type At = (usize, [i32; 3]);
 
 /// A station as the railway has it: its block, its track and shape, whether a train stands at
-/// it, its assembly direction.
+/// it, its assembly direction, and the pick it stands for.
 type Station = (
     [i32; 3],
     Option<([i32; 3], TrackShape)>,
     bool,
     Option<[i32; 3]>,
+    Option<create_engine::network::Target>,
 );
 
 thread_local! {
@@ -143,11 +169,12 @@ pub fn forget() {
     MARKS.with_borrow_mut(HashMap::clear);
 }
 
-/// A marker as the data carries it: track offset, way, kind, light.
-type Marker = ([i32; 3], [i32; 2], u8, i32);
+/// A marker as the data carries it: track offset, transform from the track block's corner,
+/// kind, light.
+type Marker = ([i32; 3], [u32; 12], u8, i32);
 
-/// A marker as the railway finds it: track block, way, kind.
-type Pointing = ([i32; 3], [i32; 2], u8);
+/// A marker as the railway finds it: the pick it stands for, and its kind.
+type Pointing = (create_engine::network::Target, u8);
 
 /// Each signal's and track observer's marker (`TrackTargetingBehaviour.render` from
 /// `SignalRenderer`, `TrackObserverRenderer`) written into its data where it changed; a signal
@@ -160,11 +187,11 @@ pub fn refresh_marks(lv: &mut ServerLevel<'_>) {
             let m = r
                 .net
                 .signal_marker(*p)
-                .map(|(t, d, dual)| (t, d, u8::from(dual)));
+                .map(|(t, dual)| (t, u8::from(dual)));
             (*p, m)
         });
         let observers = r.observers.keys().map(|p| {
-            let m = r.net.observer_marker(&r.tracks, *p).map(|(t, d)| (t, d, 2));
+            let m = r.net.observer_marker(*p).map(|t| (t, 2));
             (*p, m)
         });
         signals.chain(observers).collect()
@@ -174,9 +201,12 @@ pub fn refresh_marks(lv: &mut ServerLevel<'_>) {
         if !lv.is_loaded(pos) {
             continue;
         }
-        let shown: Option<Marker> = m.map(|(t, d, k)| {
+        let shown: Option<Marker> = m.and_then(|(target, k)| {
+            let t = target.track;
+            let pose = super::tracks::marker_pose(dim, &target, 1.0)?;
             let light = light_near(lv, t, true) as i32;
-            ([t[0] - pos[0], t[1] - pos[1], t[2] - pos[2]], d, k, light)
+            let offset = [t[0] - pos[0], t[1] - pos[1], t[2] - pos[2]];
+            Some((offset, pose.map(f32::to_bits), k, light))
         });
         if MARKS.with_borrow(|s| s.get(&(dim, pos)) == Some(&shown)) {
             continue;
@@ -185,9 +215,9 @@ pub fn refresh_marks(lv: &mut ServerLevel<'_>) {
             continue;
         };
         let value = match shown {
-            Some((t, d, k, l)) => Tag::compound([
+            Some((t, m, k, l)) => Tag::compound([
                 ("t", Tag::IntArray(t.to_vec())),
-                ("d", Tag::IntArray(d.to_vec())),
+                ("m", pose_tag(m.map(f32::from_bits))),
                 ("k", Tag::Byte(k as i8)),
                 ("l", Tag::Int(l)),
             ]),
@@ -205,12 +235,14 @@ pub fn draw_mark(host: &dyn ClientHost, draw: &mut dyn BlockEntityDrawContext, n
     let Some(Tag::Compound(c)) = crate::glue::kinetics::synced(nbt, MARK) else {
         return;
     };
-    let ints = |k: &str| match c.get(&k.into()) {
+    let t = match c.get(&"t".into()) {
         Some(Tag::IntArray(v)) => v.clone(),
         _ => Vec::new(),
     };
-    let (t, d) = (ints("t"), ints("d"));
-    let (&[tx, ty, tz], &[dx, dz]) = (&t[..], &d[..]) else {
+    let &[tx, ty, tz] = &t[..] else {
+        return;
+    };
+    let Some(pose) = c.get(&"m".into()).and_then(pose_of) else {
         return;
     };
     let name = match c.get(&"k".into()) {
@@ -227,12 +259,27 @@ pub fn draw_mark(host: &dyn ClientHost, draw: &mut dyn BlockEntityDrawContext, n
     }
     draw.push();
     draw.translate([tx as f32, ty as f32, tz as f32]);
-    // `prepareTrackOverlay` on straight track: turned to the way it looks (`getModelAngles`).
-    let yaw = (dx as f32).atan2(dz as f32).to_degrees();
-    draw.rotate_about([0.0, 1.0, 0.0], yaw, [0.5, 0.0, 0.5]);
-    let _ = draw.terrain_model(m, mod_api::TerrainModelOptions::default());
+    // `prepareTrackOverlay`: on its track, turned along it (`getModelAngles`).
+    super::tracks::draw_affine(draw, &pose, |d| {
+        let _ = d.terrain_model(m, mod_api::TerrainModelOptions::default());
+    });
     draw.pop();
     draw.set_light(lit);
+}
+
+/// Where a marker in data `c` (`MARK`, or a station's `KEY`) stands from its block entity, for
+/// its drawing's bounds: its track block, and its transform's origin beyond it.
+pub fn mark_reach(c: &Compound) -> Option<[[f32; 3]; 2]> {
+    let Some(Tag::IntArray(t)) = c.get(&"t".into()) else {
+        return None;
+    };
+    let &[x, y, z] = &t[..] else {
+        return None;
+    };
+    let base = [x as f32, y as f32, z as f32];
+    let pose = c.get(&"m".into()).and_then(pose_of);
+    let far = pose.map_or(base, |m| [base[0] + m[3], base[1] + m[7], base[2] + m[11]]);
+    Some([base, far])
 }
 
 pub fn client_reset() {
@@ -247,27 +294,44 @@ pub fn refresh(lv: &mut ServerLevel<'_>) {
         r.stations
             .keys()
             .map(|p| {
-                let target =
-                    create_engine::network::target_track(&r.tracks, *p).map(|t| (t, r.tracks[&t]));
+                // Its pick, else the straight track beside it.
+                let picked = r.net.station_marker(*p);
+                let track = match picked {
+                    Some(t) => Some(t.track),
+                    None => create_engine::network::target_track(&r.tracks, *p),
+                };
+                let target = track.and_then(|t| Some((t, *r.tracks.get(&t)?)));
                 let present = r.trains.iter().any(|t| t.train.at_station == Some(*p));
-                (*p, target, present, r.assembling.get(p).copied())
+                (*p, target, present, r.assembling.get(p).copied(), picked)
             })
             .collect()
     })
     .unwrap_or_default();
-    for (pos, target, present, assembling) in stations {
+    for (pos, target, present, assembling, picked) in stations {
         let Some((track, shape)) = target else {
             continue;
         };
         if !lv.is_loaded(pos) {
             continue;
         }
-        let dir = match assembling {
-            Some(d) => {
+        let dir = match (assembling, picked) {
+            (Some(d), _) => {
                 DIRS.with_borrow_mut(|m| m.insert((dim, pos), [d[0], d[2]]));
                 [d[0], d[2]]
             }
-            None => DIRS.with_borrow(|m| m.get(&(dim, pos)).copied()).unwrap_or(
+            // `resolveFlagAngle`: the track's axis times the target direction, to the nearest
+            // side.
+            (None, Some(t)) => {
+                let axis = shape.axes()[shape.axes().len() - 1];
+                let s = if t.front { 1.0 } else { -1.0 };
+                let d = create_engine::network::nearest_horizontal([
+                    axis[0] * s,
+                    0.0,
+                    axis[2] * s,
+                ]);
+                [d[0], d[2]]
+            }
+            (None, None) => DIRS.with_borrow(|m| m.get(&(dim, pos)).copied()).unwrap_or(
                 if shape == TrackShape::Xo {
                     [1, 0]
                 } else {
@@ -275,6 +339,7 @@ pub fn refresh(lv: &mut ServerLevel<'_>) {
                 },
             ),
         };
+        let pose = picked.and_then(|t| super::tracks::marker_pose(dim, &t, 1.0));
         let (length, bogeys) = if assembling.is_some() {
             super::assembly::assembly_track(lv, pos)
                 .map(|(run, b)| (run.len() as i32, b.iter().map(|b| b.0).collect()))
@@ -294,6 +359,7 @@ pub fn refresh(lv: &mut ServerLevel<'_>) {
             assembling: assembling.is_some(),
             length,
             bogeys,
+            pose,
         };
         let same = SENT.with_borrow(|m| m.get(&(dim, pos)) == Some(&shown));
         if same {
@@ -456,11 +522,20 @@ pub fn draw(
     draw.push();
     draw.translate([s.track[0] as f32, s.track[1] as f32, s.track[2] as f32]);
     if !assembly {
-        // The station's marker on its track, turned along it.
+        // The station's marker on its track, turned along it (`prepareTrackOverlay`; one with no
+        // pick along its flag's way).
         if let Some(m) = model(host, OVERLAY) {
-            let yaw = along[0].atan2(along[1]).to_degrees();
-            draw.rotate_about([0.0, 1.0, 0.0], yaw, [0.5, 0.0, 0.5]);
-            let _ = draw.terrain_model(m, mod_api::TerrainModelOptions::default());
+            let options = mod_api::TerrainModelOptions::default();
+            match s.pose {
+                Some(pose) => super::tracks::draw_affine(draw, &pose, |d| {
+                    let _ = d.terrain_model(m, options);
+                }),
+                None => {
+                    let yaw = along[0].atan2(along[1]).to_degrees();
+                    draw.rotate_about([0.0, 1.0, 0.0], yaw, [0.5, 0.0, 0.5]);
+                    let _ = draw.terrain_model(m, options);
+                }
+            }
         }
         draw.pop();
         keep(draw, pos, nbt);

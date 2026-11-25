@@ -4,6 +4,7 @@
 //! thrown off the end; the items clients draw (`create:belt`).
 
 #[allow(unused_imports)] use crate::glue::compat::ext::*;
+#[allow(unused_imports)] use mod_api::RandomSource as _;
 use super::super::net;
 use super::super::server::{ServerLevel, update_all};
 use super::super::states;
@@ -38,9 +39,12 @@ pub fn belt_segment(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Option<([i32; 3], i3
 /// `BeltBlock.useItemOn` for a player who may build and is not sneaking, clicked on `hit` (the
 /// face and the point): a wrench or a belt connector slices the belt (`slicer`), a dye or water
 /// (a bucket or a bottle, `held` naming a potion with its contents) colours or washes it, an
-/// empty main hand takes the segment's items (`use_belt`), a shaft makes a middle segment a
-/// pulley (used up outside creative), a casing cases the segment (`setCasingType`, nothing used
-/// up). True when the click was the belt's.
+/// empty main hand takes the segment's items (`use_belt`) and lets the click go on, a shaft
+/// makes a middle segment a pulley (used up outside creative), a casing cases the segment
+/// (`setCasingType`, nothing used up). `Success` when the belt took the click; `Fail` when the
+/// slicer refused it; None passes it on (`PASS_TO_DEFAULT_BLOCK_INTERACTION`). After `Fail` or
+/// None the held item's own use follows, as in Create (the wrench's `onWrenched`, the belt
+/// connector forgetting a shaft that went).
 pub fn use_belt_with(
     lv: &mut ServerLevel<'_>,
     pos: [i32; 3],
@@ -48,21 +52,22 @@ pub fn use_belt_with(
     hand: mod_api::Hand,
     held: Option<&str>,
     hit: (Dir, [f64; 3]),
-) -> bool {
-    let Some(p) = lv.host.player(player) else {
-        return false;
-    };
+) -> Option<mod_api::InteractionResult> {
+    use mod_api::InteractionResult::{Fail, Success};
+    let p = lv.host.player(player)?;
     if crate::glue::items::sneaking(&*lv.host, p) || p.may_build(&*lv.host) != Some(true) {
-        return false;
+        return None;
     }
-    // `BeltSlicer`: from the clicked point, measured from the block's centre.
+    // `BeltSlicer`: from the clicked point, measured from the block's centre. Its answer:
+    // SUCCESS when the belt changed, FAIL when refused, else passed on.
     let local = [0, 1, 2].map(|i| hit.1[i] - f64::from(pos[i]) - 0.5);
+    let sliced = |r: Option<bool>| r.map(|changed| if changed { Success } else { Fail });
     match held {
         Some("create:wrench") => {
-            return super::slicer::use_wrench(lv, pos, p, hit.0, local).is_some();
+            return sliced(super::slicer::use_wrench(lv, pos, p, hit.0, local));
         }
         Some("create:belt_connector") => {
-            return super::slicer::use_connector(lv, pos, p, local).is_some();
+            return sliced(super::slicer::use_connector(lv, pos, p, local));
         }
         _ => {}
     }
@@ -70,23 +75,40 @@ pub fn use_belt_with(
     if let Some(h) = held {
         let dye = create_engine::dye::DyeColor::of_item(h);
         if dye.is_some() || crate::glue::fluids::empties_water(h) {
-            return apply_color(lv, pos, dye.map(|d| d.name()));
+            return apply_color(lv, pos, dye.map(|d| d.name())).then_some(Success);
+        }
+    }
+    // A package goes onto the segment (`handler.insertItem(0, stack.copy(), false)`), one used
+    // up when it all went (creative too: `stack.shrink(1)`); else the click goes on.
+    if held.is_some_and(|h| create_engine::package::is_package(create_engine::arm::item_id(h)))
+        && let Some(stack) = crate::glue::items::held(&*lv.host, p, hand)
+    {
+        let (key, progress) = belt_name(&*lv.host, &stack);
+        let count = stack.count().min(u32::from(items::stack_limit(&*lv.host, &key))) as u8;
+        if put_on_from_above(lv, pos, &key, count, progress, false) == Some(0) {
+            crate::glue::items::shrink_held(&mut *lv.host, p, hand, 1);
+            return Some(Success);
         }
     }
     match held {
-        None => hand == mod_api::Hand::Main && use_belt(lv, pos, player),
+        // `isHand`: the items within reach go to the player, and the click goes on
+        // (`PASS_TO_DEFAULT_BLOCK_INTERACTION`): Create's server never takes it here.
+        None => {
+            if hand == mod_api::Hand::Main {
+                use_belt(lv, pos, player);
+            }
+            None
+        }
         Some("create:shaft") => {
-            let Some((_, _, seg)) = belt_segment(lv, pos) else {
-                return false;
-            };
+            let (_, _, seg) = belt_segment(lv, pos)?;
             if seg.part != belt::Part::Middle {
-                return false;
+                return None;
             }
             if !crate::glue::items::creative(&*lv.host, p) {
                 crate::glue::items::shrink_held(&mut *lv.host, p, hand, 1);
             }
             crate::glue::items::wrench::switch_property(lv, pos, "part", "pulley");
-            true
+            Some(Success)
         }
         Some(c @ ("create:andesite_casing" | "create:brass_casing")) => {
             let kind = if c == "create:brass_casing" {
@@ -105,9 +127,9 @@ pub fn use_belt_with(
                 1.0,
                 0.8,
             );
-            true
+            Some(Success)
         }
-        _ => false,
+        _ => None,
     }
 }
 
@@ -283,7 +305,8 @@ pub fn wrench_belt(
 }
 
 /// `BeltBlock.useItemOn` with an empty main hand: every item within reach of the segment's
-/// centre goes to the player. True when the click was the belt's.
+/// centre goes to the player, with the pickup sound when any did. True when the segment's belt
+/// is formed (`getControllerBE`).
 pub fn use_belt(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: u128) -> bool {
     let Some((c, index, _)) = belt_segment(lv, pos) else {
         return false;
@@ -300,10 +323,27 @@ pub fn use_belt(lv: &mut ServerLevel<'_>, pos: [i32; 3], player: u128) -> bool {
     })
     .flatten()
     .unwrap_or_default();
+    let success = !taken.is_empty();
     for i in taken {
         if let Some(s) = belt_stack(lv, &i) {
             items::give(&mut *lv.host, player, s);
         }
+    }
+    if success {
+        // `level.playSound(null, pos, SoundEvents.ITEM_PICKUP, SoundSource.PLAYERS, .2f,
+        // 1f + level.random.nextFloat())`.
+        let pitch = lv
+            .level
+            .with_random(&mut *lv.host, |r| r.next_float())
+            .map_or(1.0, |f| 1.0 + f);
+        lv.level.play_sound(
+            &mut *lv.host,
+            "minecraft:entity.item.pickup",
+            pos.map(|v| f64::from(v) + 0.5),
+            mod_api::SoundSource::Players,
+            0.2,
+            pitch,
+        );
     }
     true
 }
@@ -477,6 +517,7 @@ pub fn handle_insertion(
             return None;
         }
         with_world(|w| w.depot_put(dim, next, Some(held)));
+        super::depot::inserted_sound(lv, next, &held);
         return Some(rest);
     }
     // BeltBlockEntity.tryInsertingFromSide on the next belt.
@@ -735,8 +776,9 @@ pub fn break_pass(lv: &mut ServerLevel<'_>) {
     belt::break_cascade(&mut BeltBreakWorld(lv));
     let dim = lv.dim;
     let drops = with_world(|w| std::mem::take(&mut w.dims[dim].belt_drops)).unwrap_or_default();
-    for (c, seg, length, item) in drops {
-        eject_item(lv, c, &seg, length, 0.0, &item);
+    // `BeltInventory.eject` at the speed the belt had: along it, an eighth up.
+    for (c, seg, length, item, rpm) in drops {
+        eject_item(lv, c, &seg, length, rpm, &item);
     }
 }
 
@@ -1239,7 +1281,8 @@ pub fn stepped_on(on: [i32; 3], entity: u32) {
 /// by stepping up its stairs (`BeltShapes`) and down it at the belt's speed. The mod API moves an
 /// entity only by its motion (`EntityRef::set_velocity`), so a passenger is given the belt's
 /// motion each tick rather than moved by it. Mobs are slowed (slowness II for half a second)
-/// and take no fall damage while carried.
+/// and take no fall damage while carried. Only the segment at an entity's feet carries it when
+/// it touches two, and on a slow belt an entity just ahead stops it.
 pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
     let dim = lv.dim;
     let mut mine: Vec<([i32; 3], u32, bool)> = PASSENGERS.with_borrow_mut(|p| {
@@ -1258,11 +1301,17 @@ pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
     if mine.is_empty() {
         return;
     }
-    // One belt segment per entity: the one it stands in (`lastCollidedPos`).
+    // The segments each entity touched this tick.
     mine.sort_by_key(|e| (e.1, e.2));
-    mine.dedup_by_key(|e| e.1);
-    let slowness = lv.host.effect_key("minecraft:slowness");
+    let mut touched: Vec<(u32, Vec<([i32; 3], bool)>)> = Vec::new();
     for (pos, id, stepped) in mine {
+        match touched.last_mut() {
+            Some((last, list)) if *last == id => list.push((pos, stepped)),
+            _ => touched.push((id, vec![(pos, stepped)])),
+        }
+    }
+    let slowness = lv.host.effect_key("minecraft:slowness");
+    for (id, list) in touched {
         let Some(e) = lv.host.entity(id) else {
             continue;
         };
@@ -1280,6 +1329,14 @@ pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
         };
         let at = feet.map(|v| v.floor() as i32);
         let below = [at[0], at[1] - 1, at[2]];
+        // One belt segment per entity (`lastCollidedPos`): the one at its feet when it is inside
+        // that one (`info.refresh` when `pos.equals(entityIn.blockPosition())`), else the first
+        // it touched.
+        let (pos, stepped) = list
+            .iter()
+            .copied()
+            .find(|&(p, stepped)| !stepped && p == at)
+            .unwrap_or(list[0]);
         let pos = if !stepped {
             pos
         } else if belt_segment(lv, at).is_some() {
@@ -1290,6 +1347,11 @@ pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
             // Over the edge of the segment holding it up.
             pos
         };
+        // Don't fight other belts (`betweenBelts`): a belt segment at its feet that is not this
+        // one leaves it be.
+        if pos != at && belt_segment(lv, at).is_some() {
+            continue;
+        }
         let Some((c, _, seg)) = belt_segment(lv, pos) else {
             continue;
         };
@@ -1305,6 +1367,12 @@ pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
                 &mod_api::ActiveEffect::new(key, 10, 1, false, false, false),
             );
         }
+        // Entity collisions (`BeltMovementHandler.java:155-167`): on a belt slower than half a
+        // block a tick, an entity just ahead of it stops it (`setDeltaMovement(0, 0, 0)`).
+        if belt::movement_speed(rpm).abs() < 0.5 && blocked_ahead(lv, e, m) {
+            e.set_velocity(&mut *lv.host, [0.0; 3]);
+            continue;
+        }
         e.reset_fall_distance(&mut *lv.host);
         // Up a slope it climbs the belt's stairs as it is pushed along (gravity keeps it on
         // them); down one it sinks at the belt's speed against gravity (0.08 a tick).
@@ -1317,6 +1385,32 @@ pub fn transport_passengers(lv: &mut ServerLevel<'_>) {
         };
         e.set_velocity(&mut *lv.host, [m[0], vy, m[2]]);
     }
+}
+
+/// `BeltMovementHandler.transportEntity`'s entity check: the passenger `e`'s box moved half a
+/// block along its belt motion `m` and shrunk by as much (`checkBB`) meets another entity that
+/// does not let it through (`shouldIgnoreBlocking`).
+fn blocked_ahead(lv: &ServerLevel<'_>, e: mod_api::EntityRef, m: [f64; 3]) -> bool {
+    let Some([lo, hi]) = e.bounding_box(&*lv.host) else {
+        return false;
+    };
+    // `Vec3.normalize`: none under 1e-4.
+    let length = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
+    let ahead = if length < 1.0e-4 {
+        [0.0; 3]
+    } else {
+        m.map(|v| v / length * 0.5)
+    };
+    let from: [f64; 3] = std::array::from_fn(|i| lo[i] + ahead[i] + ahead[i].abs());
+    let to: [f64; 3] = std::array::from_fn(|i| hi[i] + ahead[i] - ahead[i].abs());
+    lv.level
+        .entities_in(&*lv.host, from, to)
+        .is_some_and(|entities| {
+            entities
+                .into_iter()
+                .filter(|other| *other != e)
+                .any(|other| ignores_blocking(&*lv.host, e, other) != Some(true))
+        })
 }
 
 /// Ground friction a walking entity's motion keeps each tick (a block's 0.6 times 0.91).

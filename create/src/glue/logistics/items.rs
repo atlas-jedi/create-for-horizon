@@ -253,6 +253,14 @@ pub fn random_angle(lv: &ServerLevel<'_>, pos: [i32; 3]) -> i32 {
     (x % 360) as i32
 }
 
+/// `new TransportedItemStack(stack)`'s turn for item `id` at `pos`: `random_angle`, or for a
+/// package its square turn (`belt::transported_angle`). A depot's `Held::new` takes it; a belt's
+/// `Item::new` works it out itself.
+pub fn stack_angle(lv: &ServerLevel<'_>, pos: [i32; 3], id: &str) -> i32 {
+    let package = create_engine::package::is_package(create_engine::arm::item_id(id));
+    create_engine::belt::transported_angle(random_angle(lv, pos), false, package)
+}
+
 /// The block entity at `pos`.
 pub fn entity(lv: &ServerLevel<'_>, pos: [i32; 3]) -> Option<BlockEntityRef> {
     lv.host.block_entity(lv.level, pos)
@@ -377,6 +385,17 @@ pub fn insert_room(
 ) -> Option<u32> {
     if let Some(room) = actors::psi_room(lv, pos, stack) {
         return Some(room);
+    }
+    // So does an item drain's, on a horizontal face (`ItemDrainItemHandler`): its stack is the
+    // engine's (`handlers::DrainItems`), a write this aborting transaction could not take back.
+    if !matches!(side, Direction::Up | Direction::Down)
+        && matches!(super::info_at(lv, pos), Some((create_engine::Block::ItemDrain, _)))
+        && let Some(i) = Direction::ALL.iter().position(|d| *d == side)
+    {
+        let (key, count) = super::handlers::drain_offer(&*lv.host, stack);
+        let travel = Dir::ALL[i].opposite();
+        let left = crate::glue::fluids::insert_into_drain_sim(lv, pos, travel, &key, count, true)?;
+        return Some(u32::from(count - left));
     }
     // A belt's handler (or a non-distributing brass tunnel delegating to the belt below)
     // answers from the engine (`ItemHandlerBeltSegment`), whose insert is not a journaled write

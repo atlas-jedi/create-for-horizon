@@ -44,6 +44,12 @@ impl Pose {
         [0, 1, 2].map(|i| self.centre[i] + turned[i])
     }
 
+    /// `toLocalVector`: a point of the world in the structure's blocks' space.
+    pub fn to_local(&self, world: [f64; 3]) -> [f64; 3] {
+        let d = [0, 1, 2].map(|i| world[i] - self.centre[i]);
+        unturn(d, &self.turns).map(|v| v + 0.5)
+    }
+
     /// Its turns as one unit quaternion `[x, y, z, w]`.
     pub fn rotation(&self) -> [f64; 4] {
         self.turns

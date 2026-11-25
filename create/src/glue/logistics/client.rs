@@ -34,7 +34,18 @@ struct ClientDepot {
 /// ago (for as long as the same items are on it).
 struct ClientBelt {
     contents: belt::Contents,
-    prev: Vec<f32>,
+    prev: Vec<(f32, f32)>,
+}
+
+/// Where a belt's items are now, along it and across it (`prevBeltPosition`,
+/// `prevSideOffset` for the next tick).
+fn belt_prev(contents: &belt::Contents) -> Vec<(f32, f32)> {
+    contents
+        .items
+        .items
+        .iter()
+        .map(|i| (i.position, i.side_offset))
+        .collect()
 }
 
 /// An arm a client draws: the server's last word and how far its move has come here.
@@ -339,15 +350,16 @@ pub fn draw_arm_points(host: &dyn ClientHost, event: &mut mod_api::RenderLevelSt
             .and_then(|l| l.block_state(host, p))
             .and_then(|s| host.state_outline(s))
             .unwrap_or_default();
+        // `if (shape.isEmpty()) continue;`: a point whose block went is not outlined.
+        if boxes.is_empty() {
+            continue;
+        }
         let (mut lo, mut hi) = ([1.0f64; 3], [0.0f64; 3]);
         for b in &boxes {
             for k in 0..3 {
                 lo[k] = lo[k].min(b[k]);
                 hi[k] = hi[k].max(b[k + 3]);
             }
-        }
-        if boxes.is_empty() {
-            (lo, hi) = ([0.0; 3], [1.0; 3]);
         }
         let min = [0, 1, 2].map(|k| f64::from(p[k]) + lo[k] - 0.002);
         let max = [0, 1, 2].map(|k| f64::from(p[k]) + hi[k] + 0.002);
@@ -437,8 +449,8 @@ fn table_info(
 pub fn animated(block: Block, pos: [i32; 3], entity: &mod_api::ModBlockEntity) -> bool {
     match block {
         Block::MechanicalArm | Block::WeightedEjector => true,
-        // A windowed chute's stack moves (`chute::CHUTE_MOTION`).
-        Block::Chute => matches!(
+        // A chute's drawn stack moves (`chute::CHUTE_MOTION`).
+        Block::Chute | Block::SmartChute => matches!(
             entity.nbt.get(&super::chute::CHUTE_MOTION.into()),
             Some(Tag::Float(b)) if f32::from_bits(*b) != 0.0
         ),
@@ -576,16 +588,26 @@ pub fn tick_client_flaps() {
 }
 
 /// The flaps the server noted on the block entity at `pos` since it was last drawn start to
-/// swing (`flap`: out 1, in -1); those of a block first seen are past.
-fn new_flaps(pos: [i32; 3], data: &Compound) {
-    let Some((serial, flaps)) = super::flaps::read(data) else {
+/// swing (`flap`: out 1, in -1); those of a block first seen are past, and its flaps (`keys`)
+/// start a little out instead (`createChasingFlap`'s `startWithValue(.25f)`).
+fn new_flaps(pos: [i32; 3], data: &Compound, keys: &[u8]) {
+    let read = super::flaps::read(data);
+    if read.is_none() && keys.is_empty() {
         return;
-    };
+    }
     CLIENT.with_borrow_mut(|c| {
-        let seen = c.flapped.insert(pos, serial);
-        if seen.is_none_or(|s| s == serial) {
+        // None noted yet counts as 0: the server counts from 1.
+        let serial = read.as_ref().map_or(0, |r| r.0);
+        let Some(seen) = c.flapped.insert(pos, serial) else {
+            let start = create_engine::funnel::FLAP_AT_START;
+            for &key in keys {
+                c.flaps.insert((pos, key), (start, start));
+            }
             return;
-        }
+        };
+        let Some((_, flaps)) = read.filter(|_| seen != serial) else {
+            return;
+        };
         for (side, inward) in flaps {
             let e = c.flaps.entry((pos, side)).or_insert((0.0, 0.0));
             e.1 = if inward { -1.0 } else { 1.0 };
@@ -593,8 +615,9 @@ fn new_flaps(pos: [i32; 3], data: &Compound) {
     });
 }
 
-/// `ChuteRenderer`: a windowed chute's stack at half size, turning as it falls, between where
-/// the server last put it and a tick on (`chute::CHUTE_ITEM`).
+/// `ChuteRenderer`: the stack a chute draws (a windowed one's, or one rising through the air
+/// under it, `chute::CHUTE_ITEM`) at half size, turning as it moves, between where the server
+/// last put it and a tick on; under the chute while it still rises from there.
 fn draw_chute_item(draw: &mut dyn BlockEntityDrawContext, host: &dyn Host, nbt: &Compound) {
     let Some(Tag::String(id)) = nbt.get(&super::chute::CHUTE_ITEM.into()) else {
         return;
@@ -609,7 +632,7 @@ fn draw_chute_item(draw: &mut dyn BlockEntityDrawContext, host: &dyn Host, nbt: 
     };
     let at = float(super::chute::CHUTE_POSITION);
     let motion = float(super::chute::CHUTE_MOTION);
-    let position = (at + motion * draw.partial()).clamp(0.0, 1.0);
+    let position = (at + motion * draw.partial()).clamp(at.min(0.0), 1.0);
     let Some(stack) = stack_of(host, &id, 1) else {
         return;
     };
@@ -629,6 +652,32 @@ fn draw_chute_item(draw: &mut dyn BlockEntityDrawContext, host: &dyn Host, nbt: 
 /// Whether a flap of the funnel or tunnel at `pos` swings.
 fn flapping(pos: [i32; 3]) -> bool {
     CLIENT.with_borrow(|c| c.flaps.keys().any(|(p, _)| *p == pos))
+}
+
+/// The flaps the funnel or tunnel `block` has, by key (`FunnelBlockEntity.hasFlap`: a sideways
+/// funnel's; `BeltTunnelBlockEntity.updateTunnelConnections`: a tunnel's sides, of which
+/// `draw_block_flaps` leaves out those a neighbour hides).
+fn flap_keys(block: Block, info: &create_engine::parts::StateInfo) -> Vec<u8> {
+    match block {
+        Block::AndesiteFunnel
+        | Block::BrassFunnel
+        | Block::AndesiteBeltFunnel
+        | Block::BrassBeltFunnel => {
+            if info.facing.is_some_and(|f| f.axis() != Axis::Y) {
+                vec![super::flaps::FUNNEL]
+            } else {
+                Vec::new()
+            }
+        }
+        Block::AndesiteTunnel | Block::BrassTunnel => match (info.axis, info.tunnel) {
+            (Some(axis), Some(shape)) => create_engine::tunnel::sides(axis, shape)
+                .into_iter()
+                .map(|d| d as u8)
+                .collect(),
+            _ => Vec::new(),
+        },
+        _ => Vec::new(),
+    }
 }
 
 /// `FlapStuffs.renderFlaps`: four flaps of model `file` on side `side` of the block, swung by
@@ -898,7 +947,7 @@ fn belts_from_server(data: &[u8]) {
                 cl.belts.remove(&c);
                 return;
             }
-            let prev = contents.items.items.iter().map(|i| i.position).collect();
+            let prev = belt_prev(&contents);
             cl.belts.insert(c, ClientBelt { contents, prev });
         });
     }
@@ -1006,7 +1055,7 @@ pub fn tick_client_belts(host: &mut dyn ClientHost) {
             length: i32::from(contents.length),
             movement: belt::movement_facing(rpm, contents.segment.facing),
         };
-        b.prev = contents.items.items.iter().map(|i| i.position).collect();
+        b.prev = belt_prev(contents);
         contents
             .items
             .tick(i32::from(contents.length), speed, horizontal, &mut side);
@@ -1159,13 +1208,23 @@ impl BlockEntityPart for LogisticsEntity {
         self.submit(host, &mut crate::glue::Submit::of(event));
     }
 
-    /// A belt's controller draws all its items: it is in view while any of the belt is.
+    /// A belt's controller draws all its items: it is in view while any of the belt is. An arm
+    /// reaches out of its block: it is in view within 3 blocks of it
+    /// (`ArmBlockEntity.createRenderBoundingBox().inflate(3)`).
     fn block_entity_render_bounding_box(
         &self,
         _host: &dyn ClientHost,
         event: &mut BlockEntityRenderBoundingBoxEvent<'_>,
     ) {
         let pos = event.pos;
+        if CLIENT.with_borrow(|c| c.arms.contains_key(&pos)) {
+            let b = &mut *event.bounds;
+            for k in 0..3 {
+                b[k] -= 3.0;
+                b[k + 3] += 3.0;
+            }
+            return;
+        }
         let Some((seg, length)) = CLIENT.with_borrow(|c| {
             c.belts
                 .get(&pos)
@@ -1190,8 +1249,8 @@ impl LogisticsEntity {
         let Some((block, info)) = table_info(host, event.state) else {
             return;
         };
-        new_flaps(event.pos, &event.entity.nbt);
-        if block == Block::Chute {
+        new_flaps(event.pos, &event.entity.nbt, &flap_keys(block, &info));
+        if matches!(block, Block::Chute | Block::SmartChute) {
             draw_chute_item(&mut *event.draw, host, &event.entity.nbt);
         }
         draw_block_flaps(&mut *event.draw, host, block, &info, event.pos);
@@ -1413,6 +1472,9 @@ fn draw_belt_items(
     }) else {
         return;
     };
+    let level = host.local_player().and_then(|p| p.level(host));
+    let segment = contents.segment;
+    let light = |offset: f32| segment_light(host, level, c, &segment, offset);
     draw_belt_contents(
         draw,
         host,
@@ -1421,29 +1483,69 @@ fn draw_belt_items(
         &prev,
         t,
         eye,
+        Some(&light),
     );
 }
 
-/// `BeltRenderer.renderItems`: each item where it lies along the belt (from where it was a tick
-/// ago, `prev`), turned and stacked as Create lays it.
+/// `BeltRenderer.renderItem`'s `stackLight` (`LevelRenderer.getLightColor`) for an item `offset`
+/// along the belt whose controller `c` is segment `seg`: the light of the segment it is over
+/// (`floor(offset)` steps along the belt and up or down its slope, unclamped), packed as
+/// `draw.light`; a cell the client holds no chunk for reads as full sky, no block light.
+fn segment_light(
+    host: &dyn ClientHost,
+    level: Option<mod_api::LevelRef>,
+    c: [i32; 3],
+    seg: &belt::Segment,
+    offset: f32,
+) -> u32 {
+    let segment = offset.floor() as i32;
+    let n = seg.facing.offset();
+    let up = match seg.slope {
+        belt::Slope::Upward => 1,
+        belt::Slope::Downward => -1,
+        _ => 0,
+    };
+    let at = [
+        c[0] + n[0] * segment,
+        c[1] + up * segment,
+        c[2] + n[2] * segment,
+    ];
+    let read = |layer, unloaded: i32| {
+        let v = level.and_then(|l| l.brightness(host, layer, at));
+        v.unwrap_or(unloaded).clamp(0, 15) as u32 * 16
+    };
+    read(mod_api::LightLayer::Sky, 15) | read(mod_api::LightLayer::Block, 0) << 8
+}
+
+/// `BeltRenderer.renderItems`: each item where it lies along and across the belt (from where it
+/// was a tick ago, `prev`: `lerp(partialTicks, prevBeltPosition, beltPosition)` and the same of
+/// its side offset), turned and stacked as Create lays it, lit by `light` of its offset (None on
+/// a contraption, which lights it with its own light).
+#[allow(clippy::too_many_arguments)]
 fn draw_belt_contents(
     draw: &mut dyn BlockEntityDrawContext,
     host: &dyn Host,
     layout: &dyn ItemLayout,
     contents: &belt::Contents,
-    prev: &[f32],
+    prev: &[(f32, f32)],
     t: f32,
     eye: Option<[f32; 3]>,
+    light: Option<&dyn Fn(f32) -> u32>,
 ) {
     let length = i32::from(contents.length);
     let same = prev.len() == contents.items.items.len();
+    let own_light = draw.light();
     for (i, it) in contents.items.items.iter().enumerate() {
-        let at = if same {
-            prev[i] + (it.position - prev[i]) * t
+        let (at, side) = if same {
+            let (p, s) = prev[i];
+            (p + (it.position - p) * t, s + (it.side_offset - s) * t)
         } else {
-            it.position
+            (it.position, it.side_offset)
         };
-        let place = belt::item_place(&contents.segment, length, at, it.side_offset);
+        if let Some(light) = light {
+            draw.set_light(light(at));
+        }
+        let place = belt::item_place(&contents.segment, length, at, side);
         let solid = layout.solid(host, &it.item);
         if super::items::upright(host, &it.item) {
             draw_upright_on_belt(draw, host, &place, it, solid, eye);
@@ -1463,6 +1565,9 @@ fn draw_belt_contents(
             draw.pop();
         }
         draw.pop();
+    }
+    if light.is_some() {
+        draw.set_light(own_light);
     }
 }
 
@@ -1653,6 +1758,12 @@ pub(super) fn arm_goggles(pos: [i32; 3]) -> bool {
     CLIENT.with_borrow(|c| c.arms.get(&pos).is_some_and(|a| a.shown.goggles))
 }
 
+/// Whether the arm at `pos`, as this client has it, has no inputs and no outputs
+/// (`ArmBlockEntity.addToTooltip`'s `hint.mechanical_arm_no_targets`).
+pub(crate) fn arm_without_targets(pos: [i32; 3]) -> bool {
+    CLIENT.with_borrow(|c| c.arms.get(&pos).is_some_and(|a| a.shown.points.is_empty()))
+}
+
 fn draw_arm(draw: &mut dyn BlockEntityDrawContext, host: &dyn ClientHost, pos: [i32; 3], t: f32) {
     let Some((s, progress)) = CLIENT.with_borrow(|c| {
         c.arms.get(&pos).map(|a| {
@@ -1725,9 +1836,10 @@ fn draw_arm_shown(
     for (name, m) in parts {
         draw.push();
         pose(draw, m);
-        // Hung from the ceiling, the goggles turn upright (`rotateZDegrees(180)`).
+        // Hung from the ceiling, the goggles turn upright (`rotateZDegrees(180)` about the
+        // claw's own origin: Create's partials are modelled about 0).
         if name == claw && s.ceiling && s.goggles {
-            draw.rotate_about([0.0, 0.0, 1.0], 180.0, [0.5; 3]);
+            draw.rotate_about([0.0, 0.0, 1.0], 180.0, [0.0; 3]);
         }
         let tinted = match (rainbow, name) {
             (Some(c), "part_arm_lower_body") => Some((ARM_TINTED[0], c)),
@@ -1887,17 +1999,14 @@ fn draw_filter(
                 let Some(facing) = info.facing else {
                     return;
                 };
-                let slot = create_engine::funnel::filter_slot(facing, info.belt_funnel, side);
-                let horizontal = facing.axis() != Axis::Y;
-                let tilted = horizontal
-                    && info.belt_funnel.is_none_or(|s| {
-                        matches!(
-                            s,
-                            create_engine::funnel::BeltShape::Pulling
-                                | create_engine::funnel::BeltShape::Pushing
-                        )
-                    });
-                (slot, if tilted { -22.5 } else { 0.0 })
+                let shape = info.belt_funnel;
+                let Some(slot) = create_engine::funnel::filter_slot(facing, shape, side) else {
+                    continue;
+                };
+                // `FunnelFilterSlotPositioning.rotate`.
+                let turn = create_engine::funnel::filter_rotation(facing, shape, side);
+                draw_filter_turned(draw, host, &id, slot, turn);
+                continue;
             }
         };
         let Some(slot) = slot else {
@@ -1917,6 +2026,21 @@ fn draw_filter_stack(
     slot: [f64; 3],
     tilt: f32,
 ) {
+    // `Sided.rotate`: the side's horizontal angle plus 180°, then 90° up for the top.
+    let y_rot = create_engine::decor::horizontal_angle(side) + 180.0;
+    let x_rot = if side == Dir::Up { 90.0 } else { 0.0 };
+    draw_filter_turned(draw, host, id, slot, (y_rot, x_rot + tilt));
+}
+
+/// One filter slot's item `id` at `slot`, turned `turn` degrees about y, then about x (the slot's
+/// `ValueBoxTransform.rotate`, `FilteringRenderer`).
+fn draw_filter_turned(
+    draw: &mut dyn BlockEntityDrawContext,
+    host: &dyn ClientHost,
+    id: &str,
+    slot: [f64; 3],
+    turn: (f32, f32),
+) {
     if id.is_empty() {
         return;
     }
@@ -1931,13 +2055,10 @@ fn draw_filter_stack(
         draw.set_light(0xF0F0);
     }
     {
-        // `Sided.rotate`: the side's horizontal angle plus 180°, then 90° up for the top.
-        let y_rot = create_engine::decor::horizontal_angle(side) + 180.0;
-        let x_rot = if side == Dir::Up { 90.0 } else { 0.0 };
         draw.push();
         draw.translate(slot.map(|v| v as f32));
-        draw.rotate_about(UP, y_rot, [0.0; 3]);
-        draw.rotate_about([1.0, 0.0, 0.0], x_rot + tilt, [0.0; 3]);
+        draw.rotate_about(UP, turn.0, [0.0; 3]);
+        draw.rotate_about([1.0, 0.0, 0.0], turn.1, [0.0; 3]);
         draw.scale([scale; 3]);
         if !solid {
             draw.translate([0.0, 0.0, -0.15]);
@@ -2075,10 +2196,10 @@ pub(crate) fn draw_riding_items(
             };
             if let Some(contents) = belt::decode(bytes).into_iter().next() {
                 let o = contents.controller.map(|v| v as f32);
-                let prev: Vec<f32> = contents.items.items.iter().map(|i| i.position).collect();
+                let prev = belt_prev(&contents);
                 draw.push();
                 draw.translate(o);
-                draw_belt_contents(draw, host, layout, &contents, &prev, 1.0, None);
+                draw_belt_contents(draw, host, layout, &contents, &prev, 1.0, None, None);
                 draw.pop();
             }
         }

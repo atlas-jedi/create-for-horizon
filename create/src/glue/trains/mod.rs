@@ -10,9 +10,13 @@
 //! - `station_screen`, `schedule_screen` (`gui`): the station's screens (`StationScreen`,
 //!   `AssemblyScreen`: its name, assembly, the train's name) and the schedule's editor
 //!   (`ScheduleScreen`), drawn as the mod's own screens.
-//! - `conductor`: schedules handed to a mob on a carriage seat behind controls, or held by a
-//!   station for the trains arriving there; `relocate`: moving a standing train with the
-//!   wrench.
+//! - `conductor`: schedules handed to a mob on a carriage seat behind controls (or a blaze
+//!   burner there), or held by a station for the trains arriving there, and the conductors a
+//!   scheduled train needs to run; `status`: what a train tells its owner (`TrainStatus`);
+//!   `relocate`: moving a standing train with the wrench.
+//! - `arrival`: a train's bells, note blocks and whistles as it ends a long journey
+//!   (`ArrivalSoundQueue`); `effects`: carriages' steam, sparks and smoke on clients
+//!   (`CarriageSounds`, `CarriageParticles`).
 //! - `visuals`: trains and cart contraptions as players see them, each block a vanilla block
 //!   display the server moves with its carriage, bogey or cart (`CarriageContraptionVisual`,
 //!   `StandardBogeyVisual`, `OrientedContraptionEntity`'s drawing).
@@ -56,6 +60,7 @@
 //!   consume a key, so a key bound to something else still does it.
 
 pub mod actors;
+mod arrival;
 pub mod assembly;
 mod cargo;
 mod carriage_draw;
@@ -66,6 +71,7 @@ mod contents;
 pub(super) mod controls;
 mod coupling_draw;
 mod doors;
+mod effects;
 pub(crate) mod gui;
 mod horn;
 mod railway;
@@ -75,14 +81,29 @@ mod saved;
 mod schedule_screen;
 mod station_draw;
 mod station_screen;
+mod status;
 mod structure;
+mod track_client;
 mod tracks;
 mod visuals;
 
 pub(crate) use cargo::key as cargo_key;
 
 pub use carts::{Carts, assembler_mode, set_assembler_mode};
+pub(crate) use actors::{
+    door_kinds, doors_controlled, put_carriage_carried, take_carriage_carried,
+};
 pub(crate) use carts::{put_cart_carried, take_cart_carried};
+
+/// The contraption controls on level `lv`'s carts and train carriages, each structure's by the
+/// key a click on them names and where it stands this tick (`actors::PosedControls`).
+pub(crate) fn posed_controls(
+    lv: &mut super::server::ServerLevel<'_>,
+) -> Vec<create_engine::actors::PosedControls> {
+    let mut all = carts::posed_controls(lv);
+    all.extend(actors::posed_controls(lv));
+    all
+}
 pub use controls::TrainControls;
 pub(crate) use controls::drivers;
 pub use railway::Trains;

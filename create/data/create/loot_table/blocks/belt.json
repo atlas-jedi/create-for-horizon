@@ -15,6 +15,31 @@
         }
       ],
       "rolls": 1.0
+    },
+    {
+      "bonus_rolls": 0.0,
+      "conditions": [
+        {
+          "type": "minecraft:survives_explosion"
+        },
+        {
+          "type": "minecraft:inverted",
+          "term": {
+            "type": "minecraft:block_state_property",
+            "block": "create:belt",
+            "properties": {
+              "part": "middle"
+            }
+          }
+        }
+      ],
+      "entries": [
+        {
+          "type": "minecraft:item",
+          "name": "create:shaft"
+        }
+      ],
+      "rolls": 1.0
     }
   ],
   "random_sequence": "create:blocks/belt"

@@ -357,6 +357,13 @@ fn place_anchored(lv: &mut ServerLevel<'_>) {
                 let deg = f64::from(m.turn.angle_at(now));
                 let pose = Pose::turned(*p, f.axis(), deg);
                 put(Owner::Anchor(*p, 0), STATIONARY, pose, &m.blocks);
+                // Each stabilized structure riding it: its own stand-in where it hangs, upright
+                // (`OrientedContraptionEntity`).
+                for (i, sub) in m.subs.iter().enumerate() {
+                    let shift = sub.shift(f.axis(), deg);
+                    let base = [0, 1, 2].map(|k| f64::from(p[k]) + shift[k]);
+                    put(Owner::Anchor(*p, 1 + i as u8), STATIONARY, Pose::translated(base), &sub.blocks);
+                }
             }
         }
         for (p, m) in &d.pistons {
@@ -393,6 +400,12 @@ fn place_anchored(lv: &mut ServerLevel<'_>) {
                 let pose = Pose::turned(*p, axis, f64::from(c.clock.minute));
                 put(Owner::Anchor(*p, 1), STATIONARY, pose, minute);
             }
+            for (i, (hand, sub)) in c.subs.iter().enumerate() {
+                let deg = if *hand == 0 { c.clock.hour } else { c.clock.minute };
+                let shift = sub.shift(axis, f64::from(deg));
+                let base = [0, 1, 2].map(|k| f64::from(p[k]) + shift[k]);
+                put(Owner::Anchor(*p, 2 + i as u8), STATIONARY, Pose::translated(base), &sub.blocks);
+            }
         }
         out
     })
@@ -424,10 +437,14 @@ fn anchored_blocks(dim: usize, owner: Owner) -> Vec<([i32; 3], u32)> {
                 .or_else(|| l.elevators.get(&p).map(|m| &m.blocks))
                 .or_else(|| l.clocks.get(&p).map(|m| &m.hour))
                 .cloned(),
-            Owner::Anchor(p, _) => l
-                .clocks
-                .get(&p)
-                .and_then(|c| c.minute.as_ref().map(|m| m.1.clone())),
+            // A stabilized structure riding a bearing's, or a clock's minute hand.
+            Owner::Anchor(p, k) => match d.windmills.get(&p) {
+                Some(m) => m.subs.get(usize::from(k) - 1).map(|s| s.blocks.clone()),
+                None => l.clocks.get(&p).and_then(|c| match k {
+                    1 => c.minute.as_ref().map(|m| m.1.clone()),
+                    _ => c.subs.get(usize::from(k) - 2).map(|s| s.1.blocks.clone()),
+                }),
+            },
             Owner::Gantry(start) => d
                 .gantries
                 .iter()

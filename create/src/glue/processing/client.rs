@@ -102,7 +102,7 @@ pub fn animated(block: Block, entity: &ModBlockEntity) -> bool {
 }
 
 /// A basin's stacks its block entity's data holds (`ITEMS_KEY`), in slot order.
-fn basin_items(nbt: &Compound) -> Vec<(String, u32)> {
+pub(super) fn basin_items(nbt: &Compound) -> Vec<(String, u32)> {
     basin_items_of(nbt.get(&basin_glue::ITEMS_KEY.into()))
 }
 
@@ -128,19 +128,24 @@ fn basin_items_of(tag: Option<&Tag>) -> Vec<(String, u32)> {
 }
 
 /// A basin's tanks its block entity's data holds: (fluid, amount) of the inputs, then outputs.
-fn basin_fluids(nbt: &Compound) -> Vec<(Fluid, u32)> {
+pub(super) fn basin_fluids(nbt: &Compound) -> Vec<(Fluid, u32)> {
+    basin_fluids_by_tank(nbt).into_iter().flatten().collect()
+}
+
+/// A basin's four tanks as its block entity's data holds them: the two inputs, then the two
+/// outputs, each (fluid, amount) or empty.
+pub(super) fn basin_fluids_by_tank(nbt: &Compound) -> [Option<(Fluid, u32)>; 4] {
+    let mut out = [None; 4];
     let Some(Tag::IntArray(v)) = nbt.get(&basin_glue::FLUIDS_KEY.into()) else {
-        return Vec::new();
+        return out;
     };
     let keys = crate::glue::fluids::fluid_keys(nbt, basin_glue::FLUIDS_KEY);
-    v.as_chunks::<2>()
-        .0
-        .iter()
-        .filter_map(|c| {
-            let fluid = create_engine::tank::Codes::fluid(&keys, c[0])?;
-            (c[1] > 0).then_some((fluid, c[1] as u32))
-        })
-        .collect()
+    for (slot, c) in out.iter_mut().zip(v.as_chunks::<2>().0) {
+        *slot = create_engine::tank::Codes::fluid(&keys, c[0])
+            .filter(|_| c[1] > 0)
+            .map(|fluid| (fluid, c[1] as u32));
+    }
+    out
 }
 
 /// `BasinBlockEntity.ingredientRotation`: the items in a basin swirl while its mixer works the
@@ -465,10 +470,11 @@ impl MachineDraw {
             }
             Block::MechanicalMixer => {
                 let speeds = kinetics::speeds_of(&event.entity.nbt);
-                let offset = mixer_head_offset(&event.entity.nbt, &*event.draw);
+                let (offset, head_speed) =
+                    mixer_head(&event.entity.nbt, &*event.draw, speeds[0]);
                 for d in parts::draws(block, &info, event.pos, speeds) {
                     if matches!(d.model, Model::MixerPole | Model::MixerHead) {
-                        draw_mixer_part(event.draw, &d, offset);
+                        draw_mixer_part(event.draw, &d, offset, head_speed);
                     }
                 }
             }
@@ -626,6 +632,40 @@ fn draw_deployer(
     };
     draw.item(&stack, context, None, 0);
     draw.pop();
+}
+
+/// `DeployerBlockEntity.addToGoggleTooltip` for the deployer at `pos`, from what the server last
+/// told of it: its header, its mode (yellow) and what it holds with how many (green), ahead of
+/// the stress lines already there, which a blank line then parts from them, as in Create.
+pub(super) fn deployer_goggles(
+    host: &dyn ClientHost,
+    pos: [i32; 3],
+    lines: &mut Vec<Vec<(String, u32)>>,
+) {
+    let Some((s, _)) = DEPLOYERS.with_borrow(|d| d.get(&pos).cloned()) else {
+        return;
+    };
+    let text = |key: &str, english: &str| {
+        host.translate(&format!("create.tooltip.deployer.{key}"))
+            .unwrap_or_else(|| english.to_owned())
+    };
+    let line = |t: String, rgb: u32| create_engine::gauge::goggles(0, vec![(t, rgb)]);
+    let mut mine = vec![line(text("header", "Deployer Information"), 0xFFFFFF)];
+    mine.push(if s.punch {
+        line(text("punching", "Mode: Attack"), 0xFFFF55)
+    } else {
+        line(text("using", "Mode: Use"), 0xFFFF55)
+    });
+    if let Some(stack) = s.held.as_deref().and_then(|id| stacks::stack(host, id, 1)) {
+        let contains = text("contains", "Item: %1$s x%2$s")
+            .replace("%1$s", &host.hover_name(&stack))
+            .replace("%2$s", &s.count.to_string());
+        mine.push(line(contains, 0x55FF55));
+    }
+    if !lines.is_empty() {
+        mine.push(Vec::new());
+    }
+    lines.splice(0..0, mine);
 }
 
 /// A crafter's facing and pointing as the client sees the block at `pos`; None for any other.
@@ -1054,7 +1094,8 @@ fn draw_saw_items(
     draw.translate([if outputs <= 1 { 0.5 } else { 0.25 }, 0.0, offset]);
     draw.translate([if along_z { -1.0 } else { 0.0 }, 0.0, 0.0]);
     for (rendered, (id, _)) in items.iter().enumerate() {
-        let Some(stack) = stacks::stack(host, id, 1) else {
+        // A stack named with its components (`items::key_of`) is drawn with them.
+        let Some(stack) = crate::glue::logistics::items::stack_of(host, id, 1) else {
             continue;
         };
         let block = crate::glue::compat::item_uses_block_light(&*host, &stack, ItemDisplayContext::Fixed);
@@ -1101,14 +1142,17 @@ fn draw_saw_blade(draw: &mut dyn BlockEntityDrawContext, info: &StateInfo, speed
 }
 
 /// The mixer's head lowered as its cycle has it this frame (`getRenderedHeadOffset`), from what
-/// the server last told of it (`MIXER_KEY`) run on by the game time; 7/16 at rest.
-fn mixer_head_offset(nbt: &Compound, draw: &dyn BlockEntityDrawContext) -> f32 {
+/// the server last told of it (`MIXER_KEY`) run on by the game time, 7/16 at rest; and the speed
+/// it turns at (`getRenderedHeadRotationSpeed`) for a mixer turning at `speed`.
+fn mixer_head(nbt: &Compound, draw: &dyn BlockEntityDrawContext, speed: f32) -> (f32, f32) {
+    use create_engine::basin::{head_offset, head_rotation_speed};
+    let resting = (head_offset(false, 0, 0.0), head_rotation_speed(false, 0, speed));
     let Some(Tag::Compound(c)) = nbt.get(&basin_glue::MIXER_KEY.into()) else {
-        return create_engine::basin::head_offset(false, 0, 0.0);
+        return resting;
     };
     let (Some(Tag::Int(told)), Some(Tag::Long(at))) = (c.get(&"T".into()), c.get(&"S".into()))
     else {
-        return create_engine::basin::head_offset(false, 0, 0.0);
+        return resting;
     };
     let ticks = create_engine::basin::shown_ticks(*told, draw.game_time() - at);
     // At the bottom the head waits for the server; past 40 the cycle is over.
@@ -1117,11 +1161,21 @@ fn mixer_head_offset(nbt: &Compound, draw: &dyn BlockEntityDrawContext) -> f32 {
     } else {
         draw.partial()
     };
-    create_engine::basin::head_offset(ticks < 40, ticks, partial)
+    let running = ticks < 40;
+    (
+        head_offset(running, ticks, partial),
+        head_rotation_speed(running, ticks, speed),
+    )
 }
 
-/// The mixer's pole or head `offset` down; the head turns with the mixer.
-fn draw_mixer_part(draw: &mut dyn BlockEntityDrawContext, d: &parts::Draw, offset: f32) {
+/// The mixer's pole or head `offset` down; the head turns at `head_speed`, as the renderer turns
+/// it (`speed * 6 / 10` degrees a tick: at rest as fast as its cog, twice that mixing).
+fn draw_mixer_part(
+    draw: &mut dyn BlockEntityDrawContext,
+    d: &parts::Draw,
+    offset: f32,
+    head_speed: f32,
+) {
     let partial = if d.model == Model::MixerPole {
         Partial::MixerPole
     } else {
@@ -1129,8 +1183,8 @@ fn draw_mixer_part(draw: &mut dyn BlockEntityDrawContext, d: &parts::Draw, offse
     };
     draw.push();
     draw.translate([0.0, -offset, 0.0]);
-    if d.rpm != 0.0 {
-        draw.spin([0.0, 1.0, 0.0], [0.5; 3], d.rpm * 0.3, d.phase);
+    if d.model == Model::MixerHead && head_speed != 0.0 {
+        draw.spin([0.0, 1.0, 0.0], [0.5; 3], head_speed * 0.6, 0.0);
     }
     draw_partial(draw, partial, "up");
     draw.still();

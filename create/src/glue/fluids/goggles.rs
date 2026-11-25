@@ -168,6 +168,10 @@ fn engine_lines(host: &dyn ClientHost, pos: [i32; 3]) -> Option<Vec<Vec<(String,
     };
     let [part, _] = create_engine::parts::parts(Block::PoweredShaft, &shaft_info, &settings);
     let capacity = part.map_or(0.0, |p| p.capacity);
+    // `if (Mth.equal(stressBase, 0)) return added;`: an engine without steam shows nothing.
+    if capacity.abs() < 1.0e-5 {
+        return None;
+    }
     let (speed, _) = super::super::kinetics::shown_theory(host, level, shaft);
     let generated = data
         .as_ref()

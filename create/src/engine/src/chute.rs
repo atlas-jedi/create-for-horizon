@@ -73,6 +73,112 @@ pub fn can_output_down(
     !diagonal && drop()
 }
 
+/// `handleUpwardOutput(true)`, the question `tick` asks past the middle of a stack the fans
+/// carry up: `inventory`, an item handler above reached through an open chute (no chute's,
+/// `grabCapability`) and whether a simulated `insertItemStacked` takes any of the stack, is the
+/// whole answer; else an input chute that takes it (`bestOutput`); else out of the top
+/// (`drop`: no funnel facing up, no solid bottom above), only while no chute leads in
+/// (`if (!inputChutes.isEmpty()) return false`).
+pub fn can_output_up(
+    inventory: Option<bool>,
+    best_input: bool,
+    has_inputs: bool,
+    drop: impl FnOnce() -> bool,
+) -> bool {
+    if let Some(takes) = inventory {
+        return takes;
+    }
+    best_input || !has_inputs && drop()
+}
+
+/// `handleUpwardOutput`'s `bestOutput`: of the chutes leading in (`getInputChutes`, each with
+/// whether it `canAcceptItem` the stack and its `getItemMotion`), the first moving up fastest,
+/// none falling. Its index.
+pub fn best_input(inputs: impl IntoIterator<Item = (bool, f32)>) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, (accepts, motion)) in inputs.into_iter().enumerate() {
+        if !accepts || motion < 0.0 {
+            continue;
+        }
+        if best.is_none_or(|(_, m)| m < motion) {
+            best = Some((i, motion));
+        }
+    }
+    best.map(|b| b.0)
+}
+
+/// `setItem(stack)`: where a stack given to a chute starts (`getItemMotion() < 0 ? 1 : 0`), at
+/// the top while it falls, at the bottom while the fans carry it up.
+pub fn start(motion: f32) -> f32 {
+    if motion < 0.0 { 1.0 } else { 0.0 }
+}
+
+/// `ChuteRenderer.renderSafe` and `SmartChuteRenderer.renderSafe`: whether a chute draws the
+/// stack it holds at `position`. A chute (`shape`) only facing down: in a window, else only
+/// up to its middle while a current pulls into it from under it (`bottomPullDistance`, the
+/// stack still rising through the air); a smart chute (no shape) only at or under its bottom.
+pub fn draws_item(facing: Dir, shape: Option<Shape>, bottom_pull: f32, position: f32) -> bool {
+    match shape {
+        None => position <= 0.0,
+        Some(_) if facing != Dir::Down => false,
+        Some(Shape::Window) => true,
+        Some(_) => bottom_pull != 0.0 && position <= 0.5,
+    }
+}
+
+/// `ChuteBlockEntity.addToGoggleTooltip`, in the game's language (`tr`, en_us for a key it
+/// lacks): the fans on its column (`pull` from above, `push` from below), which way its stacks
+/// move (`getItemMotion`) and what it holds (`contents`: the item's name and the count).
+pub fn tooltip(
+    pull: f32,
+    push: f32,
+    contents: Option<(&str, u32)>,
+    tr: &dyn Fn(&str) -> Option<String>,
+) -> Vec<crate::gauge::Line> {
+    // ChatFormatting WHITE, GRAY, YELLOW and GREEN.
+    const WHITE: u32 = 0xFF_FFFF;
+    const GRAY: u32 = 0xAA_AAAA;
+    const YELLOW: u32 = 0xFF_FF55;
+    const GREEN: u32 = 0x55_FF55;
+    let t = |key: &str, english: &str| {
+        tr(&format!("create.tooltip.chute.{key}")).unwrap_or_else(|| english.to_owned())
+    };
+    let line = |text: String, color: u32| crate::gauge::goggles(0, vec![(text, color)]);
+    let mut lines = vec![line(t("header", "Chute Information"), WHITE)];
+    if pull == 0.0 && push == 0.0 {
+        lines.push(line(t("no_fans_attached", "No attached fans"), GRAY));
+    }
+    if pull != 0.0 {
+        let text = if pull > 0.0 {
+            t("fans_pull_up", "Fans pull from Above")
+        } else {
+            t("fans_push_down", "Fans push from Above")
+        };
+        lines.push(line(text, GRAY));
+    }
+    if push != 0.0 {
+        let text = if push > 0.0 {
+            t("fans_push_up", "Fans push from Below")
+        } else {
+            t("fans_pull_down", "Fans pull from Below")
+        };
+        lines.push(line(text, GRAY));
+    }
+    let moves = if item_motion(push, pull) < 0.0 {
+        t("items_move_down", "Items move Downward")
+    } else {
+        t("items_move_up", "Items move Upward")
+    };
+    lines.push(line(format!("-> {moves}"), YELLOW));
+    if let Some((name, count)) = contents {
+        let text = t("contains", "Contains: %1$s x%2$s")
+            .replace("%2$s", &count.to_string())
+            .replace("%1$s", name);
+        lines.push(line(text, GREEN));
+    }
+    lines
+}
+
 /// `AbstractChuteBlock.isOpen` of a chute facing `facing` with `shape` (`ChuteBlock.isOpen`):
 /// open facing down, or as an intersection; a diagonal chute leading on in its own line is shut.
 /// A smart chute (no shape) always is.
@@ -114,6 +220,13 @@ pub const SMART_AMOUNT: u32 = 64;
 /// a vanilla container lacks; a funnel's `defaultExtractionTimer` here. Containers of Create's
 /// own blocks (vaults, depots) wake the chute when their contents change instead.
 pub const RETRY: i64 = 8;
+/// `tickAirStreams`' `entitySearchCooldown = 5`, counted down before it is tested: an empty
+/// chute the fans lift looks for item entities in the current under it every 6th tick (and at
+/// a belt below it every tick).
+pub const ENTITY_SEARCH: i64 = 6;
+/// `tickAirStreams`' `airCurrentUpdateCooldown` (`fanBlockCheckRate`, 30 ticks): how often a
+/// chute holding nothing tells its clients again of the fans on its column (its goggles' lines).
+pub const FAN_CHECK: i64 = 30;
 
 /// Empty chutes that may take from the inventory above them (`handleInputFromAbove`): those to
 /// look now (placed, emptied, a neighbour or the inventory changed), those to look again later
@@ -527,6 +640,77 @@ mod tests {
             update_state([1, 1, 0], Dir::East, Shape::Normal, &world, false),
             (Dir::East, Shape::Normal)
         );
+    }
+
+    #[test]
+    fn a_stack_the_fans_carry_up_goes_on_into_a_chute_leading_in() {
+        // `handleUpwardOutput` (`ChuteBlockEntity.java:446-472`): with no inventory above, the
+        // chutes leading in (a diagonal one beside included) take it before it may leave the
+        // top, and while any leads in it never leaves the top.
+        assert!(can_output_up(None, true, true, || false));
+        assert!(!can_output_up(None, false, true, || true));
+        assert!(can_output_up(None, false, false, || true));
+        assert!(!can_output_up(None, false, false, || false));
+        // An inventory above through an open chute is the whole answer.
+        assert!(!can_output_up(Some(false), true, true, || true));
+        assert!(can_output_up(Some(true), false, true, || false));
+        // The fastest rising one that takes it; the first of equals; none falling or full.
+        assert_eq!(best_input([(true, 0.05), (true, 0.1), (true, 0.1)]), Some(1));
+        assert_eq!(best_input([(false, 0.2), (true, 0.0)]), Some(1));
+        assert_eq!(best_input([(true, -0.2), (false, 0.1)]), None);
+        // `setItem(stack)`: at the top while falling, at the bottom while rising.
+        assert_eq!(start(MOTION), 1.0);
+        assert_eq!(start(item_motion(64.0, 0.0)), 0.0);
+        assert_eq!(start(0.0), 0.0);
+    }
+
+    #[test]
+    fn a_chute_draws_its_stack_in_a_window_or_while_it_rises_through_the_air() {
+        // `ChuteRenderer.renderSafe` (`ChuteRenderer.java:24-31`).
+        assert!(draws_item(Dir::Down, Some(Shape::Window), 0.0, 0.8));
+        assert!(!draws_item(Dir::Down, Some(Shape::Normal), 0.0, 0.3));
+        assert!(draws_item(Dir::Down, Some(Shape::Normal), 2.0, -1.5));
+        assert!(draws_item(Dir::Down, Some(Shape::Encased), 1.0, 0.5));
+        assert!(!draws_item(Dir::Down, Some(Shape::Normal), 2.0, 0.6));
+        assert!(!draws_item(Dir::East, Some(Shape::Window), 2.0, -1.0));
+        // `SmartChuteRenderer.renderSafe`: only once at or under its bottom.
+        assert!(draws_item(Dir::Down, None, 0.0, -0.5));
+        assert!(!draws_item(Dir::Down, None, 3.0, 0.2));
+    }
+
+    #[test]
+    fn the_goggles_tell_of_the_fans_the_way_and_the_stack() {
+        // `addToGoggleTooltip` in en_us.
+        let text = |lines: Vec<crate::gauge::Line>| -> Vec<String> {
+            lines.into_iter().map(|l| l[1].0.clone()).collect()
+        };
+        assert_eq!(
+            text(tooltip(0.0, 0.0, Some(("Cobblestone", 16)), &|_| None)),
+            [
+                "Chute Information",
+                "No attached fans",
+                "-> Items move Downward",
+                "Contains: Cobblestone x16"
+            ]
+        );
+        // A fan under the column blowing up: pushed from below, up.
+        assert_eq!(
+            text(tooltip(0.0, 64.0, None, &|_| None)),
+            ["Chute Information", "Fans push from Below", "-> Items move Upward"]
+        );
+        // One over it blowing down and one under it pulling down.
+        assert_eq!(
+            text(tooltip(-64.0, -32.0, None, &|_| None)),
+            [
+                "Chute Information",
+                "Fans push from Above",
+                "Fans pull from Below",
+                "-> Items move Downward"
+            ]
+        );
+        // The game's language when it has the key.
+        let tr = |k: &str| (k == "create.tooltip.chute.header").then(|| "Rutsche".to_owned());
+        assert_eq!(text(tooltip(0.0, 0.0, None, &tr))[0], "Rutsche");
     }
 
     #[test]

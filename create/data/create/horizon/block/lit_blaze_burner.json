@@ -48,5 +48,14 @@
   },
   "default_state": {
     "flame_type": "regular"
+  },
+  "state_light": {
+    "properties": [
+      "flame_type"
+    ],
+    "values": {
+      "regular": 12,
+      "soul": 9
+    }
   }
 }

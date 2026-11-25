@@ -60,7 +60,38 @@ struct Part {
     /// An actor's moving part (`ActorVisual`): the actor's block, its state's facts, its centre in
     /// the carriage's space (unturned) and which of its parts this is.
     actor: Option<(Block, StateInfo, [f64; 3], usize)>,
+    /// A sliding door's half or folding leaf (`SlidingDoorRenderer`): where it stands shut and
+    /// where open.
+    door: Option<DoorSlide>,
+    /// A mechanical bearing's top on a cart's contraption, by the bearing's facing: turned back
+    /// against the cart each tick (`StabilizedBearingMovementBehaviour`).
+    still: Option<create_engine::kinetics::Dir>,
 }
+
+/// A display of a sliding door riding a carriage: the door block's offset in the carriage, and
+/// the display's translation and left rotation with the door shut and open.
+#[derive(Clone, Copy)]
+struct DoorSlide {
+    local: [i32; 3],
+    shut: ([f32; 3], [f32; 4]),
+    open: ([f32; 3], [f32; 4]),
+}
+
+/// A sliding door's display to make: its block and properties, its centre in the carriage's
+/// space, its block's offset, its pose in its block shut and open, and whether it is open.
+struct DoorShape {
+    name: String,
+    props: Vec<(String, String)>,
+    centre: [f64; 3],
+    local: [i32; 3],
+    shut: actor_draw::Pose,
+    open: actor_draw::Pose,
+    is_open: bool,
+}
+
+/// Ticks a door's display takes to slide open or shut: Create's panel goes 0.15 of the way a
+/// tick (`SlidingDoorMovementBehaviour.tick`), 7 ticks from end to end.
+const DOOR_SLIDE_TICKS: i32 = 7;
 
 /// What a display group shows: `(level, train, CAR, carriage)`, `(level, train, BOGEY,
 /// bogey)` or `(level, cart's UUID, CART, 0)`.
@@ -257,22 +288,128 @@ pub fn tick(lv: &mut ServerLevel<'_>) {
     sync(lv, now, &[CAR, BOGEY]);
 }
 
-/// Carriage `car` of train `train` changed a block (a door opened): its displays are made
-/// again from its blocks next tick.
-pub fn refresh_car(lv: &mut ServerLevel<'_>, train: u32, car: usize) {
+/// The sliding door whose block is at `local` in carriage `car` of train `train` opened or
+/// closed: its displays (a half slid aside, or a folding door's two leaves) go to where
+/// `SlidingDoorRenderer` puts them open or shut, gliding there over the panel's 7 ticks.
+/// Horizon: a display glides evenly, where Create's panel moves by the square of how far it
+/// has got (HORIZON_GAPS.md).
+pub fn slide_door(lv: &mut ServerLevel<'_>, train: u32, car: usize, local: [i32; 3], open: bool) {
     let key = (lv.dim, u128::from(train), CAR, car);
-    if let Some(shown) = SHOWN.with_borrow_mut(|s| s.remove(&key)) {
-        for (id, _) in shown.displays {
-            if let Some(e) = lv.host.entity(id) {
-                e.discard(lv.host);
-            }
-        }
+    let moved: Vec<(u32, [f32; 3], [f32; 4])> = SHOWN.with_borrow_mut(|s| {
+        let Some(v) = s.get_mut(&key) else {
+            return Vec::new();
+        };
+        v.displays
+            .iter_mut()
+            .filter_map(|(id, part)| {
+                let door = part.door.filter(|d| d.local == local)?;
+                (part.translation, part.left) = if open { door.open } else { door.shut };
+                Some((*id, part.translation, part.left))
+            })
+            .collect()
+    });
+    for (id, translation, left) in moved {
+        let Some(e) = lv.host.entity(id) else {
+            continue;
+        };
+        let Some(d) = lv.host.display(e) else {
+            continue;
+        };
+        let mut t = Transformation::IDENTITY;
+        t.translation = translation;
+        t.left_rotation = left;
+        d.set_start_interpolation(lv.host, 0);
+        d.set_interpolation_duration(lv.host, DOOR_SLIDE_TICKS);
+        d.set_transformation(lv.host, t);
     }
 }
 
-/// A cart's contraption as `carts` takes it.
+/// A sliding door riding a carriage or cart (`Contraption.capture` takes it hidden, and its block
+/// entity's renderer draws it): the displays that show it, posed in its block shut and open as
+/// `SlidingDoorRenderer` poses it at 0 and 1. A sliding door's half is its block closed and
+/// shown (`setValue(OPEN, false)`), slid aside when open (the upper half a 512th lower); a
+/// folding door is its two leaves, made by its lower half, folded when open. None for any other
+/// block.
+fn door_shapes(name: &str, s: u32, centre: [f64; 3], local: [i32; 3]) -> Option<Vec<DoorShape>> {
+    use actor_draw::Parts as _;
+    use create_engine::door::{Door, FoldStep, fold_pose, slide_offset};
+    let (_, info) = crate::glue::contraptions::create_info(s)
+        .filter(|(b, _)| create_engine::dye::is_sliding_door(*b))?;
+    let d = Door::of(&info)?;
+    let still = |t: [f64; 3]| actor_draw::Pose {
+        q: actor_draw::Pose::IDENTITY.q,
+        t,
+    };
+    if let Some(leaves) = crate::glue::decor::doors::fold_leaves(name) {
+        if d.upper {
+            return Some(Vec::new());
+        }
+        let pose = |value: f32| {
+            let mut p = Poses::default();
+            for left in [true, false] {
+                let (model_left, steps) = fold_pose(d.facing, d.hinge_right, left, value);
+                p.push();
+                for step in steps {
+                    match step {
+                        FoldStep::Translate(by) => p.translate(by),
+                        FoldStep::TurnY { degrees, pivot } => {
+                            p.rotate_about([0.0, 1.0, 0.0], degrees, pivot)
+                        }
+                    }
+                }
+                p.part(if model_left { leaves[0] } else { leaves[1] }, "north");
+                p.pop();
+            }
+            p.out
+        };
+        let (shut, open) = (pose(0.0), pose(1.0));
+        return Some(
+            shut.into_iter()
+                .zip(open)
+                .map(|((leaf, facing, shut), (_, _, open))| DoorShape {
+                    name: leaf,
+                    props: vec![("facing".to_owned(), facing.to_owned())],
+                    centre,
+                    local,
+                    shut,
+                    open,
+                    is_open: d.open,
+                })
+                .collect(),
+        );
+    }
+    let low = if d.upper { -1.0 / 512.0 } else { 0.0 };
+    let slide = slide_offset(d.facing, d.hinge_right, 1.0).map(f64::from);
+    let half = if d.upper { "upper" } else { "lower" };
+    let facing = crate::glue::kinetics::dir_name(d.facing);
+    let hinge = if d.hinge_right { "right" } else { "left" };
+    let props = [
+        ("facing", facing),
+        ("half", half),
+        ("hinge", hinge),
+        ("open", "false"),
+        ("powered", "false"),
+        ("visible", "true"),
+    ]
+    .map(|(k, v)| (k.to_owned(), v.to_owned()))
+    .to_vec();
+    Some(vec![DoorShape {
+        name: name.to_owned(),
+        props,
+        centre,
+        local,
+        shut: still([0.0, low, 0.0]),
+        open: still([slide[0], slide[1] + low, slide[2]]),
+        is_open: d.open,
+    }])
+}
+
+/// A cart's contraption as `carts` takes it: its cart, which of its contraptions (0 its own,
+/// then the stabilized ones riding it), its pivot, turn, pitch, base turn, blocks and what their
+/// block entities hold.
 pub type CartPose<'a> = (
     u128,
+    usize,
     [f64; 3],
     f32,
     f32,
@@ -284,7 +421,9 @@ pub type CartPose<'a> = (
 /// The cart contraptions of a level after its carts moved (`OrientedContraptionEntity`'s
 /// drawing): each cart's UUID, its contraption's pivot (its anchor block's centre), its turn
 /// (`Mounted::angle`), pitch and the turn of its initial orientation, drawn
-/// `Y(angle - base) · Z(pitch) · Y(base)` about the pivot, and the blocks.
+/// `Y(angle - base) · Z(pitch) · Y(base)` about the pivot, and the blocks. A stabilized
+/// contraption riding a cart's has a group of its own (by its number), its pivot where its
+/// blocks' offsets start, drawn at its own yaw.
 pub fn carts(lv: &mut ServerLevel<'_>, list: Vec<CartPose<'_>>) {
     let dim = lv.dim;
     if list.is_empty() && !SHOWN.with_borrow(|s| s.keys().any(|k| k.0 == dim && k.2 == CART)) {
@@ -292,8 +431,8 @@ pub fn carts(lv: &mut ServerLevel<'_>, list: Vec<CartPose<'_>>) {
     }
     let now = list
         .into_iter()
-        .map(|(uuid, at, angle, pitch, base, blocks, held)| {
-            let key = (dim, uuid, CART, 0);
+        .map(|(uuid, index, at, angle, pitch, base, blocks, held)| {
+            let key = (dim, uuid, CART, index);
             let shown = SHOWN.with_borrow(|s| s.contains_key(&key));
             // `Ry(angle - base) Rz(pitch) Ry(base)` is `Ry(angle - base - 90) Rx(pitch)
             // Ry(base + 90)`.
@@ -480,6 +619,18 @@ fn sync(lv: &mut ServerLevel<'_>, mut now: Vec<Now>, kinds: &[u8]) {
                     }
                 }
             }
+            if let Some(facing) = part.still
+                && let Some(d) = lv.host.display(e)
+            {
+                let (translation, left) =
+                    actor_transform(still_pose(facing, counter_angle(n, facing)), n.turn);
+                let mut t = Transformation::IDENTITY;
+                t.translation = translation;
+                t.left_rotation = left;
+                d.set_start_interpolation(lv.host, 0);
+                d.set_interpolation_duration(lv.host, 1);
+                d.set_transformation(lv.host, t);
+            }
             if let Some(i) = part.bogey
                 && let Some(size) = size
                 && let Some((_, _, pose)) = bogey_parts(size, wheel as f32).get(usize::from(i))
@@ -515,8 +666,10 @@ fn spawn(lv: &mut ServerLevel<'_>, n: &Now) -> Shown {
     // Each display: its state, its point in the carriage's space, and its own turn about that
     // point (the partials' quarter) with the offset of its model's origin from the point.
     let mut parts: Vec<Shape> = Vec::new();
+    let mut doors: Vec<DoorShape> = Vec::new();
     let mut extras: Vec<([f64; 3], super::contents::Extra)> = Vec::new();
     let mut actors: Vec<(Block, StateInfo, [f64; 3], usize)> = Vec::new();
+    let mut kinetic: Vec<KineticShape> = Vec::new();
     let mut radius = 0.0;
     let mut bogey_size = None;
     if kind == BOGEY {
@@ -575,7 +728,7 @@ fn spawn(lv: &mut ServerLevel<'_>, n: &Now) -> Shown {
         }
         for (o, s) in blocks {
             // A cart's anchor is its assembler, not drawn (Create puts its rail back there).
-            if kind == CART && o == [0, 0, 0] {
+            if kind == CART && n.key.3 == 0 && o == [0, 0, 0] {
                 continue;
             }
             let Some(state) = super::car_state(s) else {
@@ -591,6 +744,31 @@ fn spawn(lv: &mut ServerLevel<'_>, n: &Now) -> Shown {
             // over the pivot, its centre over it; a cart's anchor block is centred on its pivot.
             let up = if kind == CART { 0.0 } else { 1.5 };
             let centre = [f64::from(o[0]), f64::from(o[1]) + up, f64::from(o[2])];
+            // A sliding door rides hidden: its displays show what its renderer draws.
+            if let Some(shapes) = door_shapes(&name, s, centre, o) {
+                doors.extend(shapes);
+                continue;
+            }
+            // `renderBlockEntities`: the parts its block entity's renderer draws, at rest; a
+            // mechanical bearing's top on a cart's own contraption turns back against the cart.
+            if let Some((block, info)) = crate::glue::contraptions::create_info(s) {
+                let actor = actor_draw::draws(block);
+                let parts_of = crate::glue::contraptions::draw::carried_parts(block, &info, actor, false);
+                for (key, prop, axis, phase) in parts_of {
+                    let model = crate::glue::names::Named::name(key, &*lv.host);
+                    let props = match prop {
+                        Some((k, v)) => vec![(k.to_owned(), v.to_owned())],
+                        None => props.clone(),
+                    };
+                    let counter = block == Block::MechanicalBearing && kind == CART && n.key.3 == 0;
+                    let still = info.facing.filter(|_| counter);
+                    let pose = match still {
+                        Some(f) => still_pose(f, counter_angle(n, f)),
+                        None => turned_pose(axis.map(f64::from), f64::from(phase)),
+                    };
+                    kinetic.push((model, props, centre, pose, still));
+                }
+            }
             parts.push((name, props, centre, [-0.5; 3], None));
             // An actor's moving parts, at rest until it moves.
             // Train controls draw their cover and levers on a train only.
@@ -624,12 +802,47 @@ fn spawn(lv: &mut ServerLevel<'_>, n: &Now) -> Shown {
             left,
             bogey,
             actor: None,
+            door: None,
+            still: None,
         };
         let nbt = display_nbt(&name, &props, part.translation, part.left, n.yaw, n.pitch);
         let pos = place(n, part);
         if let Some(id) = lv
             .host
             .summon(lv.dimension, "minecraft:block_display", pos, nbt)
+        {
+            displays.push((id, part));
+        }
+    }
+    for d in doors {
+        // Posed in its block as the door is, open or shut, the block centred on the display's
+        // point and turned with the carriage.
+        let slide = DoorSlide {
+            local: d.local,
+            shut: actor_transform(d.shut, n.turn),
+            open: actor_transform(d.open, n.turn),
+        };
+        let (translation, left) = if d.is_open { slide.open } else { slide.shut };
+        let part = Part {
+            at: turn_y(d.centre, n.turn),
+            translation,
+            left,
+            bogey: None,
+            actor: None,
+            door: Some(slide),
+            still: None,
+        };
+        let nbt = display_nbt(
+            &d.name,
+            &d.props,
+            part.translation,
+            part.left,
+            n.yaw,
+            n.pitch,
+        );
+        if let Some(id) =
+            lv.host
+                .summon(lv.dimension, "minecraft:block_display", place(n, part), nbt)
         {
             displays.push((id, part));
         }
@@ -650,6 +863,8 @@ fn spawn(lv: &mut ServerLevel<'_>, n: &Now) -> Shown {
             left: left.map(|v| v as f32),
             bogey: None,
             actor: None,
+            door: None,
+            still: None,
         };
         let mut nbt = e.nbt;
         let base = display_nbt("", &[], part.translation, part.left, n.yaw, n.pitch);
@@ -663,6 +878,25 @@ fn spawn(lv: &mut ServerLevel<'_>, n: &Now) -> Shown {
             tr.insert("scale".into(), floats);
         }
         if let Some(id) = lv.host.summon(lv.dimension, e.kind, place(n, part), nbt) {
+            displays.push((id, part));
+        }
+    }
+    for (name, props, centre, pose, still) in kinetic {
+        let (translation, left) = actor_transform(pose, n.turn);
+        let part = Part {
+            at: turn_y(centre, n.turn),
+            translation,
+            left,
+            bogey: None,
+            actor: None,
+            door: None,
+            still,
+        };
+        let nbt = display_nbt(&name, &props, part.translation, part.left, n.yaw, n.pitch);
+        if let Some(id) =
+            lv.host
+                .summon(lv.dimension, "minecraft:block_display", place(n, part), nbt)
+        {
             displays.push((id, part));
         }
     }
@@ -682,6 +916,8 @@ fn spawn(lv: &mut ServerLevel<'_>, n: &Now) -> Shown {
             left,
             bogey: None,
             actor: Some((block, info, centre, i)),
+            door: None,
+            still: None,
         };
         let props = vec![("facing".to_owned(), facing.to_owned())];
         let name = format!("create:{name}");
@@ -831,6 +1067,69 @@ fn actor_poses(
     let mut poses = Poses::default();
     actor_draw::actor_parts(&mut poses, block, info, doing);
     poses.out
+}
+
+/// A kinetic block's part to show: its model block and properties, its block's centre in the
+/// carriage's space, its pose in its block, and the facing of a bearing whose top turns back.
+type KineticShape = (
+    String,
+    Vec<(String, String)>,
+    [f64; 3],
+    actor_draw::Pose,
+    Option<create_engine::kinetics::Dir>,
+);
+
+/// A part turned `deg` about the unit axis `axis` through its block's centre, as a pose from the
+/// block's corner.
+fn turned_pose(axis: [f64; 3], deg: f64) -> actor_draw::Pose {
+    let q = actor_draw::quat(axis, deg);
+    let e = if axis[0] != 0.0 {
+        create_engine::kinetics::Axis::X
+    } else if axis[2] != 0.0 {
+        create_engine::kinetics::Axis::Z
+    } else {
+        create_engine::kinetics::Axis::Y
+    };
+    let r = create_engine::actors::turn_vec([0.5; 3], e, deg);
+    actor_draw::Pose {
+        q,
+        t: std::array::from_fn(|i| 0.5 - r[i]),
+    }
+}
+
+/// A mechanical bearing's top turned back `deg` about the bearing's axis
+/// (`StabilizedBearingMovementBehaviour.renderInContraption`).
+fn still_pose(facing: create_engine::kinetics::Dir, deg: f64) -> actor_draw::Pose {
+    let axis = match facing.axis() {
+        create_engine::kinetics::Axis::X => [1.0, 0.0, 0.0],
+        create_engine::kinetics::Axis::Y => [0.0, 1.0, 0.0],
+        create_engine::kinetics::Axis::Z => [0.0, 0.0, 1.0],
+    };
+    turned_pose(axis, deg)
+}
+
+/// `StabilizedBearingMovementBehaviour.getCounterRotationAngle` on a cart's contraption (an
+/// `OrientedContraptionEntity`, which stabilizes every bearing, `canBeStabilized`): a vertical
+/// bearing's top turns back by the cart's yaw (`-getViewYRot`), a horizontal one's by its pitch
+/// (`-getViewXRot`) when the cart's initial orientation lies along the bearing's axis, else
+/// not at all; degrees about the bearing's axis.
+fn counter_angle(n: &Now, facing: create_engine::kinetics::Dir) -> f64 {
+    use create_engine::kinetics::Axis;
+    // The cart's turn of its initial orientation (`base`), and its yaw from the display's.
+    let base = n.turn - 90.0;
+    if facing.axis() == Axis::Y {
+        return f64::from(n.yaw) - 90.0;
+    }
+    let along = if (base.rem_euclid(180.0) - 90.0).abs() < 1.0 {
+        Axis::X
+    } else {
+        Axis::Z
+    };
+    if facing.axis() == along {
+        -f64::from(n.pitch)
+    } else {
+        0.0
+    }
 }
 
 /// A display's translation and left rotation for a part posed `pose` in its block (from its

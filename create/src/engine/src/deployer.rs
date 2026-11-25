@@ -104,7 +104,29 @@ impl Deployer {
         self.reach = 0.5 + hit.min(0.75);
         self.timer = 1000;
     }
+}
 
+/// `start`'s ray (`Block.OUTLINE`, no fluids): it runs down the middle of the block two ahead,
+/// from its face toward the deployer to its far face, and stops at the first box of that
+/// block's outline `shape` (boxes `[x0, y0, z0, x1, y1, z1]` in the block) it meets. How far it
+/// got, 0 to 1; 1 when it met none (air, or a shape with a hole down its middle).
+pub fn ray_depth(shape: &[[f64; 6]], facing: Dir) -> f32 {
+    let a = match facing.axis() {
+        crate::kinetics::Axis::X => 0,
+        crate::kinetics::Axis::Y => 1,
+        crate::kinetics::Axis::Z => 2,
+    };
+    let across = |b: &[f64; 6]| (0..3).all(|i| i == a || (b[i] <= 0.5 && 0.5 <= b[i + 3]));
+    let hit = shape.iter().filter(|b| across(b));
+    let depth = if facing.positive() {
+        hit.map(|b| b[a]).fold(f64::INFINITY, f64::min)
+    } else {
+        hit.map(|b| 1.0 - b[a + 3]).fold(f64::INFINITY, f64::min)
+    };
+    depth.clamp(0.0, 1.0) as f32
+}
+
+impl Deployer {
     /// `tick` for a deployer over a depot (no fake player): the stroke runs down; at the bottom
     /// (`activate` hands the work to the depot) it draws back, then waits 500.
     pub fn tick(&mut self, rpm: f32) -> Tick {
@@ -493,6 +515,8 @@ pub struct Shown {
     pub at: f32,
     pub per_tick: f32,
     pub held: Option<String>,
+    /// How many it holds (the goggles' `tooltip.deployer.contains`).
+    pub count: u8,
     /// In punch mode (`Mode.PUNCH`): the held item is shown as a fist holds it.
     pub punch: bool,
 }
@@ -511,20 +535,21 @@ pub fn encode(list: &[Shown]) -> Vec<u8> {
         let b = &item.as_bytes()[..item.len().min(255)];
         out.push(b.len() as u8);
         out.extend_from_slice(b);
+        out.push(s.count);
     }
     out
 }
 
 pub fn decode(mut data: &[u8]) -> Vec<Shown> {
     let mut out = Vec::new();
-    while data.len() >= 22 {
+    while data.len() >= 23 {
         let int = |i: usize| i32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
         let float = |i: usize| f32::from_le_bytes([data[i], data[i + 1], data[i + 2], data[i + 3]]);
         let Some(&facing) = Dir::ALL.get(usize::from(data[12] & 0x7f)) else {
             break;
         };
         let n = usize::from(data[21]);
-        let Some(item) = data.get(22..22 + n) else {
+        let (Some(item), Some(&count)) = (data.get(22..22 + n), data.get(22 + n)) else {
             break;
         };
         let item = String::from_utf8_lossy(item).into_owned();
@@ -534,9 +559,10 @@ pub fn decode(mut data: &[u8]) -> Vec<Shown> {
             at: float(13),
             per_tick: float(17),
             held: (!item.is_empty()).then_some(item),
+            count,
             punch: data[12] & 0x80 != 0,
         });
-        data = &data[22 + n..];
+        data = &data[23 + n..];
     }
     out
 }
@@ -602,6 +628,7 @@ mod tests {
                 at: 0.5,
                 per_tick: -0.032,
                 held: Some("minecraft:oak_planks".into()),
+                count: 17,
                 punch: true,
             },
             Shown {
@@ -610,10 +637,36 @@ mod tests {
                 at: 0.0,
                 per_tick: 0.0,
                 held: None,
+                count: 0,
                 punch: false,
             },
         ];
         assert_eq!(decode(&encode(&list)), list);
+    }
+
+    #[test]
+    fn the_reach_stops_at_the_block_two_ahead() {
+        // `start`: `.5 + min(depth, .75)`.
+        let reach = |shape: &[[f64; 6]], facing| {
+            let mut d = Deployer::default();
+            d.start(ray_depth(shape, facing));
+            d.reach
+        };
+        let full = [[0.0, 0.0, 0.0, 1.0, 1.0, 1.0]];
+        let slab = [[0.0, 0.0, 0.0, 1.0, 0.5, 1.0]];
+        // Air: the ray meets nothing, the hand goes as far as it can.
+        assert_eq!(reach(&[], Dir::North), 1.25);
+        // A full block: the hand stops at its face, whichever way it faces.
+        assert_eq!(reach(&full, Dir::East), 0.5);
+        assert_eq!(reach(&full, Dir::Down), 0.5);
+        // A bottom slab under a deployer facing down: half a block further.
+        assert_eq!(reach(&slab, Dir::Down), 1.0);
+        // The same slab seen from below: its bottom is at the face.
+        assert_eq!(reach(&slab, Dir::Up), 0.5);
+        // A depot (13/16 high) under one.
+        assert_eq!(ray_depth(&[[0.0, 0.0, 0.0, 1.0, 0.8125, 1.0]], Dir::Down), 0.1875);
+        // A post off the middle line (a fence's side) is missed.
+        assert_eq!(ray_depth(&[[0.0, 0.0, 0.0, 0.25, 1.0, 1.0]], Dir::Down), 1.0);
     }
 
     #[test]

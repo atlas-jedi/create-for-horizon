@@ -250,9 +250,10 @@ pub struct Dimension {
     /// Controllers whose persisted inventory changed since publication.
     belt_saved_changes: std::collections::HashSet<[i32; 3]>,
     /// Segments to replace because their neighbour broke, and items a broken belt drops (with
-    /// the controller and segment they were on).
+    /// the controller and segment they were on, the belt's length, and the rpm
+    /// `BeltInventory.eject` throws them at).
     pub belt_breaks: Vec<BeltBreak>,
-    pub belt_drops: Vec<([i32; 3], crate::belt::Segment, i32, crate::belt::Item)>,
+    pub belt_drops: Vec<([i32; 3], crate::belt::Segment, i32, crate::belt::Item, f32)>,
     /// Items saved with a belt, kept until its chain is whole again after loading.
     belt_saved: HashMap<[i32; 3], crate::belt::Inventory>,
     /// Belt segments the belt slicer takes away (`UPDATE_MOVE_BY_PISTON`): their removal
@@ -618,6 +619,9 @@ pub struct Windmill {
     /// What it carries besides its blocks, storage and actors (its actors are found again from
     /// its blocks): its contraption controls, the kinds they turned off and its glue.
     pub extras: crate::actors::Carried,
+    /// The stabilized structures riding it (`stabilizedSubContraptions`), whose storage rides
+    /// with its own.
+    pub subs: Vec<crate::contraption::Stabilized>,
 }
 
 /// An encased fan (`EncasedFanBlockEntity`): its facing, speed and air current, and the depots
@@ -1549,6 +1553,13 @@ impl CreateWorld {
         new: u32,
         skip_shape_updates: bool,
     ) {
+        // A broken controller's `BeltBlockEntity.destroy` ejects its items at the speed it has
+        // before its block entity detaches (`belt_removed`).
+        let belt_speed = self
+            .table
+            .get(old)
+            .and_then(|(_, i)| i.belt)
+            .and_then(|_| self.speed(dim, pos));
         self.register_block_entity(dim, pos, old, new);
         if !skip_shape_updates {
             self.chain_shapes_due(dim, pos, old, new);
@@ -2044,7 +2055,7 @@ impl CreateWorld {
         if let Some(seg) = self.table.get(old).and_then(|(_, i)| i.belt)
             && self.table.get(new).map(|(b, _)| b) != Some(Block::Belt)
         {
-            self.belt_removed(dim, pos, seg);
+            self.belt_removed(dim, pos, seg, belt_speed);
         }
     }
 
@@ -3591,8 +3602,22 @@ impl CreateWorld {
     }
 
     /// A belt segment left (`BeltBlock.onRemove`): its belt drops its items, and the segments
-    /// next to it break in turn (a pulley leaves its shaft).
-    fn belt_removed(&mut self, dim: usize, pos: [i32; 3], seg: crate::belt::Segment) {
+    /// next to it break in turn (a pulley leaves its shaft). The items fly off at the belt's
+    /// speed (`BeltInventory.eject`): the broken controller's from before it detached
+    /// (`removed_speed`, `BeltBlockEntity.destroy`), else the controller's as the cascade
+    /// reaches it.
+    fn belt_removed(
+        &mut self,
+        dim: usize,
+        pos: [i32; 3],
+        seg: crate::belt::Segment,
+        removed_speed: Option<f32>,
+    ) {
+        let rpm = match self.dims[dim].belt_of.get(&pos).copied() {
+            Some(c) if c != pos => self.speed(dim, c),
+            _ => removed_speed,
+        }
+        .unwrap_or(0.0);
         let d = &mut self.dims[dim];
         if d.belt_quiet.remove(&pos) {
             return;
@@ -3602,7 +3627,7 @@ impl CreateWorld {
         {
             let length = belt.chain.len() as i32;
             for item in belt.items.items {
-                d.belt_drops.push((c, belt.segment, length, item));
+                d.belt_drops.push((c, belt.segment, length, item, rpm));
             }
             for p in &belt.chain {
                 d.belt_of.remove(p);
@@ -3746,12 +3771,13 @@ impl CreateWorld {
 
     /// `BeltBlockEntity.destroy` while the slicer sets the clicked START to air: the block
     /// entity is still the controller, so `getInventory().ejectAll()` takes every item off the
-    /// belt and drops it where it is (against the `beltLength` the slicer has just zeroed).
-    pub fn destroy_belt(&mut self, dim: usize, belt: &mut Belt) {
+    /// belt and drops it where it is (against the `beltLength` the slicer has just zeroed), at
+    /// the speed `rpm` that `detachKinetics` left it.
+    pub fn destroy_belt(&mut self, dim: usize, belt: &mut Belt, rpm: f32) {
         let d = &mut self.dims[dim];
         let controller = belt.chain[0];
         for item in belt.items.eject_all() {
-            d.belt_drops.push((controller, belt.segment, 0, item));
+            d.belt_drops.push((controller, belt.segment, 0, item, rpm));
         }
         d.belt_saved_changes.insert(controller);
     }
@@ -6289,15 +6315,38 @@ mod tests {
         let (_, mut taken) = w.take_belt(0, c).unwrap();
         // The slicer's `UPDATE_MOVE_BY_PISTON` write: no cascade, but `destroy` still runs.
         w.remove_belt_quietly(0, c);
-        w.destroy_belt(0, &mut taken);
+        w.destroy_belt(0, &mut taken, 32.0);
         assert!(taken.items.items.is_empty());
         let drops = &w.dims[0].belt_drops;
         assert_eq!(drops.len(), 1);
-        assert_eq!((drops[0].0, drops[0].2), (c, 0));
+        assert_eq!((drops[0].0, drops[0].2, drops[0].4), (c, 0, 32.0));
         assert_eq!(
             (drops[0].3.item.as_str(), drops[0].3.count),
             ("minecraft:iron_ingot", 15)
         );
+        states::clear_range();
+    }
+
+    /// `BeltBlockEntity.destroy` / `BeltBlock.onRemove` -> `ejectAll`: a broken running belt
+    /// throws its items at the speed its controller had (`BeltInventory.eject`), whether the
+    /// controller itself broke or a segment further on.
+    #[test]
+    fn a_broken_belt_throws_its_items_at_its_speed() {
+        let _guard = states::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let c = [0, 8, 0];
+        for broken in [[0, 8, 0], [0, 8, 2]] {
+            let mut w = long_belt_world(5, 32.0);
+            let rpm = w.speed(0, c).unwrap();
+            assert!(rpm != 0.0);
+            let item = crate::belt::Item::new("minecraft:iron_ingot", 3, 0, false);
+            w.dims[0].belts.get_mut(&c).unwrap().items =
+                crate::belt::Inventory::from_saved(vec![item], true);
+            let state = w.dims[0].states[&broken];
+            w.block_changed(0, broken, state, 0);
+            let drops = &w.dims[0].belt_drops;
+            assert_eq!(drops.len(), 1, "{broken:?}");
+            assert_eq!((drops[0].0, drops[0].4), (c, rpm), "{broken:?}");
+        }
         states::clear_range();
     }
 
@@ -6660,6 +6709,7 @@ mod tests {
                 ..Default::default()
             },
             extras: Default::default(),
+            subs: Vec::new(),
         };
         let running = [0, 8, 0];
         w.dims[0].windmills.insert(running, saved(10.0));
@@ -10174,6 +10224,7 @@ mod tests {
                     limit: None,
                 },
                 extras: Default::default(),
+                subs: Vec::new(),
             },
         );
         w.tick(0, &mut Vec::new());
@@ -11410,12 +11461,13 @@ mod tests {
         // Its own `powered` changing is no reason to look again.
         w.block_changed(0, o, observer, powered);
         assert!(w.dims[0].detectors.take_checks(1).is_empty());
-        // A tank under the switch: its contents changing reaches the switch.
+        // A tank under the switch: its contents changing waits for the switch's `lazyTick`;
+        // the observer's target changing reaches the observer.
         w.block_changed(0, [8, 64, 0], 0, tank);
         w.dims[0].tank_changes.push([8, 64, 0]);
         w.detectors_tanks_changed(0);
         w.detectors_contents_changed(0, [4, 64, 0]);
-        assert_eq!(w.dims[0].detectors.take_checks(2), [o, s]);
+        assert_eq!(w.dims[0].detectors.take_checks(2), [o]);
         w.neighbor_changed(0, o, powered);
         assert_eq!(w.dims[0].detectors.take_checks(3), [o]);
         // A cuckoo clock turns on a shaft out of its back.

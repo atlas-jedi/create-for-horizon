@@ -174,12 +174,13 @@ fn slots_level(lv: &mut ServerLevel<'_>, pos: [i32; 3], block: Block) -> i32 {
             })
             .flatten()
             .unwrap_or(0);
-            cmp::depot(present(lv), max)
+            let held = slot_stack(lv, pos, 0).map(|s| max_stack(lv, &s));
+            cmp::depot(present(lv), max, held)
         }
-        // A depot: its items over the held stack's max stack size, 64 when it holds none.
+        // A depot: its items over the held stack's max stack size, 99 when it holds none.
         Block::Depot => {
-            let held = slot_stack(lv, pos, 0).map_or(64, |s| max_stack(lv, &s));
-            cmp::depot(present(lv), held)
+            let held = slot_stack(lv, pos, 0).map(|s| max_stack(lv, &s));
+            cmp::depot(present(lv), held.unwrap_or(99), held)
         }
         Block::Basin => inventory(lv, &[pos], create_engine::basin::INPUTS),
         b if create_engine::dye::is_toolbox(b) => {

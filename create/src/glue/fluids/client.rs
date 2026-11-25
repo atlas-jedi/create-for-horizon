@@ -27,6 +27,7 @@ pub(super) fn register(r: &mut dyn Registrar) {
         crate::create_log!("[create] the fluids' block entity part was refused: {e:?}");
     }
     super::engine::register_client(r);
+    super::spouted::register(r);
     // Equipment registers before kinetics makes the type.
     super::super::equipment::register_cogs(r, &kind);
 }

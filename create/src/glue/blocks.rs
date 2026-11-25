@@ -194,6 +194,53 @@ impl BlockPart for TemplateBlock {
             None
         }
     }
+
+    fn update_shape(
+        &self,
+        level: &mut dyn mod_api::LevelTicksHost,
+        event: &mut mod_api::UpdateShapeEvent,
+    ) -> Option<BlockState> {
+        door_half_follows(&*level, event)
+    }
+}
+
+/// `DoorBlock.updateShape` toward a sliding door's other half, with Create's
+/// `SlidingDoorBlock.updateShape`: the half takes the other's state, `visible` too
+/// (`neighbourState.setValue(HALF, half)`). A half that opened still shown makes this one hidden
+/// as well, and that half takes it back when it hears of this one, all inside the write that
+/// opened it: the iron door's template opens a door by redstone (`DoorBlock.neighborChanged`)
+/// where Create's own `neighborChanged` sets `VISIBLE` false in the same `setBlock`, so no
+/// client ever sees an open door shown. Any other neighbour is the template's to answer.
+fn door_half_follows(
+    level: &dyn mod_api::LevelTicksHost,
+    event: &mod_api::UpdateShapeEvent,
+) -> Option<BlockState> {
+    let door = |s: BlockState| {
+        let id = states::id(s)?;
+        with_world(|w| w.table.get(id).map(|(b, i)| (b, *i)))
+            .flatten()
+            .filter(|(b, _)| dye::is_sliding_door(*b))
+    };
+    let (block, me) = door(event.state)?;
+    let toward = if me.upper {
+        mod_api::Direction::Down
+    } else {
+        mod_api::Direction::Up
+    };
+    if event.direction != toward {
+        return None;
+    }
+    let (other_block, other) = door(event.neighbour)?;
+    if other_block != block || other.upper == me.upper {
+        return None;
+    }
+    let half = if me.upper { "upper" } else { "lower" };
+    let next = level.state_with_property(event.neighbour, "half", half)?;
+    if other.open && other.visible {
+        level.state_with_property(next, "visible", "false")
+    } else {
+        Some(next)
+    }
 }
 
 /// `ValveHandleBlock.onBlockActivated` → `clicked`: not for a player who may not build, nor a
@@ -426,7 +473,8 @@ fn use_door(
 }
 
 /// Sliding doors after the level's tick: a door that opened is hidden (`visible` false, as
-/// Create sets it with `open`) and takes the other door of a double door with it, and its panel
+/// Create sets it with `open`; a door with both halves already is, by [`door_half_follows`] in
+/// the write that opened it) and takes the other door of a double door with it, and its panel
 /// slides; once a closed door's panel has slid shut it shows again, with an iron door's
 /// closing sound. Only doors that changed or still slide cost anything.
 fn tick_doors(lv: &mut ServerLevel<'_>) {

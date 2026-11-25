@@ -3,12 +3,14 @@
 //! they face (`DirectedDirectionalBlock.getTargetDirection`) and give a signal from what it
 //! holds.
 //!
-//! Create ticks both every tick (the switch reads its target every 10, `lazyTick`). Here they
-//! look again only when their target's contents change (the notifications the glue already
-//! has for depots, vaults, chutes and tanks), when a neighbour changes, while a belt they watch
-//! carries items, or every `lazyTick` interval for a vanilla container (no notification).
-//! Between looks their result is the same as Create's: an inventory whose version did not
-//! change keeps the observer on (`sustainSignal`) and the switch's level as it was.
+//! Create ticks both every tick. The observer looks each tick; here it looks again only when
+//! its target's contents change (the notifications the glue already has for depots, vaults,
+//! chutes and tanks), when a neighbour changes, while a belt it watches carries items, or every
+//! `lazyTick` interval for a container with no notification. Between looks its result is the
+//! same as Create's: an inventory whose version did not change keeps it on (`sustainSignal`).
+//! The switch reads its target only on its `lazyTick` (`SWITCH_LAZY`), when placed and when
+//! its filter changes (`updateCurrentLevel`), as Create's does: its level stays as it was
+//! between reads, whatever changes in the meantime.
 
 use crate::filter::{Filter, Passes};
 use crate::kinetics::Dir;
@@ -20,10 +22,13 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 pub const DEFAULT_DELAY: u8 = 6;
 /// `activate(3)`: the target block itself passes the filter.
 pub const BLOCK_DELAY: u8 = 3;
-/// `SmartObserverBlockEntity`'s `lazyTickRate` (20) and the switch's (10): how often a vanilla
-/// container, which sends no notification, is looked at.
+/// `SmartObserverBlockEntity`'s `lazyTickRate` (20): how often a container that sends no
+/// notification is looked at by an observer.
 pub const OBSERVER_LAZY: i64 = 20;
-pub const SWITCH_LAZY: i64 = 10;
+/// `ThresholdSwitchBlockEntity`'s `setLazyTickRate(10)`: `SmartBlockEntity.tick` counts
+/// `lazyTickCounter` down before testing it (`lazyTickCounter-- <= 0`, then back to 10), so
+/// `lazyTick` (`updateCurrentLevel`) comes every 11th tick.
+pub const SWITCH_LAZY: i64 = 11;
 /// `ThresholdSwitchBlockEntity.scheduleBlockTick`: its output follows two ticks later.
 pub const SWITCH_DELAY: i64 = 2;
 /// `handleCenteredProcessingOnAllItems(.45f, ...)`: how far from a belt segment's (or a
@@ -109,7 +114,8 @@ pub fn passes_fluid(filter: Option<&str>, fluid: Fluid) -> bool {
 }
 
 /// One inventory slot as a detector sees it: its item (none: empty), count and the item's
-/// largest stack.
+/// largest stack there (an empty slot's: what it takes of an item that stacks to 64,
+/// `min(64, getSlotLimit)`).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Slot<Item = String> {
     pub item: Option<Item>,
@@ -272,10 +278,11 @@ pub fn fill_level(filter: impl Passes, seen: &Seen) -> Option<(i32, i32, i32)> {
     let (mut level, mut max) = (0i64, 0i64);
     if let Some((slots, limit)) = &seen.inventory {
         for s in slots {
-            // `min(MAX_STACK_SIZE (64 for an empty slot), getSlotLimit)`.
+            // `min(MAX_STACK_SIZE (64 for an empty slot), getSlotLimit)`: an empty slot's
+            // `max_stack` is its own limit for a 64-stack.
             let space = match s.item {
                 Some(_) => s.max_stack.min(*limit),
-                None => 64.min(*limit),
+                None => 64.min(s.max_stack).min(*limit),
             };
             if space == 0 {
                 continue;
@@ -558,27 +565,41 @@ impl Detectors {
         saved
     }
 
-    /// The contents of the blocks `at` changed: the detectors looking at them look again.
+    /// The contents of the blocks `at` changed: the observers looking at them look again (a
+    /// switch waits for its `lazyTick`).
     pub fn contents_changed(&mut self, at: impl IntoIterator<Item = [i32; 3]>) {
         if self.watching.is_empty() {
             return;
         }
+        let Self {
+            watching,
+            switches,
+            checks,
+            ..
+        } = self;
         for p in at {
-            if let Some(list) = self.watching.get(&p) {
-                self.checks.extend(list.iter().copied());
+            if let Some(list) = watching.get(&p) {
+                checks.extend(list.iter().copied().filter(|d| !switches.contains_key(d)));
             }
         }
     }
 
-    /// A detector's neighbour changed: it looks again (its target may be a new block).
+    /// An observer's neighbour changed: it looks again (its target may be a new block). A
+    /// switch has no `neighborChanged`: it finds a new target at its `lazyTick`.
     pub fn neighbor_changed(&mut self, pos: [i32; 3]) {
-        if self.target_of.contains_key(&pos) {
+        if self.target_of.contains_key(&pos) && !self.switches.contains_key(&pos) {
             self.checks.push(pos);
         }
     }
 
-    /// How a detector's target is looked at again after this look, at game time `now`.
+    /// How a detector's target is looked at again after this look, at game time `now`. A
+    /// switch reads whatever its target is only on its `lazyTick`.
     pub fn watch(&mut self, pos: [i32; 3], watch: Watch, now: i64) {
+        let watch = if self.switches.contains_key(&pos) {
+            Watch::Lazy
+        } else {
+            watch
+        };
         if watch == Watch::Belt {
             self.belt_watch.insert(pos);
         } else {
@@ -1018,11 +1039,16 @@ mod tests {
         d.take_checks(0);
         d.contents_changed([[1, 64, 0], [9, 9, 9]]);
         assert_eq!(d.take_checks(1), [a]);
-        // A chest beside the switch: every 10 ticks; the observer's every 20.
-        d.watch(b, Watch::Lazy, 1);
+        // The switch reads only on its `lazyTick`: its target's contents or a neighbour
+        // changing is no reason, whatever the target is (every 11th tick, `SWITCH_LAZY`).
+        d.contents_changed([[6, 64, 0]]);
+        d.neighbor_changed(b);
+        assert!(d.take_checks(1).is_empty());
+        d.watch(b, Watch::Notified, 1);
+        assert!(d.take_checks(11).is_empty());
+        assert_eq!(d.take_checks(12), [b]);
+        // A chest beside the observer, which sends no notification: every 20 ticks.
         d.watch(a, Watch::Lazy, 1);
-        assert!(d.take_checks(10).is_empty());
-        assert_eq!(d.take_checks(11), [b]);
         assert_eq!(d.take_checks(21), [a]);
         // Turned to another target: watched there instead.
         d.placed(a, false, [0, 63, 0]);
@@ -1066,6 +1092,16 @@ mod tests {
             fill_level(Some("minecraft:dirt"), &chest),
             Some((0, 0, 1728))
         );
+        // Empty slots that take one item each (a crafter's): `min(64, getSlotLimit)` is 1.
+        let one = Slot {
+            max_stack: 1,
+            ..empty()
+        };
+        let crafter = Seen {
+            inventory: Some((vec![one.clone(), one, slot("minecraft:cobblestone", 1)], 64)),
+            ..Seen::default()
+        };
+        assert_eq!(fill_level(None::<&str>, &crafter), Some((0, 1, 66)));
         let mut s = Switch::default();
         let u = s.update_level(fill_level(None::<&str>, &chest));
         // At 128 (onWhenAbove 128): on; level 1 + 128/1728 * 4 = 1.

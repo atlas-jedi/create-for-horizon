@@ -1,13 +1,15 @@
-//! What clients draw of item drains (`ItemDrainRenderer`): the fluid in the drain's basin and
-//! the stack crossing it, rolling as it goes. The server shows a drain's stack in its block
-//! entity data (`DRAIN_ITEM`) each tick it changes.
+//! What clients draw of item drains (`ItemDrainRenderer`): the fluid in the drain's basin, the
+//! stack crossing it, rolling as it goes, and the stream pouring out of it while it is emptied.
+//! The server shows a drain's stack in its block entity data (`DRAIN_ITEM`) each tick it
+//! changes, with when its emptying started and the fluid it pours.
 
 use super::super::server::ServerLevel;
 use super::super::world::with_world;
 use super::TANK;
 use super::client::fluid_box;
 use create_engine::kinetics::Dir;
-use create_engine::tank::Codes;
+use create_engine::spout::FILLING_TIME;
+use create_engine::tank::{Codes, Fluid};
 use mod_api::{ClientHost, Compound, ItemDisplayContext, ModBlockEntity, Tag};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -31,25 +33,32 @@ pub(super) fn reset() {
 /// Drains whose stack moved or changed show it again.
 pub(super) fn send(lv: &mut ServerLevel<'_>) {
     let dim = lv.dim;
-    let now: Vec<([i32; 3], Vec<Tag>)> = with_world(|w| {
+    let time = lv.game_time();
+    let drains: Vec<([i32; 3], Option<create_engine::drain::Held>, i32)> = with_world(|w| {
         w.dims[dim]
             .drains
             .iter()
-            .map(|(p, d)| {
-                let c = d.held.as_ref().map_or_else(Vec::new, |h| {
-                    vec![
-                        Tag::String(h.item.as_str().into()),
-                        Tag::Int(i32::from(h.count)),
-                        Tag::Float(h.position.to_bits()),
-                        Tag::Float(h.prev.to_bits()),
-                        Tag::Int(h.from as i32),
-                    ]
-                });
-                (*p, c)
-            })
+            .map(|(p, d)| (*p, d.held.clone(), d.processing))
             .collect()
     })
     .unwrap_or_default();
+    let now: Vec<([i32; 3], Vec<Tag>)> = drains
+        .into_iter()
+        .map(|(p, held, processing)| {
+            let c = held.as_ref().map_or_else(Vec::new, |h| {
+                let mut c = vec![
+                    Tag::String(h.item.as_str().into()),
+                    Tag::Int(i32::from(h.count)),
+                    Tag::Float(h.position.to_bits()),
+                    Tag::Float(h.prev.to_bits()),
+                    Tag::Int(h.from as i32),
+                ];
+                c.extend(emptying(&h.item, processing, time));
+                c
+            });
+            (p, c)
+        })
+        .collect();
     let changed: Vec<_> = SHOWN.with_borrow_mut(|shown| {
         shown.retain(|(d, p), _| *d != dim || now.iter().any(|(q, _)| q == p));
         let mut changed = Vec::new();
@@ -71,6 +80,25 @@ pub(super) fn send(lv: &mut ServerLevel<'_>) {
     }
 }
 
+/// What a drain emptying `item` shows its clients of it (`processingTicks` and the item's
+/// fluid, for `ItemDrainRenderer.renderFluid`'s stream): the game time the cycle left its first
+/// tick, and the item's fluid (`GenericItemEmptying.emptyItem(.., simulate)`) as a code and its
+/// key. Nothing while it isn't emptying, nor while it waits on its first tick for room in the
+/// tank (Create's client stays at `FILLING_TIME` until the server moves on).
+fn emptying(item: &str, processing: i32, time: i64) -> Vec<Tag> {
+    if processing <= 0 || processing >= FILLING_TIME {
+        return Vec::new();
+    }
+    let start = time - i64::from(FILLING_TIME - processing);
+    let mut codes = Codes::default();
+    let code = codes.code(super::clicks::emptying(item).map(|e| e.fluid));
+    vec![
+        Tag::Long(start),
+        Tag::Int(code),
+        Tag::String(codes.keys.first().map_or("", String::as_str).into()),
+    ]
+}
+
 /// The stack a drain's data shows: item, count, position, previous position, way.
 fn shown(entity: &ModBlockEntity) -> Option<(String, u32, f32, f32, Dir)> {
     let Some(Tag::List(l)) = entity.nbt.get(&DRAIN_ITEM.into()) else {
@@ -82,6 +110,7 @@ fn shown(entity: &ModBlockEntity) -> Option<(String, u32, f32, f32, Dir)> {
         Tag::Float(position),
         Tag::Float(prev),
         Tag::Int(from),
+        ..,
     ] = l.as_slice()
     else {
         return None;
@@ -95,19 +124,49 @@ fn shown(entity: &ModBlockEntity) -> Option<(String, u32, f32, f32, Dir)> {
     ))
 }
 
-/// Whether a drain's stack moves this frame.
-pub(super) fn animated(entity: &ModBlockEntity) -> bool {
-    shown(entity).is_some_and(|(_, _, p, q, _)| p != q)
+/// The emptying a drain's data shows: the game time its cycle left its first tick, and the
+/// emptied item's fluid.
+fn shown_emptying(entity: &ModBlockEntity) -> Option<(i64, Option<Fluid>)> {
+    let Some(Tag::List(l)) = entity.nbt.get(&DRAIN_ITEM.into()) else {
+        return None;
+    };
+    let [_, _, _, _, _, Tag::Long(start), Tag::Int(code), Tag::String(key)] = l.as_slice() else {
+        return None;
+    };
+    let key = key.to_string_lossy();
+    let keys = if key.is_empty() { Vec::new() } else { vec![key] };
+    Some((*start, Codes::fluid(&keys, *code)))
 }
 
-/// `ItemDrainRenderer.renderFluid` (the basin's fluid) and `renderItem`.
+/// Whether a drain's stack moves this frame, or its stream pours.
+pub(super) fn animated(entity: &ModBlockEntity) -> bool {
+    shown(entity).is_some_and(|(_, _, p, q, _)| p != q) || shown_emptying(entity).is_some()
+}
+
+/// `ItemDrainRenderer.renderFluid` (the basin's fluid and the stream pouring into it) and
+/// `renderItem`.
 pub(super) fn draw(host: &dyn ClientHost, event: &mut crate::glue::Submit<'_>) {
-    if let Some(Tag::IntArray(v)) = event.entity.nbt.get(&TANK.into()).cloned()
-        && let &[fluid, amount, capacity] = v.as_slice()
-        && let Some(fluid) = Codes::fluid(&super::fluid_keys(&event.entity.nbt, TANK), fluid)
-        && amount > 0
-        && capacity > 0
+    let tank = match event.entity.nbt.get(&TANK.into()) {
+        Some(Tag::IntArray(v)) => match v.as_slice() {
+            &[fluid, amount, capacity] if amount > 0 && capacity > 0 => {
+                Codes::fluid(&super::fluid_keys(&event.entity.nbt, TANK), fluid)
+                    .map(|f| (f, amount, capacity))
+            }
+            _ => None,
+        },
+        _ => None,
+    };
+    // The stream, in the emptied item's fluid, else the basin's (`fluidStack2`).
+    if let Some((start, fluid)) = shown_emptying(event.entity)
+        && let Some(fluid) = fluid.or(tank.map(|t| t.0))
     {
+        let draw = &*event.draw;
+        let pt = (FILLING_TIME as f32 - (draw.game_time() - start) as f32) - draw.partial();
+        if let Some((min, max)) = create_engine::drain::stream(pt) {
+            fluid_box(host, &mut *event.draw, fluid, 1000, min, max);
+        }
+    }
+    if let Some((fluid, amount, capacity)) = tank {
         let level = (amount as f32 / capacity as f32).min(1.0);
         let (min, max) = (2.0 / 16.0, 14.0 / 16.0);
         let y = 5.0 / 16.0;

@@ -113,36 +113,46 @@ fn first_whistle(host: &dyn mod_api::Host, cars: &[Vec<([i32; 3], u32)>]) -> Opt
     for blocks in cars {
         let mut sorted: Vec<&([i32; 3], u32)> = blocks.iter().collect();
         sorted.sort_by_key(|(o, _)| *o);
-        let parts = |o: [i32; 3]| {
-            let (_, s) = blocks.iter().find(|(p, _)| *p == o)?;
-            super::state_parts(host, super::car_state(*s)?)
-        };
-        for (o, s) in sorted {
-            let Some((name, props)) =
-                super::car_state(*s).and_then(|st| super::state_parts(host, st))
-            else {
-                continue;
-            };
-            if name != "create:steam_whistle" {
-                continue;
+        for (o, state) in sorted {
+            if let Some(w) = whistle_at(host, blocks, *o, *state) {
+                return Some(w);
             }
-            let size = props
-                .iter()
-                .find(|(k, _)| k == "size")
-                .map(|(_, v)| v.as_str());
-            let pitch = create_engine::whistle::pitch(|h| {
-                let (n, p) = parts([o[0], o[1] + h, o[2]])?;
-                if n != "create:steam_whistle_extension" {
-                    return None;
-                }
-                let shape = p.iter().find(|(k, _)| k == "shape")?.1.clone();
-                create_engine::whistle::Shape::read(&shape)
-            });
-            let small = size == Some("small");
-            return Some((size == Some("large"), if small { 12 } else { 0 } - pitch));
         }
     }
     None
+}
+
+/// The steam whistle `state` at `o` of a carriage's `blocks`: whether it is large, and its pitch
+/// in semitones (12 up for a small one, less its own `Pitch`, which its extensions above it
+/// give).
+pub(super) fn whistle_at(
+    host: &dyn mod_api::Host,
+    blocks: &[([i32; 3], u32)],
+    o: [i32; 3],
+    state: u32,
+) -> Option<(bool, i32)> {
+    let parts = |o: [i32; 3]| {
+        let (_, s) = blocks.iter().find(|(p, _)| *p == o)?;
+        super::state_parts(host, super::car_state(*s)?)
+    };
+    let (name, props) = super::state_parts(host, super::car_state(state)?)?;
+    if name != "create:steam_whistle" {
+        return None;
+    }
+    let size = props
+        .iter()
+        .find(|(k, _)| k == "size")
+        .map(|(_, v)| v.as_str());
+    let pitch = create_engine::whistle::pitch(|h| {
+        let (n, p) = parts([o[0], o[1] + h, o[2]])?;
+        if n != "create:steam_whistle_extension" {
+            return None;
+        }
+        let shape = p.iter().find(|(k, _)| k == "shape")?.1.clone();
+        create_engine::whistle::Shape::read(&shape)
+    });
+    let small = size == Some("small");
+    Some((size == Some("large"), if small { 12 } else { 0 } - pitch))
 }
 
 /// `HonkPacket.Clientbound.handle`: a honk starts a train's horn (20 ticks, or 13 while it

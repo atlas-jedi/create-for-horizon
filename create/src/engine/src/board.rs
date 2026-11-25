@@ -631,7 +631,8 @@ pub fn ejector_slot(facing: Dir, side: Dir, charged: bool) -> Option<[f64; 3]> {
 }
 
 /// The ejector's board (`create.weighted_ejector.stack_size`, `between(0, 64)`).
-pub const EJECTOR: Board = scroll_value("Ejected Stack Size", 64);
+/// `EjectorBlockEntity.maxStackSize`: `between(0, Item.ABSOLUTE_MAX_STACK_SIZE)`, 0 to 99.
+pub const EJECTOR: Board = scroll_value("Ejected Stack Size", 99);
 
 /// `FactoryPanelBehaviour.createBoard`: the target amount, up to 100 items (row 0) or stacks
 /// (row 1), a milestone every 10.

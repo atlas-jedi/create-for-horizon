@@ -106,12 +106,18 @@ fn rolled(lv: &ServerLevel<'_>, at: [i32; 3], r: &deployer::Recipe) -> Vec<(Stri
         .collect()
 }
 
+/// `start`'s ray for the deployer at `pos` facing `facing`: how far into the block two ahead
+/// it gets before that block's outline (`deployer::ray_depth`).
+fn reach_depth(lv: &ServerLevel<'_>, pos: [i32; 3], facing: Dir) -> f32 {
+    let at = super::step(pos, facing, 2);
+    deployer::ray_depth(&lv.shape(at, mod_api::BlockShapeKind::Outline), facing)
+}
+
 /// The deployer's stroke starting toward a depot or belt: the ray from its face to the top of
 /// the block two ahead (`start`).
 fn start_over(lv: &ServerLevel<'_>, d: &mut Deployer, at: [i32; 3]) {
-    let top = lv.outline_top(at);
-    d.start((1.0 - top) as f32);
     let above = [at[0], at[1] + 2, at[2]];
+    d.start(reach_depth(lv, above, Dir::Down));
     let dim = lv.dim;
     with_world(|w| {
         let dd = &mut w.dims[dim];
@@ -179,6 +185,8 @@ pub fn deployer_on_depot(lv: &mut ServerLevel<'_>, depot: [i32; 3]) -> bool {
                 }
             };
             held.locked = true;
+            // `spawnedItemEffects`: crumbs of the stack worked on, at the hand.
+            crumbs(lv, above, Dir::Down, d.reach, stack.clone());
             deployer_used(lv, &mut d, &r, above);
             with_world(|w| w.set_deployer(dim, above, d.clone()));
             true
@@ -242,6 +250,12 @@ pub fn deployer_on_belt(
                     .collect(),
             };
             let outputs = press::on_belt(lv, at, outputs);
+            // `spawnedItemEffects`: crumbs of the stack worked on, at the hand.
+            if let Some(worked) =
+                stacks::stack(&*lv.host, create_engine::arm::item_id(&item.item), 1)
+            {
+                crumbs(lv, above, Dir::Down, d.reach, worked);
+            }
             deployer_used(lv, &mut d, &r, above);
             with_world(|w| w.set_deployer(dim, above, d.clone()));
             Process::Convert {
@@ -297,6 +311,28 @@ fn deployer_used(
 
 fn centre(pos: [i32; 3]) -> [f64; 3] {
     pos.map(|v| f64::from(v) + 0.5)
+}
+
+/// `SandPaperItem.spawnParticles` where Create's client puts a deployer's `spawnedItemEffects`
+/// (the deployer at `pos` facing `facing`, its hand `reach` out: `getMovementVector().scale(reach
+/// + 1)` from its middle): 20 crumbs of `stack`, each thrown up to 1/8 along each axis.
+fn crumbs(lv: &mut ServerLevel<'_>, pos: [i32; 3], facing: Dir, reach: f32, stack: ItemStack) {
+    let Some(key) = ITEM_PARTICLE.get() else {
+        return;
+    };
+    let o = facing.offset();
+    let out = f64::from(reach) + 1.0;
+    let at = std::array::from_fn(|i| f64::from(pos[i]) + 0.5 + f64::from(o[i]) * out);
+    let options = mod_api::ParticleOptions::item_stack(*key, stack);
+    lv.level.send_particles(
+        &mut *lv.host,
+        &options,
+        None,
+        at,
+        [0.0; 3],
+        0.125 / 3f64.sqrt(),
+        20,
+    );
 }
 
 /// The deployer's held stack as an item stack, with its components and its wear.
@@ -400,33 +436,27 @@ pub fn tick_deployers(lv: &mut ServerLevel<'_>) {
         if mode == Mode::Punch && super::fist::start(lv, pos, facing) {
             continue;
         }
+        // Holding something over a depot or belt, a using one waits for them to start it.
         let below = super::step(pos, facing, 2);
-        if facing == Dir::Down && takes_from_side(dim, below) && mode == Mode::Use {
+        let holds = with_world(|w| w.dims[dim].deployers.get(&pos).map(|d| d.held.is_some()))
+            .flatten()
+            .unwrap_or(false);
+        if facing == Dir::Down && takes_from_side(dim, below) && mode == Mode::Use && holds {
             continue;
         }
-        let place = if mode == Mode::Punch {
-            Some(below)
-        } else {
-            deployer_place_target(lv, pos, facing)
-                .or_else(|| deployer_uses(lv, pos, facing).then_some(super::step(pos, facing, 1)))
-        };
-        let reach = if lv.replaceable(super::step(pos, facing, 1)) {
-            0.75
-        } else {
-            0.0
-        };
+        let go = mode == Mode::Punch || should_activate(lv, pos, facing);
+        // `start`: the ray through the block two ahead sets its reach.
+        let depth = reach_depth(lv, pos, facing);
         with_world(|w| {
             let d = &mut w.dims[dim];
             let Some(dp) = d.deployers.get_mut(&pos) else {
                 return;
             };
-            match place {
-                // `start`: the ray toward the block two ahead sets its reach.
-                Some(_) => {
-                    dp.start(reach);
-                    d.deployer_changes.push(pos);
-                }
-                None => dp.wait(rpm),
+            if go {
+                dp.start(depth);
+                d.deployer_changes.push(pos);
+            } else {
+                dp.wait(rpm);
             }
             d.deploying.push(pos);
         });
@@ -489,42 +519,47 @@ pub fn tick_deployers(lv: &mut ServerLevel<'_>) {
     }
 }
 
-/// Where the block a deployer holds would go (`placement`), as a position; None when it holds
-/// no block, or nowhere fits.
-fn deployer_place_target(lv: &ServerLevel<'_>, pos: [i32; 3], facing: Dir) -> Option<[i32; 3]> {
+/// `DeployerHandler.shouldActivate` for a using deployer at `pos` facing `facing`: it swings
+/// unless the block it reaches (two ahead) already is the block it holds, or already holds the
+/// fluid source of its bucket (a fish bucket's water too), or it holds something over a depot
+/// or belt (whose callbacks start it). An empty hand always swings, a held item with nothing to
+/// place or use too: the stroke then does nothing, as in Create.
+fn should_activate(lv: &ServerLevel<'_>, pos: [i32; 3], facing: Dir) -> bool {
     let dim = lv.dim;
-    let held =
-        with_world(|w| w.dims[dim].deployers.get(&pos).and_then(|d| d.held.clone())).flatten()?;
-    // A block item (`BlockItem.getBlock`): the block it places.
-    let placed = lv.host.item_block(stacks::key(&*lv.host, &held.0)?)?;
-    let reached = super::step(pos, facing, 2);
-    let before = super::step(pos, facing, 1);
-    let is_held = lv.level.block(&*lv.host, reached) == Some(placed);
-    deployer::placement(lv.replaceable(reached), lv.replaceable(before), is_held)
-        .map(|at_reached| if at_reached { reached } else { before })
-}
-
-/// `shouldActivate` for a held item that is not a block: always, except a bucket of a fluid
-/// whose source is already in the block it reaches.
-fn deployer_uses(lv: &ServerLevel<'_>, pos: [i32; 3], facing: Dir) -> bool {
-    let dim = lv.dim;
-    // An empty hand always (it uses the block it reaches).
     let Some((item, _)) =
         with_world(|w| w.dims[dim].deployers.get(&pos).and_then(|d| d.held.clone())).flatten()
     else {
         return true;
     };
-    if stacks::key(&*lv.host, &item).is_some_and(|k| lv.host.item_block(k).is_some()) {
+    let reached = super::step(pos, facing, 2);
+    // A block item (`BlockItem.getBlock`): the block it places.
+    if let Some(placed) = stacks::key(&*lv.host, &item).and_then(|k| lv.host.item_block(k))
+        && lv.level.block(&*lv.host, reached) == Some(placed)
+    {
         return false;
     }
-    let reached = super::step(pos, facing, 2);
+    // `BucketItem.content` against `getFluidState(..).getType()`: a source of that fluid.
     let fluid = match item.as_str() {
-        "minecraft:water_bucket" => "minecraft:water",
-        "minecraft:lava_bucket" => "minecraft:lava",
-        _ => return true,
+        "minecraft:lava_bucket" => Some("minecraft:lava"),
+        "minecraft:water_bucket"
+        | "minecraft:cod_bucket"
+        | "minecraft:salmon_bucket"
+        | "minecraft:pufferfish_bucket"
+        | "minecraft:tropical_fish_bucket"
+        | "minecraft:axolotl_bucket"
+        | "minecraft:tadpole_bucket" => Some("minecraft:water"),
+        _ => None,
     };
-    lv.block_name(reached).as_deref() != Some(fluid)
-        || lv.property(reached, "level").is_some_and(|l| l != "0")
+    if let Some(fluid) = fluid
+        && lv
+            .level
+            .fluid_state(&*lv.host, reached)
+            .filter(|f| f.source)
+            .is_some_and(|f| f.fluid.name(&*lv.host) == fluid)
+    {
+        return false;
+    }
+    !(facing == Dir::Down && takes_from_side(dim, reached))
 }
 
 /// `DeployerBlockEntity.activate`: nothing over a depot or belt (their callbacks do the work);
@@ -746,23 +781,8 @@ fn feed(
     }
     let left = finish_using(lv, &stack, target, food.filter(|_| eats));
     set_held_stack(&*lv.host, d, left.as_ref());
-    // `SandPaperItem.spawnParticles` at the hand (`getMovementVector().scale(reach + 1)`): 20
-    // crumbs of the stack as it was, each thrown up to 1/8 along each axis.
-    if let Some(key) = ITEM_PARTICLE.get() {
-        let o = facing.offset();
-        let reach = f64::from(d.reach) + 1.0;
-        let at = std::array::from_fn(|i| f64::from(pos[i]) + 0.5 + f64::from(o[i]) * reach);
-        let options = mod_api::ParticleOptions::item_stack(*key, stack);
-        lv.level.send_particles(
-            &mut *lv.host,
-            &options,
-            None,
-            at,
-            [0.0; 3],
-            0.125 / 3f64.sqrt(),
-            20,
-        );
-    }
+    // `spawnedItemEffects`: crumbs of the stack as it was, at the hand.
+    crumbs(lv, pos, facing, d.reach, stack);
     true
 }
 
@@ -1187,6 +1207,7 @@ fn send_deployers(lv: &mut ServerLevel<'_>, players: &[PlayerRef], list: &[[i32;
                     at,
                     per_tick: v,
                     punch: d.mode == deployer::Mode::Punch,
+                    count: d.held.as_ref().map_or(0, |h| h.1),
                     held: d.held.map(|h| h.0),
                 }
             }
@@ -1196,6 +1217,7 @@ fn send_deployers(lv: &mut ServerLevel<'_>, players: &[PlayerRef], list: &[[i32;
                 at: f32::NAN,
                 per_tick: 0.0,
                 held: None,
+                count: 0,
                 punch: false,
             },
         });

@@ -12,13 +12,16 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 
 /// A train a client knows: each carriage's blocks (as assembled, from its leading bogey, in the
-/// server's numbering), the way it faced then, each carriage's last pose and when it came
-/// (client seconds).
+/// server's numbering), the way it faced then, each carriage's and each bogey's last pose and
+/// when they came (client seconds).
 struct ClientTrain {
     cars: Vec<Vec<([i32; 3], u32)>>,
     heading: [i32; 2],
     poses: Vec<Pose>,
+    bogeys: Vec<Pose>,
     since: f32,
+    derailed: bool,
+    stalled: bool,
 }
 
 thread_local! {
@@ -76,13 +79,19 @@ pub fn trains_from_server(host: &dyn ClientHost, d: &[u8]) {
                     cars,
                     heading: m.heading,
                     poses: Vec::new(),
+                    bogeys: Vec::new(),
                     since: now,
+                    derailed: false,
+                    stalled: false,
                 },
             );
         }
         if let Some(t) = trains.get_mut(&m.id) {
             t.poses = m.cars;
+            t.bogeys = m.bogeys.into_iter().map(|(_, p)| p).collect();
             t.since = now;
+            t.derailed = m.derailed;
+            t.stalled = m.stalled;
         }
     });
 }
@@ -167,6 +176,97 @@ pub fn nearest_point(host: &dyn ClientHost, train: u32, to: [f64; 3]) -> Option<
                 d(a).total_cmp(&d(b))
             })
     })
+}
+
+/// A carriage as a client has it now, for its sounds and particles: its motion a tick (its
+/// pose's velocity), its rotation anchors (`leadingAnchor`, `trailingAnchor`: its two bogeys,
+/// or its one bogey's wheels) and its bogeys.
+pub struct CarriageNow {
+    /// Its entity's place (its leading bogey's anchor), as it glides now.
+    pub at: [f64; 3],
+    pub motion: [f64; 3],
+    pub leading: [f64; 3],
+    pub trailing: [f64; 3],
+    pub bogeys: Vec<create_engine::carriage_effects::Bogey>,
+}
+
+/// The way a pose faces: its yaw from the train's heading (counterclockwise looking down, as
+/// `yaw_pitch` measures it) and its pitch.
+fn front_of(yaw: f64, pitch: f64, heading: [i32; 2]) -> [f64; 3] {
+    let heading_angle = (-f64::from(heading[1])).atan2(f64::from(heading[0])).to_degrees();
+    let a = (yaw + heading_angle).to_radians();
+    let p = pitch.to_radians();
+    [a.cos() * p.cos(), p.sin(), -a.sin() * p.cos()]
+}
+
+/// A train as a client has it now: derailed, stalled.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct TrainNow {
+    pub derailed: bool,
+    pub stalled: bool,
+}
+
+/// `f` of each train this client knows and its carriages as they glide now, front first. A
+/// carriage's bogeys are told apart by where they are: its first is at its pivot, a second
+/// follows it unless it is the next carriage's first.
+pub fn each_train(host: &dyn ClientHost, mut f: impl FnMut(u32, TrainNow, &[CarriageNow])) {
+    let now = now(host);
+    TRAINS.with_borrow(|trains| {
+        for (&id, t) in trains {
+            let dt = f64::from(now - t.since);
+            let glide = |p: &Pose| -> ([f64; 3], [f64; 3]) {
+                let fr = frame(p, t.heading, dt);
+                (fr.pivot, front_of(fr.yaw, f64::from(p.pitch), t.heading))
+            };
+            let firsts: Vec<Option<usize>> = t
+                .poses
+                .iter()
+                .map(|c| t.bogeys.iter().position(|b| b.at == c.at))
+                .collect();
+            let cars: Vec<CarriageNow> = t
+                .poses
+                .iter()
+                .enumerate()
+                .filter_map(|(c, pose)| {
+                    let first = firsts[c]?;
+                    let second = Some(first + 1).filter(|&b| {
+                        b < t.bogeys.len() && !firsts.iter().any(|f| *f == Some(b))
+                    });
+                    let mut bogeys = Vec::with_capacity(2);
+                    let (a, front) = glide(&t.bogeys[first]);
+                    bogeys.push(create_engine::carriage_effects::Bogey::facing(a, front));
+                    let (leading, trailing) = match second {
+                        Some(b) => {
+                            let (a2, front2) = glide(&t.bogeys[b]);
+                            bogeys.push(create_engine::carriage_effects::Bogey::facing(a2, front2));
+                            (a, a2)
+                        }
+                        None => (
+                            std::array::from_fn(|k| a[k] + front[k]),
+                            std::array::from_fn(|k| a[k] - front[k]),
+                        ),
+                    };
+                    Some(CarriageNow {
+                        at: frame(pose, t.heading, dt).pivot,
+                        motion: pose.velocity.map(|v| f64::from(v) / 20.0),
+                        leading,
+                        trailing,
+                        bogeys,
+                    })
+                })
+                .collect();
+            let now = TrainNow {
+                derailed: t.derailed,
+                stalled: t.stalled,
+            };
+            f(id, now, &cars);
+        }
+    });
+}
+
+/// The trains this client knows.
+pub fn known_trains() -> Vec<u32> {
+    TRAINS.with_borrow(|t| t.keys().copied().collect())
 }
 
 /// For the train HUD's arrow, the carriage `at` points into as this client has it: its

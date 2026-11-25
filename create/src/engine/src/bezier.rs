@@ -283,10 +283,15 @@ impl Curve {
     /// `getNormal(t)`: the track's up, between the ends' normals.
     pub fn normal(&self, t: f64) -> Vec3 {
         let derivative = normalize(self.derivative(t));
+        cross(derivative, self.side(t))
+    }
+
+    /// `Segment.normal` at `t`: the track's sideways unit, across it (`faceNormal × derivative`).
+    pub fn side(&self, t: f64) -> Vec3 {
+        let derivative = normalize(self.derivative(t));
         let [fn1, fn2] = self.normals;
         let face = if fn1 == fn2 { fn1 } else { slerp(t, fn1, fn2) };
-        let normal = normalize(cross(face, derivative));
-        cross(derivative, normal)
+        normalize(cross(face, derivative))
     }
 }
 

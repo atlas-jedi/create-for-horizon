@@ -200,6 +200,26 @@ impl Pulley {
     }
 }
 
+/// `PulleyBlockEntity.assemble`'s mirrors: the cells, at the height of the pulley at `pulley`,
+/// over each block of its structure's top row (`createColliders(UP)` at local height 0, its
+/// blocks relative to `anchor`), the pulley's own aside (`startMirroringOther` refuses itself).
+/// A rope pulley in one of them mirrors it.
+pub fn mirror_cells(
+    pulley: [i32; 3],
+    anchor: [i32; 3],
+    blocks: &[([i32; 3], u32)],
+) -> Vec<[i32; 3]> {
+    let mut out: Vec<[i32; 3]> = colliders(blocks, true)
+        .into_iter()
+        .filter(|l| l[1] == 0)
+        .map(|l| [anchor[0] + l[0], pulley[1], anchor[2] + l[2]])
+        .filter(|c| *c != pulley)
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
 /// Where `PulleyBlockEntity.disassemble` puts rope (`ropes`, below the pulley) and the magnet
 /// for a stop at whole offset `grid`: rope at 1 to `grid - 1` below, the magnet at `grid`.
 pub fn rope_cells(pulley: [i32; 3], grid: i32) -> (Vec<[i32; 3]>, Option<[i32; 3]>) {
@@ -225,6 +245,24 @@ mod tests {
         assert!((v - 0.11).abs() < 1e-5);
         assert_eq!(p.step(256.0, [0, 10, 0], free, |_| false), Step::Move(0.0));
         assert!((p.offset - 2.6).abs() < 1e-5);
+    }
+
+    #[test]
+    fn pulleys_over_the_top_row_mirror_the_one_lifting_it() {
+        // A pulley at y 10 over an anchor at y 5: a 3-wide slab at y 5 with one block on top
+        // of its east end (local y 1) and one hanging under the west end.
+        let blocks = vec![
+            ([-1, 0, 0], 1),
+            ([0, 0, 0], 1),
+            ([1, 0, 0], 1),
+            ([1, 1, 0], 1),
+            ([-1, -1, 0], 1),
+        ];
+        assert_eq!(
+            mirror_cells([4, 10, 4], [4, 5, 4], &blocks),
+            vec![[3, 10, 4]],
+            "not its own column, nor where the top row is covered"
+        );
     }
 
     fn stone(state: u32) -> Option<Found> {

@@ -202,26 +202,39 @@ impl Held {
     }
 }
 
+/// `Item.ABSOLUTE_MAX_STACK_SIZE`: what an ejector's stack size 0 (`*`) stands for.
+pub const ABSOLUTE_MAX_STACK: u8 = 99;
+
 /// `DepotBehaviour.insert` on a merging depot (an ejector's): how much of an arriving stack of
-/// `count` it takes. `getRemainingSpace` first: the stack-size getter's limit (`max_stack`, with
-/// 0 standing for 64, as the ejector's scroll value formats it) capped by the held stack's own
-/// stack size — `ItemStack.EMPTY.getMaxStackSize()`, 1, with nothing held — less what lies on
-/// the depot and slides onto it (`used`: `getPresentStackSize`, the held stack and the output
-/// buffer, and every incoming stack). None when there is no room, or when the held stack cannot
-/// take the whole arriving stack (`canItemStackAmountsStack(heldItem.stack, inserted)`, its
-/// whole count, though only the room's worth goes on).
+/// `count` it takes. `getRemainingSpace(inserted)` first: the stack-size getter's limit
+/// (`max_stack`, with 0 standing for `Item.ABSOLUTE_MAX_STACK_SIZE`, as the ejector's scroll
+/// value formats it) capped by the arriving stack's own stack size (`arriving_max`), less what
+/// lies on the depot and slides onto it (`used`: `getPresentStackSize`, the held stack and the
+/// output buffer, and every incoming stack). None when there is no room, or when the held stack
+/// cannot take the whole arriving stack (`canItemStackAmountsStack(heldItem.stack, inserted)`,
+/// its whole count, though only the room's worth goes on).
 ///
 /// ```java
-/// int remainingSpace = getRemainingSpace();
+/// int remainingSpace = getRemainingSpace(heldItem.stack);
 /// ItemStack inserted = heldItem.stack;
 /// if (remainingSpace <= 0)
 ///     return inserted;
 /// if (this.heldItem != null && !ItemHelper.canItemStackAmountsStack(this.heldItem.stack, inserted))
 ///     return inserted;
 /// ```
-pub fn merge_take(max_stack: u8, held: Option<HeldStack>, used: u32, count: u8) -> u8 {
-    let from_getter = i32::from(if max_stack == 0 { 64 } else { max_stack })
-        .min(i32::from(held.map_or(1, |h| h.max)));
+pub fn merge_take(
+    max_stack: u8,
+    arriving_max: u8,
+    held: Option<HeldStack>,
+    used: u32,
+    count: u8,
+) -> u8 {
+    let from_getter = i32::from(if max_stack == 0 {
+        ABSOLUTE_MAX_STACK
+    } else {
+        max_stack
+    })
+    .min(i32::from(arriving_max));
     let room = from_getter.saturating_sub(used.min(i32::MAX as u32) as i32);
     if room <= 0 {
         return 0;
@@ -469,7 +482,7 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_merging_depot_takes_one_item_of_a_landing_stack() {
+    fn an_empty_merging_depot_takes_a_landing_stack_up_to_its_room() {
         let iron = |count| {
             Some(HeldStack {
                 same: true,
@@ -477,45 +490,49 @@ mod tests {
                 max: 64,
             })
         };
-        // e1-ejector-empty-takes-one: a 12-stack lands on an empty, charged ejector. Java
-        // keeps 11 in the entity: with no held stack, `getHeldItemStack().getMaxStackSize()`
-        // is `ItemStack.EMPTY`'s 1, so however much the value board allows, only one goes on.
-        assert_eq!(merge_take(0, None, 0, 12), 1);
-        assert_eq!(merge_take(64, None, 0, 12), 1);
+        // A 12-stack lands on an empty, charged ejector: `getRemainingSpace(inserted)` caps the
+        // value board's limit by the arriving stack's own size, so all 12 go on.
+        assert_eq!(merge_take(0, 64, None, 0, 12), 12);
+        assert_eq!(merge_take(64, 64, None, 0, 12), 12);
+        // The value board's limit holds the rest back (8 of 12); ender pearls stop at 16 and a
+        // sword at one.
+        assert_eq!(merge_take(8, 64, None, 0, 12), 8);
+        assert_eq!(merge_take(0, 16, None, 0, 16), 16);
+        assert_eq!(merge_take(0, 1, None, 0, 1), 1);
         // With one iron already held (its own stack size 64), the scroll value 16 leaves
         // room for 15 more; 12 all go on.
-        assert_eq!(merge_take(16, iron(1), 1, 12), 12);
+        assert_eq!(merge_take(16, 64, iron(1), 1, 12), 12);
         // Five held of the same 16: 11 fit, the 12th stays in the entity.
-        assert_eq!(merge_take(16, iron(5), 5, 12), 11);
-        // The value 0 stands for 64: four more join 60 held.
-        assert_eq!(merge_take(0, iron(60), 60, 12), 0, "60 + 12 cannot stack");
-        assert_eq!(merge_take(0, iron(60), 60, 4), 4);
+        assert_eq!(merge_take(16, 64, iron(5), 5, 12), 11);
+        // The value 0 stands for 99, capped by the item's 64: four more join 60 held.
+        assert_eq!(merge_take(0, 64, iron(60), 60, 12), 0, "60 + 12 cannot stack");
+        assert_eq!(merge_take(0, 64, iron(60), 60, 4), 4);
         // Full already: none.
-        assert_eq!(merge_take(0, iron(64), 64, 12), 0);
+        assert_eq!(merge_take(0, 64, iron(64), 64, 12), 0);
         // What it holds also counts the output buffer (`getPresentStackSize`).
-        assert_eq!(merge_take(16, iron(1), 16, 12), 0);
+        assert_eq!(merge_take(16, 64, iron(1), 16, 12), 0);
         // Another item: none.
         let gold = Some(HeldStack {
             same: false,
             count: 1,
             max: 64,
         });
-        assert_eq!(merge_take(0, gold, 1, 1), 0);
+        assert_eq!(merge_take(0, 64, gold, 1, 1), 0);
     }
 
     #[test]
     fn incoming_stacks_take_room_on_a_merging_depot() {
-        // Issue #202, seed 126: an ejector (stack size 0, so 64) holds one iron ingot; a
+        // Issue #202, seed 126: an ejector (stack size 0, so the iron's 64) holds one iron ingot; a
         // handler inserts 16 (`DepotItemHandler.insertItem`), and all 16 go into `incoming`.
         let one = HeldStack {
             same: true,
             count: 1,
             max: 64,
         };
-        assert_eq!(merge_take(0, Some(one), 1, 16), 16);
+        assert_eq!(merge_take(0, 64, Some(one), 1, 16), 16);
         // 16 more while those slide in: `getRemainingSpace` counts them, 64 - 1 - 16 = 47.
-        assert_eq!(merge_take(0, Some(one), 1 + 16, 16), 16);
-        assert_eq!(merge_take(0, Some(one), 1 + 16 + 32, 16), 15);
+        assert_eq!(merge_take(0, 64, Some(one), 1 + 16, 16), 16);
+        assert_eq!(merge_take(0, 64, Some(one), 1 + 16 + 32, 16), 15);
         // `canItemStackAmountsStack` on arrival: 1 + 16 stack, 60 + 16 do not.
         assert!(joins(one, 16));
         assert!(!joins(

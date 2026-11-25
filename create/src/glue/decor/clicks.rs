@@ -501,6 +501,16 @@ impl mod_api::BlockPart for TableCloth {
     ) -> Option<InteractionResult> {
         use_cloth(host, event.click, event.state)
     }
+
+    /// `TableClothBlock.canSurvive`: anywhere (the carpet template's needs a block below), so a
+    /// cloth hangs over a table's edge and stays when what is under it goes.
+    fn can_survive(
+        &self,
+        _level: &dyn mod_api::LevelHost,
+        _event: &mut mod_api::CanSurviveEvent,
+    ) -> Option<bool> {
+        Some(true)
+    }
 }
 
 /// Not from below, by a player who may build: a cloth item (not sneaking) goes on the nearest

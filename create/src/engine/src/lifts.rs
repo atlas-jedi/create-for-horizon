@@ -18,6 +18,8 @@ pub struct RunningClock {
     pub rpm: f32,
     pub hour: crate::clock::Blocks,
     pub minute: Option<(i32, crate::clock::Blocks)>,
+    /// The stabilized structures riding its hands (0 the hour's, 1 the minute's).
+    pub subs: Vec<(u8, crate::contraption::Stabilized)>,
 }
 
 /// A structure one of these blocks holds out of the world.
@@ -44,6 +46,10 @@ impl Held {
                 let mut v = at(pos, &c.hour);
                 if let Some((_, m)) = &c.minute {
                     v.extend(at(pos, m));
+                }
+                // Its hands at 0, what rides them is where it was taken from.
+                for (_, s) in &c.subs {
+                    v.extend(at(pos, &s.blocks));
                 }
                 v
             }

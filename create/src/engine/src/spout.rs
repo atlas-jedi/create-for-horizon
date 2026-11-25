@@ -62,6 +62,75 @@ pub fn filling(item: &str, fluid: Fluid, recipes: &[Filling]) -> Option<(u32, St
     fluid.bucket().map(|b| (BUCKET, b.to_owned()))
 }
 
+/// What spouting changes of the block two below the spout (`AllBlockSpoutingBehaviours`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlockFill {
+    /// It becomes this block, in its default state (`StateChangingBehavior.setTo`,
+    /// `CauldronSpoutingBehavior`).
+    Become(&'static str),
+    /// Its integer property goes up by one (`StateChangingBehavior.incrementingState`).
+    Raise(&'static str),
+}
+
+/// `BlockSpoutingBehaviour.fillBlock` of the behaviours Create registers by default, for block
+/// `block` two below a spout holding `have` mB of `fluid` (`property` reads the block's
+/// integer properties): how much it takes and what the block becomes. Water turns dirt, coarse
+/// and rooted dirt to mud (250), moistens farmland (100 a level, up to 7) and fills a water
+/// cauldron (250 a level, up to 3); an empty cauldron takes 250 of water or 1000 of lava.
+pub fn block_fill(
+    block: &str,
+    property: impl Fn(&str) -> Option<i32>,
+    fluid: Fluid,
+    have: u32,
+) -> Option<(u32, BlockFill)> {
+    let water = fluid == Fluid::Water;
+    let (amount, fill) = match block {
+        "minecraft:dirt" | "minecraft:coarse_dirt" | "minecraft:rooted_dirt" if water => {
+            (250, BlockFill::Become("minecraft:mud"))
+        }
+        "minecraft:farmland" if water && property("moisture").is_some_and(|m| m < 7) => {
+            (100, BlockFill::Raise("moisture"))
+        }
+        "minecraft:water_cauldron" if water && property("level").is_some_and(|l| l < 3) => {
+            (250, BlockFill::Raise("level"))
+        }
+        "minecraft:cauldron" if water => (250, BlockFill::Become("minecraft:water_cauldron")),
+        "minecraft:cauldron" if fluid == Fluid::Lava => {
+            (BUCKET, BlockFill::Become("minecraft:lava_cauldron"))
+        }
+        _ => return None,
+    };
+    (have >= amount).then_some((amount, fill))
+}
+
+/// `SpoutBlockEntity.tick`'s block spouting: an idle spout holding fluid over a block it can
+/// fill starts its 20-tick cycle (`customProcess`). True when it started.
+pub fn start_block_fill(s: &mut Spout, fill: Option<(u32, BlockFill)>) -> bool {
+    if s.processing != -1 || s.fluid.is_none() || fill.is_none() {
+        return false;
+    }
+    s.processing = FILLING_TIME;
+    true
+}
+
+/// The block spouting's fill at the cycle's 5th-last tick: `amount` leaves the tank.
+pub fn finish_block_fill(s: &mut Spout, amount: u32) {
+    if let Some((fluid, have)) = s.fluid {
+        s.fluid = (have > amount).then_some((fluid, have - amount));
+    }
+}
+
+/// `SPOUTING.playOnServer(level, pos, 0.75f, 0.9f + 0.2f * random)`: the sound a spout makes
+/// as its cycle starts over a belt or depot, `random` in 0..1.
+pub fn sound(random: f32) -> (&'static str, f32, f32) {
+    ("create:spout", 0.75, 0.9 + 0.2 * random)
+}
+
+/// `SpoutBlockEntity.tick` on a client: it drips while `processingTicks >= 8`.
+pub fn drips(processing: i32) -> bool {
+    processing >= 8
+}
+
 /// SpoutBlockEntity.tick advances its timer on the spout's own registration turn.
 /// Item callbacks run separately on the depot or belt controller's turn.
 pub fn tick(s: &mut Spout) {
@@ -363,6 +432,76 @@ mod tests {
                 ..saved
             }
         );
+    }
+
+    /// `AllBlockSpoutingBehaviours.registerDefaults`.
+    #[test]
+    fn a_spout_fills_cauldrons_wets_dirt_and_farmland() {
+        let none = |_: &str| None;
+        let at = |v: i32| move |_: &str| Some(v);
+        assert_eq!(
+            block_fill("minecraft:cauldron", none, Fluid::Water, 1000),
+            Some((250, BlockFill::Become("minecraft:water_cauldron")))
+        );
+        assert_eq!(
+            block_fill("minecraft:cauldron", none, Fluid::Lava, 1000),
+            Some((1000, BlockFill::Become("minecraft:lava_cauldron")))
+        );
+        assert_eq!(
+            block_fill("minecraft:cauldron", none, Fluid::Lava, 999),
+            None,
+            "a whole bucket of lava"
+        );
+        assert_eq!(
+            block_fill("minecraft:cauldron", none, Fluid::Honey, 1000),
+            None
+        );
+        assert_eq!(
+            block_fill("minecraft:water_cauldron", at(2), Fluid::Water, 250),
+            Some((250, BlockFill::Raise("level")))
+        );
+        assert_eq!(
+            block_fill("minecraft:water_cauldron", at(3), Fluid::Water, 1000),
+            None,
+            "full"
+        );
+        assert_eq!(
+            block_fill("minecraft:farmland", at(6), Fluid::Water, 100),
+            Some((100, BlockFill::Raise("moisture")))
+        );
+        assert_eq!(
+            block_fill("minecraft:farmland", at(7), Fluid::Water, 1000),
+            None
+        );
+        assert_eq!(
+            block_fill("minecraft:rooted_dirt", none, Fluid::Water, 250),
+            Some((250, BlockFill::Become("minecraft:mud")))
+        );
+        assert_eq!(block_fill("minecraft:dirt", none, Fluid::Water, 249), None);
+        assert_eq!(block_fill("minecraft:dirt", none, Fluid::Lava, 1000), None);
+        assert_eq!(block_fill("minecraft:stone", none, Fluid::Water, 1000), None);
+    }
+
+    /// `SpoutBlockEntity.tick`: the cycle starts when idle, and the fill comes out of the tank.
+    #[test]
+    fn a_block_fill_runs_the_cycle_then_takes_its_fluid() {
+        let mut s = Spout::default();
+        let fill_cauldron = Some((250, BlockFill::Become("minecraft:water_cauldron")));
+        assert!(
+            !start_block_fill(&mut s, fill_cauldron),
+            "an empty spout fills nothing"
+        );
+        assert_eq!(fill(&mut s, Fluid::Water, 300), 300);
+        assert!(!start_block_fill(&mut s, None));
+        assert!(start_block_fill(&mut s, fill_cauldron));
+        assert_eq!(s.processing, FILLING_TIME);
+        assert!(!start_block_fill(&mut s, fill_cauldron), "not while it runs");
+        finish_block_fill(&mut s, 250);
+        assert_eq!(s.fluid, Some((Fluid::Water, 50)));
+        finish_block_fill(&mut s, 50);
+        assert_eq!(s.fluid, None);
+        assert_eq!(sound(0.5), ("create:spout", 0.75, 1.0));
+        assert!(drips(8) && !drips(7) && !drips(-1));
     }
 
     #[test]
