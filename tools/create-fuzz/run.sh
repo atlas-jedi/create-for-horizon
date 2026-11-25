@@ -6,7 +6,10 @@
 # Expects a Create checkout next to this repository (`../Create` from the repository root, or CREATE_DIR),
 # published with `./gradlew publishToMavenLocal`.
 set -euo pipefail
-here="$(cd "$(dirname "$0")" && pwd)"
+# Git Bash on Windows: paths the JVM reads too must be C:/..., not /c/... (`pwd -W`).
+here="$(cd "$(dirname "$0")" && { pwd -W 2>/dev/null || pwd; })"
+# A Windows JVM separates a classpath with `;` (`:` is in its drive letters).
+case "$here" in [A-Za-z]:/*) cp_sep=";" ;; *) cp_sep=":" ;; esac
 export JAVA_HOME="${JAVA_HOME:-/usr/lib/jvm/java-21-openjdk-amd64}"
 export FUZZ_FLUID_MANIFEST="$here/rust/src/fluids.json"
 export FUZZ_TRANSPORT_MANIFEST="$here/rust/src/transport.json"
@@ -20,7 +23,8 @@ export FUZZ_GAME_DIR="$run"
 export FUZZ_HARNESS_HASH="$(cd "$here/java/src/main/java"; sha256sum dev/createfuzz/*.java | sha256sum | cut -d ' ' -f1)"
 export FUZZ_COVERAGE_INCLUDES="${FUZZ_COVERAGE_INCLUDES:-com.simibubi.create.content.fluids.*:com.simibubi.create.content.kinetics.*:com.simibubi.create.content.logistics.depot.*:com.simibubi.create.content.logistics.funnel.*:com.simibubi.create.content.logistics.tunnel.*:com.simibubi.create.content.logistics.chute.*:com.simibubi.create.content.logistics.box.*:com.simibubi.create.content.processing.*:com.simibubi.create.api.stress.*:com.simibubi.create.api.registry.*}"
 export FUZZ_COVERAGE_CACHE="${FUZZ_COVERAGE_CACHE:-$here/work/jacoco}"
-export FUZZ_CREATE_JAR="${FUZZ_CREATE_JAR:-$HOME/.m2/repository/com/simibubi/create/create-1.21.1/6.0.11/create-1.21.1-6.0.11.jar}"
+m2_home="$(cd "$HOME" && { pwd -W 2>/dev/null || pwd; })"
+export FUZZ_CREATE_JAR="${FUZZ_CREATE_JAR:-$m2_home/.m2/repository/com/simibubi/create/create-1.21.1/6.0.11/create-1.21.1-6.0.11.jar}"
 coverage_tools() {
     mkdir -p "$FUZZ_COVERAGE_CACHE/classes"
     local artifact expected url jar
@@ -41,7 +45,7 @@ coverage_tools() {
             rm -f "$jar"
             return 1
         fi
-        FUZZ_COVERAGE_CLASSPATH="$FUZZ_COVERAGE_CLASSPATH:$jar"
+        FUZZ_COVERAGE_CLASSPATH="$FUZZ_COVERAGE_CLASSPATH$cp_sep$jar"
     done <<'CHECKSUMS'
 org/jacoco/org.jacoco.agent/0.8.14/org.jacoco.agent-0.8.14-runtime 4bb9b49d4e6c5b042fc7e6b4f1e3e808f7441dde
 org/jacoco/org.jacoco.core/0.8.14/org.jacoco.core-0.8.14 5d317827447ab203bb90ecc7597850baae9c8565

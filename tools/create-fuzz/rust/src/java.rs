@@ -158,7 +158,10 @@ fn exchange(
             let _ = std::fs::remove_file(&out);
             return Err(refusal(error.error));
         }
-        if let Ok(pid) = std::fs::read_to_string(dir.join("server.pid"))
+        // `/proc` is Linux's (on Windows the pid file holds a Git Bash pid): elsewhere only
+        // the timeout below ends the wait.
+        if cfg!(target_os = "linux")
+            && let Ok(pid) = std::fs::read_to_string(dir.join("server.pid"))
             && std::fs::read_to_string(format!("/proc/{}/stat", pid.trim()))
                 .map_or(true, |st| st.split_whitespace().nth(2) == Some("Z"))
         {
