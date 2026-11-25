@@ -57,10 +57,13 @@ pub(super) fn carry_out(lv: &ServerLevel<'_>, pos: [i32; 3], block: Block, out: 
     {
         out.insert(FILTER.into(), t);
     }
+    // With a filter the constructor's amount goes too: carried without one, it would come back
+    // up to the filter's stack size (`read`'s migration, `carry_in`).
+    let amount = amount.or_else(|| filter.as_ref().map(|_| Default::default()));
     if let Some(a) = amount {
         out.insert(
             AMOUNT.into(),
-            Tag::IntArray(vec![i32::from(a.count), i32::from(a.up_to)]),
+            Tag::IntArray(vec![a.count(), i32::from(a.up_to())]),
         );
     }
     if !sides.is_empty() {
@@ -96,13 +99,13 @@ pub(super) fn carry_in(
     let filter = data
         .get(&FILTER.into())
         .and_then(|t| filters::filter_from_nbt(host, t));
+    // `FilteringBehaviour.read`: a count of 0, or none beside a filter (carried by an older
+    // version), is up to the filter's stack size.
     let amount = match data.get(&AMOUNT.into()) {
-        Some(Tag::IntArray(v)) if v.len() == 2 => Some(create_engine::board::FilterAmount::new(
-            v[0].clamp(0, 255) as u8,
-            v[1] != 0,
-        )),
-        _ => None,
-    };
+        Some(Tag::IntArray(v)) if v.len() == 2 => Some((v[0], v[1] != 0)),
+        _ => filter.as_ref().map(|_| (0, false)),
+    }
+    .map(|(count, up_to)| super::amount::read_amount(host, count, up_to, filter.as_ref()));
     let sides = match data.get(&SIDES.into()) {
         Some(Tag::Compound(c)) => tunnel_filters_from_nbt(host, c),
         _ => Vec::new(),

@@ -407,8 +407,9 @@ fn board_of(host: &dyn ClientHost, pos: [i32; 3], known: bool) -> Option<OpenBoa
         (b, None) if crate::glue::stock::shop::is_cloth(b) => {
             crate::glue::stock::shop::client_price_count(host, pos).unwrap_or(1)
         }
+        // The constructor's up to 99 until the server says.
         (B::BrassFunnel | B::BrassBeltFunnel | B::SmartChute, None) => {
-            board::FilterAmount::default().word(b.max)
+            board::FilterAmount::default().word()
         }
         (_, None) => seen.unwrap_or_else(|| {
             create_engine::world::diode_kind(block).map_or(0, |k| k.default_delay())

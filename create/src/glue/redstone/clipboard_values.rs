@@ -237,11 +237,11 @@ fn set_filter(
     let id = stack.as_ref().map(|s| s.item().name(&*lv.host));
     match slot {
         Slot::Shared => {
-            let max = crate::glue::logistics::amount::filter_max(&*lv.host, f.as_ref());
+            let stack = crate::glue::logistics::amount::filter_stack_size(&*lv.host, f.as_ref());
             let shown = f.clone();
             with_world(|w| {
                 if let Some(a) = w.dims[dim].filter_amounts.get_mut(&pos) {
-                    *a = a.fitted(max);
+                    *a = a.with_filter(stack);
                 }
                 if block == Block::SmartChute {
                     w.set_chute_filter(dim, pos, f);

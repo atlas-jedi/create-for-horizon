@@ -248,9 +248,11 @@ server). While it shows, the server does nothing on the click: the client sends 
 `interact` item and face: `onShortInteract`) or a board pick (row 0 "up to", row 1 exactly, and the
 count: `setValueSettings`). The driver mirrors the glue's `use_funnel_filter`, `value_settings`,
 `funnel_passes` and `funnel_extraction`. `funnel` adds a brass funnel's filter, its count within
-the filter's stack size (a count above it moves no more) and whether it is "up to". Extracting
-funnels stay outside the comparison: every stack they move flies off as an item entity, and the
-next extraction waits for that entity to leave (`lastObserved`), which is native physics.
+the filter's stack size (a count above it moves no more; 99 without a filter, Create's
+`Item.ABSOLUTE_MAX_STACK_SIZE`, as a funnel is placed with up to 99) and whether it is "up to".
+Extracting funnels stay outside the comparison: every stack they move flies off as an item
+entity, and the next extraction waits for that entity to leave (`lastObserved`), which is native
+physics.
 
 ## Chute columns
 

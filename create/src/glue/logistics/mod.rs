@@ -219,22 +219,30 @@ impl Subsystem for Logistics {
         let brass = brass_from_nbt(data);
         let chutes = chutes_from_nbt(data);
         let funnels = funnels_from_nbt(data);
-        let amounts: Vec<([i32; 3], create_engine::board::FilterAmount)> =
+        // `FilteringBehaviour.read`: a count of 0, or none kept beside a filter, is up to the
+        // filter's stack size.
+        let mut saved: std::collections::HashMap<[i32; 3], (i32, bool)> =
             match data.get(&FILTER_AMOUNTS.into()) {
                 Some(Tag::IntArray(v)) => v
                     .as_chunks::<5>()
                     .0
                     .iter()
-                    .map(|a| {
-                        let amount = create_engine::board::FilterAmount::new(
-                            a[3].clamp(0, 255) as u8,
-                            a[4] != 0,
-                        );
-                        ([a[0], a[1], a[2]], amount)
-                    })
+                    .map(|a| ([a[0], a[1], a[2]], (a[3], a[4] != 0)))
                     .collect(),
-                _ => Vec::new(),
+                _ => Default::default(),
             };
+        let mut amounts: Vec<([i32; 3], create_engine::board::FilterAmount)> = filters
+            .iter()
+            .map(|(p, f)| {
+                let (count, up_to) = saved.remove(p).unwrap_or((0, false));
+                (*p, amount::read_amount(&*lv.host, count, up_to, Some(f)))
+            })
+            .collect();
+        amounts.extend(
+            saved
+                .into_iter()
+                .map(|(p, (count, up_to))| (p, amount::read_amount(&*lv.host, count, up_to, None))),
+        );
         let dim = lv.dim;
         let now = lv.game_time().max(0) as u64;
         with_world(|w| {
@@ -1129,12 +1137,20 @@ fn save_entities(lv: &ServerLevel<'_>, chunk: [i32; 2], out: &mut super::entity_
             .map(|(k, f)| (*k, f.clone()))
             .collect();
         sides.sort_by_key(|e| (e.0.0, e.0.1 as u8));
-        let amounts: Amounts = d
+        // A slot with a filter and the constructor's amount writes it too: read back without
+        // one, it would be up to the filter's stack size (`read`'s migration).
+        let mut amounts: Amounts = d
             .filter_amounts
             .iter()
             .filter(|(p, _)| inside(p))
             .map(|(p, a)| (*p, *a))
             .collect();
+        amounts.extend(
+            filters
+                .iter()
+                .filter(|(p, _)| !d.filter_amounts.contains_key(p))
+                .map(|(p, _)| (*p, create_engine::board::FilterAmount::default())),
+        );
         (
             d.vaults.column(cx, cz),
             filters,
@@ -1165,8 +1181,8 @@ fn save_entities(lv: &ServerLevel<'_>, chunk: [i32; 2], out: &mut super::entity_
     }
     for (p, a) in amounts {
         out.entry(p).or_default().extend([
-            (FILTER_AMOUNT.into(), Tag::Int(i32::from(a.count))),
-            (UP_TO.into(), Tag::Byte(i8::from(a.up_to))),
+            (FILTER_AMOUNT.into(), Tag::Int(a.count())),
+            (UP_TO.into(), Tag::Byte(i8::from(a.up_to()))),
         ]);
     }
     let mut by_tunnel: std::collections::BTreeMap<[i32; 3], Vec<Tag>> = Default::default();
@@ -1217,23 +1233,26 @@ fn load_entity(lv: &mut ServerLevel<'_>, pos: [i32; 3], block: Block, tag: &Comp
         let filter = tag
             .get(&FILTER.into())
             .and_then(|t| filters::filter_from_nbt(&*lv.host, t));
-        let amount = match tag.get(&FILTER_AMOUNT.into()) {
-            Some(Tag::Int(n)) => Some(create_engine::board::FilterAmount::new(
-                (*n).clamp(0, 255) as u8,
-                matches!(tag.get(&UP_TO.into()), Some(Tag::Byte(b)) if *b != 0),
-            )),
-            _ => None,
+        // `getInt("FilterAmount")`, `getBoolean("UpTo")`: 0 and false when not saved, which
+        // `read` migrates to up to the filter's stack size.
+        let count = match tag.get(&FILTER_AMOUNT.into()) {
+            Some(Tag::Int(n)) => *n,
+            _ => 0,
         };
+        let up_to = matches!(tag.get(&UP_TO.into()), Some(Tag::Byte(b)) if *b != 0);
+        let amount = amount::read_amount(&*lv.host, count, up_to, filter.as_ref());
         with_world(|w| {
             let d = &mut w.dims[dim];
             match filter {
                 Some(f) => d.chute_filters.insert(pos, f),
                 None => d.chute_filters.remove(&pos),
             };
-            match amount {
-                Some(a) => d.filter_amounts.insert(pos, a),
-                None => d.filter_amounts.remove(&pos),
-            };
+            // The constructor's amount is the table's default.
+            if amount == create_engine::board::FilterAmount::default() {
+                d.filter_amounts.remove(&pos);
+            } else {
+                d.filter_amounts.insert(pos, amount);
+            }
         });
     }
     match block {
