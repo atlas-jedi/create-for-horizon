@@ -14,7 +14,8 @@
   <a href="#install"><b>Install</b></a> ·
   <a href="#status"><b>Status</b></a> ·
   <a href="create/HORIZON_GAPS.md"><b>Known gaps</b></a> ·
-  <a href="#how-it-stays-faithful"><b>Fidelity</b></a>
+  <a href="#how-it-stays-faithful"><b>Fidelity</b></a> ·
+  <a href="CHANGELOG.md"><b>Changelog</b></a>
 </p>
 
 <p align="center">
@@ -52,7 +53,9 @@ Upstream ports every part of Create. On Horizon today:
 | Kinetics: shafts, cogs, gearboxes, water wheels, motors, stress | Tested in game |
 | Belts: flat and sloped, connecting, carrying items and players | Tested in game |
 | Pressing and depots | Tested in game |
-| Sliding and train doors | Tested in game |
+| Sliding and train doors, double doors | Tested in game |
+| Gearshifts and clutches | Tested in game |
+| Diving gear worn (third person), cardboard armour | Tested in game |
 | Processing: mixers, millstones, crushing wheels, saws, drills, fans, deployers, spouts | Ported and unit-tested, not yet played on Horizon |
 | Logistics: funnels, chutes, tunnels, mechanical arms, ejectors | Ported and unit-tested, not yet played on Horizon |
 | Contraptions: bearings, windmills, pistons, pulleys, gantries, clocks, minecarts, Ferris wheels | Ported and unit-tested, not yet played on Horizon |
@@ -68,6 +71,8 @@ Some things need API that Horizon doesn't have yet. These are the ones you notic
 - A curve on a slope has no tilted track block.
 
 The full list, with the API each one needs: **[create/HORIZON_GAPS.md](create/HORIZON_GAPS.md)**.
+
+What changed and when: **[CHANGELOG.md](CHANGELOG.md)**.
 
 ## Install
 
@@ -99,11 +104,12 @@ Try it in a new world first.
 
 - **Line by line from Java.** The engine (`create/src/engine`) is Create's rules translated from its Java source,
   with no game types. The glue (`create/src/glue`) only reads the world, calls the engine and writes back.
-- **Tests.** About 1,000 engine tests and 67 data-generator tests. A guard test fails if a generated file is
+- **Tests.** About 1,000 engine tests and 69 data-generator tests. A guard test fails if a generated file is
   edited by hand.
 - **Differential fuzzing.** [tools/create-fuzz](tools/create-fuzz/README.md) runs the same random setups in
   Create's Java, on a headless server, and in the engine. When they differ, it shrinks the case to the smallest
-  one that still differs.
+  one that still differs. On 2026-11-25, its 124 recorded cases and 1,000 random scenarios (kinetics, belts,
+  funnels, chutes, depots, processing, fluids) matched Create 6.0.11.
 - **Gaps written down.** When Horizon can't do something, the mod leaves it out and
   [HORIZON_GAPS.md](create/HORIZON_GAPS.md) says what and why. There are no stubs that pretend.
 
