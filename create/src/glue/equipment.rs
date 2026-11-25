@@ -89,6 +89,18 @@ const HEAD_INVENTORY_SLOT: i32 = 103;
 
 /// The copper and netherite backtanks' item keys, requested at registration.
 static BACKTANK_ITEMS: std::sync::OnceLock<[ItemKey; 2]> = std::sync::OnceLock::new();
+/// `ParticleTypes.SPIT`, the ring a backtank puffs out once full (`playFilledEffect`).
+static SPIT: std::sync::OnceLock<mod_api::ParticleKey> = std::sync::OnceLock::new();
+
+/// What the clients last heard of a turning backtank (`BacktankBlockEntity.write` as
+/// `sendData` sends it: on placement, when its speed changes and once full), as their copy
+/// ticks it: its air and timer, and the speed it was heard at.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct Heard {
+    air: i32,
+    timer: i32,
+    speed: f32,
+}
 
 thread_local! {
     /// The gear each item seen in a gear slot is.
@@ -107,6 +119,10 @@ thread_local! {
     static BREAKING: RefCell<HashMap<(usize, [i32; 3]), eq::Backtank>> = RefCell::new(HashMap::new());
     /// Players (entity ids) whose diving helmet gives them breath this tick.
     static BREATHING: RefCell<Vec<u32>> = const { RefCell::new(Vec::new()) };
+    /// The turning backtanks' copies on the clients, by level and position.
+    static HEARD: RefCell<HashMap<(usize, [i32; 3]), Heard>> = RefCell::new(HashMap::new());
+    /// The draws of the backtanks' air particles (`level.random` on Create's client).
+    static AIR_RANDOM: std::cell::Cell<u64> = const { std::cell::Cell::new(0x9E37_79B9_7F4A_7C15) };
 }
 
 pub struct Equipment;
@@ -258,6 +274,7 @@ impl Subsystem for Equipment {
             r.item_part(item, BacktankPlacement);
         }
         let _ = BACKTANK_ITEMS.set(keys);
+        let _ = SPIT.set(r.particle_key("minecraft:spit"));
         let _ = GRIP_ITEM.set(r.item_key("create:extendo_grip"));
     }
 
@@ -268,6 +285,12 @@ impl Subsystem for Equipment {
         SERVER_FIRE_GRANTS.with_borrow_mut(HashMap::clear);
         BREAKING.with_borrow_mut(HashMap::clear);
         BREATHING.with_borrow_mut(Vec::clear);
+        HEARD.with_borrow_mut(HashMap::clear);
+    }
+
+    /// The game's armour models Create's diving gear is drawn on (`render_worn`).
+    fn models_baked(&self, host: &mut dyn mod_api::ClientHost) {
+        bake_armor(host);
     }
 
     /// A backtank's air (`BacktankBlockEntity.write`) rides with it.
@@ -396,7 +419,19 @@ impl Subsystem for Equipment {
             });
         }
         let dim = lv.dim;
-        for (pos, speed) in with_world(|w| w.filling_backtanks(dim)).unwrap_or_default() {
+        let filling = with_world(|w| w.filling_backtanks(dim)).unwrap_or_default();
+        // A backtank no longer turning is heard afresh when it turns again (its speed changes).
+        HEARD.with_borrow_mut(|h| {
+            h.retain(|(d, p), _| *d != dim || filling.iter().any(|(q, _)| q == p))
+        });
+        for (pos, speed) in filling {
+            let Some(before) = with_world(|w| w.dims[dim].backtanks.get(&pos).copied()).flatten()
+            else {
+                continue;
+            };
+            if client_draws_air(dim, pos, before, speed) {
+                draw_air_in(lv, pos);
+            }
             let filled = with_world(|w| {
                 let f = w.dims[dim].backtanks.get_mut(&pos)?.tick(speed, false);
                 if f.is_some() {
@@ -410,7 +445,7 @@ impl Subsystem for Equipment {
                 f
             })
             .flatten();
-            if filled.is_some_and(|f| f.full) {
+            if filled.is_some_and(|f| f.full) && heard_full(dim, pos) {
                 // playFilledEffect: CONFIRM (a bell, 0.4 × 0.5 loud, pitch 0.8) where it stands.
                 let at = pos.map(|v| f64::from(v) + 0.5);
                 lv.level.play_sound(
@@ -421,6 +456,7 @@ impl Subsystem for Equipment {
                     0.2,
                     0.8,
                 );
+                puff_spit_ring(lv, pos);
             }
         }
     }
@@ -1270,6 +1306,421 @@ impl mod_api::BlockEntityPart for BacktankCogs {
     }
 }
 
+/// `BacktankBlockEntity.tick` on a client, for a backtank turning at `speed` and holding
+/// `tank` on the server: its copy waits out the timer it was last sent, then draws air in every
+/// tick until it hears it is full. The copy is the server's state as `sendData` last sent it:
+/// when it started turning or changed speed (`RotationPropagator`), or once full.
+fn client_draws_air(dim: usize, pos: [i32; 3], tank: eq::Backtank, speed: f32) -> bool {
+    let sent = Heard {
+        air: tank.air,
+        timer: tank.timer,
+        speed,
+    };
+    HEARD.with_borrow_mut(|h| {
+        let heard = h.entry((dim, pos)).or_insert(sent);
+        if heard.speed != speed {
+            *heard = sent;
+        }
+        if heard.timer > 0 {
+            heard.timer -= 1;
+            return false;
+        }
+        heard.air != tank.max_air()
+    })
+}
+
+/// The full backtank's `sendData` reaching the clients: `read` plays the filled effect when the
+/// air they had heard of was neither none nor already this (`prev != 0 && prev != airLevel`).
+fn heard_full(dim: usize, pos: [i32; 3]) -> bool {
+    let Some(tank) = with_world(|w| w.dims[dim].backtanks.get(&pos).copied()).flatten() else {
+        return false;
+    };
+    HEARD.with_borrow_mut(|h| {
+        let Some(heard) = h.get_mut(&(dim, pos)) else {
+            return false;
+        };
+        let effect = heard.air != 0 && heard.air != tank.air;
+        heard.air = tank.air;
+        heard.timer = tank.timer;
+        effect
+    })
+}
+
+/// A float in `[0, 1)` from the air particles' own draws (Create's client draws them from its
+/// level's random, which the server's must not lose draws to).
+fn air_random() -> f64 {
+    AIR_RANDOM.with(|r| {
+        let mut x = r.get();
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        r.set(x);
+        (x >> 11) as f64 / (1u64 << 53) as f64
+    })
+}
+
+/// The air a filling backtank draws in (`BacktankBlockEntity.tick` on its client:
+/// `AirParticleData(1, .05f)` from `VecHelper.offsetRandomly(centre, random, .65f)` toward the
+/// centre). Sent by the server to the players within 32 blocks, the range Create's client
+/// draws particles in.
+fn draw_air_in(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    let Some(options) = super::items::potato::air_particle() else {
+        return;
+    };
+    let centre = pos.map(|v| f64::from(v) + 0.5);
+    let from: [f64; 3] = std::array::from_fn(|i| centre[i] + (air_random() - 0.5) * 2.0 * 0.65);
+    let motion: [f64; 3] = std::array::from_fn(|i| centre[i] - from[i]);
+    let _ = lv
+        .level
+        .send_particles(&mut *lv.host, &options, None, from, motion, 1.0, 0);
+}
+
+/// `playFilledEffect`'s ring: a spit particle every 10° about the centre, a quarter block out,
+/// flying out at (0.25, 0.1) turned that far (`VecHelper.rotate` about y).
+fn puff_spit_ring(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
+    let Some(&spit) = SPIT.get() else {
+        return;
+    };
+    let options = mod_api::ParticleOptions::simple(spit);
+    let centre = pos.map(|v| f64::from(v) + 0.5);
+    for i in (0..360).step_by(10) {
+        let (sin, cos) = f64::from(i).to_radians().sin_cos();
+        // `VecHelper.rotate(vec, deg, Y)`: x cos + z sin, y, z cos - x sin.
+        let m = [0.25 * cos, 0.1, -0.25 * sin];
+        let len = (m[0] * m[0] + m[1] * m[1] + m[2] * m[2]).sqrt();
+        let at: [f64; 3] = std::array::from_fn(|k| centre[k] + m[k] / len * 0.25);
+        let _ = lv
+            .level
+            .send_particles(&mut *lv.host, &options, None, at, m, 1.0, 0);
+    }
+}
+
+/// The game's armour models (`ModelLayers.PLAYER_ARMOR`: one per slot, each with only that
+/// slot's parts) Create's gear is drawn on, in [`ArmorModel`]'s order.
+const ARMOR_LAYERS: [&str; 4] = [
+    "minecraft:player#helmet",
+    "minecraft:player#chestplate",
+    "minecraft:player#leggings",
+    "minecraft:player#boots",
+];
+
+/// The armour model a piece is drawn on (`HumanoidArmorLayer`'s outer and inner models, with
+/// `setPartVisibility`'s parts for its slot).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmorModel {
+    /// The outer model's head and hat.
+    Helmet,
+    /// The outer model's body and arms.
+    Chestplate,
+    /// The inner model's body and legs.
+    Leggings,
+    /// The outer model's legs.
+    Boots,
+    /// The inner model's body and arms (`LayeredArmorItem`'s first pass on the chest).
+    InnerChest,
+}
+
+/// What `CubeDeformation` the inner armour model grows its boxes by less than the outer one
+/// (`INNER_ARMOR_DEFORMATION` 0.5, `OUTER_ARMOR_DEFORMATION` 1.0).
+const INNER_SHRINK: f32 = 0.5;
+
+thread_local! {
+    /// The models of [`ArmorModel`], baked once models are: [`ARMOR_LAYERS`], then the inner
+    /// chest.
+    static ARMOR_MODELS: RefCell<Vec<Option<mod_api::ModelPart>>> = const { RefCell::new(Vec::new()) };
+}
+
+/// `part` and the parts under it with each box drawn `by` texels in on every side: a box
+/// grown by `CubeDeformation(g)` as one grown by `g - by`, its texture where it was. 26.3's
+/// inner armour model (`minecraft:player#leggings`) has no arms, so the inner chest is the
+/// chestplate's body and arms drawn in to the inner growth. Each part has one box at most.
+fn shrunk(mut part: mod_api::ModelPart, by: f32) -> mod_api::ModelPart {
+    fn shrink(p: &mut mod_api::ModelPart, by: f32) {
+        let mut min = [f32::MAX; 3];
+        let mut max = [f32::MIN; 3];
+        for v in p.polygons.iter().flat_map(|q| q.vertices.iter()) {
+            for k in 0..3 {
+                min[k] = min[k].min(v.pos[k]);
+                max[k] = max[k].max(v.pos[k]);
+            }
+        }
+        for v in p.polygons.iter_mut().flat_map(|q| q.vertices.iter_mut()) {
+            for k in 0..3 {
+                if v.pos[k] == min[k] {
+                    v.pos[k] += by;
+                } else if v.pos[k] == max[k] {
+                    v.pos[k] -= by;
+                }
+            }
+        }
+        for (_, child) in p.children_mut() {
+            shrink(child, by);
+        }
+    }
+    shrink(&mut part, by);
+    part
+}
+
+fn bake_armor(host: &dyn mod_api::ClientHost) {
+    let mut baked: Vec<_> = ARMOR_LAYERS.iter().map(|l| host.bake_layer(l)).collect();
+    if baked.iter().any(Option::is_none) {
+        crate::create_log!("[create] the game's armour model layers are not all there");
+    }
+    let inner = baked[ArmorModel::Chestplate as usize]
+        .clone()
+        .map(|m| shrunk(m, INNER_SHRINK));
+    baked.push(inner);
+    ARMOR_MODELS.with_borrow_mut(|m| *m = baked);
+}
+
+/// One piece of Create's armour as `HumanoidArmorLayer` draws it: on `model`, textured with
+/// `BaseArmorItem.getArmorTexture` (`create:textures/models/armor/<texture>.png`, from the jar).
+#[derive(Debug, PartialEq, Eq)]
+struct Piece {
+    model: ArmorModel,
+    texture: &'static str,
+}
+
+/// The texture of layer `n` of Create's armour texture `texture` (`BaseArmorItem`'s
+/// `textureLoc`: `copper_diving`, `netherite_diving`, `cardboard`), `<textureLoc>_layer_<n>`:
+/// the second for leggings (`getArmorTexture`), both for the netherite backtank
+/// (`LayeredArmorItem`). Copper diving gear has no leggings and no second layer.
+fn layer(texture: &str, n: u8) -> &'static str {
+    match (texture, n) {
+        ("copper_diving", _) => "copper_diving_layer_1",
+        ("netherite_diving", 1) => "netherite_diving_layer_1",
+        ("netherite_diving", _) => "netherite_diving_layer_2",
+        ("cardboard", 1) => "cardboard_layer_1",
+        _ => "cardboard_layer_2",
+    }
+}
+
+/// The armour texture (`textureLoc`) of a worn item of Create's, by its id.
+fn armor_texture(item: &str) -> Option<&'static str> {
+    match Gear::of(item) {
+        Gear::Helmet(n) | Gear::Backtank(n) | Gear::Boots(n) => Some(if n {
+            "netherite_diving"
+        } else {
+            "copper_diving"
+        }),
+        _ => item
+            .strip_prefix("create:cardboard_")
+            .filter(|p| matches!(*p, "helmet" | "chestplate" | "leggings" | "boots"))
+            .map(|_| "cardboard"),
+    }
+}
+
+/// The pieces of Create's armour worn on the head, chest, legs and feet (the items' ids), in
+/// `HumanoidArmorLayer.render`'s order (chest, legs, feet, head), and the backtank worn
+/// (`BacktankArmorLayer`; `true` for the netherite one). Each piece is drawn only from its own
+/// slot (`ArmorItem.canEquip`). The netherite backtank is a `LayeredArmorItem`: the inner
+/// model with its second layer, then the outer with its first.
+fn worn_pieces(head: &str, chest: &str, legs: &str, feet: &str) -> (Vec<Piece>, Option<bool>) {
+    let mut pieces = Vec::new();
+    let backtank = match Gear::of(chest) {
+        Gear::Backtank(netherite) => Some(netherite),
+        _ => None,
+    };
+    let slots = [
+        (chest, "chestplate", ArmorModel::Chestplate),
+        (legs, "leggings", ArmorModel::Leggings),
+        (feet, "boots", ArmorModel::Boots),
+        (head, "helmet", ArmorModel::Helmet),
+    ];
+    for (item, piece, model) in slots {
+        let Some(texture) = armor_texture(item) else {
+            continue;
+        };
+        // An item of the slot: the diving piece or the cardboard piece of that name.
+        let fits = match Gear::of(item) {
+            Gear::Helmet(_) => model == ArmorModel::Helmet,
+            Gear::Backtank(_) => model == ArmorModel::Chestplate,
+            Gear::Boots(_) => model == ArmorModel::Boots,
+            _ => item.ends_with(piece),
+        };
+        if !fits {
+            continue;
+        }
+        if backtank == Some(true) && model == ArmorModel::Chestplate {
+            pieces.push(Piece {
+                model: ArmorModel::InnerChest,
+                texture: layer(texture, 2),
+            });
+        }
+        let n = if model == ArmorModel::Leggings { 2 } else { 1 };
+        pieces.push(Piece {
+            model,
+            texture: layer(texture, n),
+        });
+    }
+    (pieces, backtank)
+}
+
+/// `getParentModel().copyPropertiesTo(model)`: each part of the armour model takes the pose
+/// the body's part of that name has this frame, and draws whatever the body's does
+/// (`setPartVisibility`: the armour models hold only their slot's boxes).
+fn pose_like(part: &mut mod_api::ModelPart, posed: &mod_api::PosedParts) {
+    for (name, child) in part.children_mut() {
+        if let Some(p) = mod_api::HumanoidPart::ALL
+            .into_iter()
+            .find(|p| p.model_name() == name)
+            .and_then(|p| posed.get(p))
+        {
+            child.load_pose(p.pose);
+        }
+        child.visible = true;
+        pose_like(child, posed);
+    }
+}
+
+/// Create's armour on the local player in third person: `HumanoidArmorLayer` with Create's
+/// armour textures (`BaseArmorItem.getArmorTexture`, `LayeredArmorItem`) and
+/// `BacktankArmorLayer` (the backtank's model on the back, its cogs turning). The game draws
+/// none of it: their `equippable` names an equipment asset no pack has. Horizon: a client
+/// reads no one's equipment but its own player's, so other players and mobs wearing Create's
+/// armour show none of it (HORIZON_GAPS.md).
+pub(crate) fn render_worn(
+    host: &dyn mod_api::ClientHost,
+    event: &mut mod_api::RenderLivingPostEvent<'_>,
+) {
+    let Some(posed) = event.parts else {
+        return;
+    };
+    let Some(me) = host.local_player().map(|p| p.entity()) else {
+        return;
+    };
+    if me.id() != event.entity.id {
+        return;
+    }
+    let Some(living) = host.living(me) else {
+        return;
+    };
+    let worn = |slot| {
+        living
+            .equipment(host, slot)
+            .map(|s| s.item().name(host))
+            .unwrap_or_default()
+    };
+    let (pieces, backtank) = worn_pieces(
+        &worn(EquipmentSlot::Head),
+        &worn(EquipmentSlot::Chest),
+        &worn(EquipmentSlot::Legs),
+        &worn(EquipmentSlot::Feet),
+    );
+    if pieces.is_empty() {
+        return;
+    }
+    let draw = &mut *event.draw;
+    draw.push();
+    // `LivingEntityRenderer.render`: from the feet, turned with the body (the hook's frame, in
+    // blocks: +z the way the body faces, +x its left, +y up; a crouching body's armour lines
+    // up in game, so the frame has `getRenderOffset`), into the model's frame (+y down, its
+    // front towards -z, its feet 24 texels down), the player at 15/16
+    // (`AvatarRenderer.scale`), which the hook's frame leaves out.
+    draw.scale([1.0, -1.0, -1.0]);
+    draw.scale([0.9375; 3]);
+    draw.translate([0.0, -1.501, 0.0]);
+    ARMOR_MODELS.with_borrow_mut(|models| {
+        for piece in &pieces {
+            let Some(Some(model)) = models.get_mut(piece.model as usize) else {
+                continue;
+            };
+            model.reset_all_poses();
+            pose_like(model, posed);
+            // The texture as a sprite of the blocks atlas, which `create-data registry` stitches
+            // it into from the jar.
+            let sprite = format!("create:models/armor/{}", piece.texture);
+            draw.model_part(model, &sprite, 0xFFFFFF);
+        }
+    });
+    if let (Some(netherite), Some(body)) = (backtank, posed.get(mod_api::HumanoidPart::Body)) {
+        draw_backtank(draw, body.pose, netherite);
+    }
+    draw.pop();
+}
+
+/// `BacktankArmorLayer.render`, under the model's frame: from the body
+/// (`model.body.translateAndRotate`), the backtank's block facing south a pixel past the back
+/// (`translate(-1/2, 10/16, 1)`, `scale(1, -1, -1)`), its shaft input 3 pixels down and its
+/// cogs (turned to face south) spinning about x at 2° a tick on the client's clock
+/// (`AnimationTickHolder.getRenderTime`).
+fn draw_backtank(
+    draw: &mut dyn mod_api::BlockEntityDrawContext,
+    body: mod_api::PartPose,
+    netherite: bool,
+) {
+    let (block, shaft, cogs) = if netherite {
+        (
+            Block::NetheriteBacktank,
+            "part_netherite_backtank_shaft",
+            "part_netherite_backtank_cogs",
+        )
+    } else {
+        (
+            Block::CopperBacktank,
+            "part_copper_backtank_shaft",
+            "part_copper_backtank_cogs",
+        )
+    };
+    let (Some(shaft), Some(cogs)) = (states::partial(shaft), states::partial(cogs)) else {
+        return;
+    };
+    draw.push();
+    // `ModelPart.translateAndRotate`: its place in texels, then `rotationZYX`, then its scale.
+    draw.translate([body.x / 16.0, body.y / 16.0, body.z / 16.0]);
+    for (axis, angle) in [
+        ([0.0, 0.0, 1.0], body.z_rot),
+        ([0.0, 1.0, 0.0], body.y_rot),
+        ([1.0, 0.0, 0.0], body.x_rot),
+    ] {
+        if angle != 0.0 {
+            draw.rotate_about(axis, angle.to_degrees(), [0.0; 3]);
+        }
+    }
+    if [body.x_scale, body.y_scale, body.z_scale] != [1.0; 3] {
+        draw.scale([body.x_scale, body.y_scale, body.z_scale]);
+    }
+    draw.translate([-0.5, 10.0 / 16.0, 1.0]);
+    draw.scale([1.0, -1.0, -1.0]);
+    draw.block(
+        states::key(block),
+        &[("facing", "south"), ("waterlogged", "false")],
+    );
+    // The shaft input as modelled (`CachedBuffers.partial`), 3 pixels down.
+    draw.push();
+    draw.translate([0.0, -3.0 / 16.0, 0.0]);
+    draw.block(shaft, &[("facing", "up")]);
+    draw.pop();
+    // The cogs turned 180° about the centre, spinning about east through (6.5, 11) pixels of
+    // the model as made: about west through (6.5, 5) once turned.
+    let angle = ((2.0 * draw.animation_time()) % 360.0) as f32;
+    draw.push();
+    draw.rotate_about([-1.0, 0.0, 0.0], angle, [0.5, 6.5 / 16.0, 5.0 / 16.0]);
+    draw.block(cogs, &[("facing", "south")]);
+    draw.pop();
+    draw.pop();
+}
+
+/// `AllCreativeModeTabs.makeStackFunc`: Create's tab shows the backtanks full
+/// (`BacktankUtil.maxAirWithoutEnchants`). A tab declaration lists bare items, so `create-data`
+/// leaves them out of `create:base` and they are added here, after the tab's own items.
+pub(crate) fn creative_tab(event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>) {
+    if event.tab != "create:base" {
+        return;
+    }
+    for block in [Block::CopperBacktank, Block::NetheriteBacktank] {
+        let Some(mut stack) = backtank_item(block).and_then(|k| ItemStack::new(k, 1)) else {
+            continue;
+        };
+        match set_stack_air(&mut stack, eq::AIR_IN_BACKTANK) {
+            Ok(()) => event.items.push(stack),
+            Err(error) => {
+                crate::create_log!("[create] a full backtank could not be made: {error:?}")
+            }
+        }
+    }
+}
+
 /// `BacktankUtil.isBarVisible` / `getBarWidth` for an air-using tool held by the local player:
 /// the worn backtanks' air as a bar while there is any.
 pub(crate) fn backtank_bar(host: &dyn mod_api::ClientHost) -> Option<(i32, u32)> {
@@ -1607,6 +2058,81 @@ mod grip_pick_tests {
         assert_eq!(entity_range_without_grip(3.0, &all), Some(7.5));
         assert_eq!(entity_range_without_grip(-10.0, &all), Some(0.0));
         assert_eq!(entity_range_without_grip(60.0, &all), Some(64.0));
+    }
+}
+
+#[cfg(test)]
+mod worn_tests {
+    use super::*;
+    use mod_api::{CubeDeformation, CubeListBuilder, LayerDefinition, MeshDefinition, PartPose};
+
+    fn piece(model: ArmorModel, texture: &'static str) -> Piece {
+        Piece { model, texture }
+    }
+
+    #[test]
+    fn each_piece_takes_its_slot_s_model_and_texture_layer() {
+        let (pieces, backtank) = worn_pieces(
+            "create:copper_diving_helmet",
+            "create:netherite_backtank",
+            "",
+            "create:copper_diving_boots",
+        );
+        assert_eq!(backtank, Some(true));
+        assert_eq!(
+            pieces,
+            [
+                piece(ArmorModel::InnerChest, "netherite_diving_layer_2"),
+                piece(ArmorModel::Chestplate, "netherite_diving_layer_1"),
+                piece(ArmorModel::Boots, "copper_diving_layer_1"),
+                piece(ArmorModel::Helmet, "copper_diving_layer_1"),
+            ]
+        );
+        let (pieces, backtank) = worn_pieces(
+            "create:cardboard_helmet",
+            "create:cardboard_chestplate",
+            "create:cardboard_leggings",
+            "create:cardboard_boots",
+        );
+        assert_eq!(backtank, None);
+        assert_eq!(
+            pieces,
+            [
+                piece(ArmorModel::Chestplate, "cardboard_layer_1"),
+                piece(ArmorModel::Leggings, "cardboard_layer_2"),
+                piece(ArmorModel::Boots, "cardboard_layer_1"),
+                piece(ArmorModel::Helmet, "cardboard_layer_1"),
+            ]
+        );
+        // A piece in another slot (`ArmorItem.canEquip`) and the game's armour draw nothing.
+        let (pieces, backtank) = worn_pieces(
+            "create:copper_backtank",
+            "create:cardboard_boots",
+            "minecraft:iron_leggings",
+            "create:netherite_diving_helmet",
+        );
+        assert!(pieces.is_empty());
+        assert_eq!(backtank, None);
+    }
+
+    fn box_part(grow: f32) -> mod_api::ModelPart {
+        let mut mesh = MeshDefinition::new();
+        let root = mesh.root();
+        let cubes = CubeListBuilder::create().tex_offs(16, 16).add_box_with(
+            [-3.0, 1.0, -2.0],
+            [6.0, 10.0, 4.0],
+            CubeDeformation::new(grow),
+        );
+        mesh.add_or_replace_child(root, "body", cubes, PartPose::offset(0.0, 2.0, 0.0));
+        LayerDefinition::create(mesh, 64, 32).bake_root()
+    }
+
+    #[test]
+    fn a_shrunk_outer_box_is_the_inner_box() {
+        let shrunk = shrunk(box_part(1.0), INNER_SHRINK);
+        let inner = box_part(0.5);
+        let polygons = |p: &mod_api::ModelPart| p.get_child("body").unwrap().polygons.clone();
+        assert_eq!(polygons(&shrunk), polygons(&inner));
     }
 }
 

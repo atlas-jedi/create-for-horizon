@@ -12,7 +12,7 @@
     "minecraft:equippable": {
       "slot": "chest",
       "equip_sound": "minecraft:item.armor.equip_netherite",
-      "asset_id": "minecraft:netherite"
+      "asset_id": "create:netherite_diving"
     },
     "minecraft:attribute_modifiers": [
       {

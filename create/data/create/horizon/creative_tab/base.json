@@ -135,8 +135,6 @@
     "create:pulse_timer",
     "create:powered_latch",
     "create:powered_toggle_latch",
-    "create:copper_backtank",
-    "create:netherite_backtank",
     "create:peculiar_bell",
     "create:haunted_bell",
     "create:desk_bell",

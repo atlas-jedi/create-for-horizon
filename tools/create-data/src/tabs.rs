@@ -47,6 +47,11 @@ const LEFT_OUT: &[&str] = &[
     "large_bogey",
 ];
 
+/// The items Create's tab shows with components (`makeStackFunc`: the backtanks full of air). A
+/// tab declaration lists bare items, so these are left out of it and the native mod adds them
+/// to `base`, after the tab's own items (`build_creative_mode_tab_contents`).
+const WITH_COMPONENTS: &[&str] = &["copper_backtank", "netherite_backtank"];
+
 /// The plain items whose item model is 3D (`BakedModel.isGui3d`: no `gui_light: front` in their
 /// model's parents), which Create lists before the blocks (`IS_ITEM_3D_PREDICATE`); the other
 /// plain items follow the blocks.
@@ -99,7 +104,7 @@ const COLOURS: &[&str] = &[
 ];
 
 fn shown(name: &str) -> bool {
-    if LEFT_OUT.contains(&name) || name.starts_with("rare_") {
+    if LEFT_OUT.contains(&name) || WITH_COMPONENTS.contains(&name) || name.starts_with("rare_") {
         return false;
     }
     if let Some(metal) = name.strip_prefix("crushed_raw_") {
@@ -246,5 +251,7 @@ mod tests {
         assert!(!shown("schematic") && shown("schematic_and_quill"));
         assert!(shown("white_sail") && !shown("red_sail"));
         assert!(shown("crushed_raw_zinc") && !shown("crushed_raw_tin"));
+        // Added full by the native mod.
+        assert!(!shown("copper_backtank") && !shown("netherite_backtank"));
     }
 }

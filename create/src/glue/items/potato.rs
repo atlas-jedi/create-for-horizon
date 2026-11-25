@@ -168,6 +168,11 @@ fn marked_for_swap(stack: &ItemStack) -> bool {
 const AIR: &str = "create:air";
 static AIR_TYPE: std::sync::OnceLock<crate::glue::compat::ParticleType<()>> = std::sync::OnceLock::new();
 
+/// The air particle's options, once registered (a filling backtank draws air in with it).
+pub(crate) fn air_particle() -> Option<mod_api::ParticleOptions> {
+    AIR_TYPE.get().map(|ty| ty.options(()))
+}
+
 struct Air;
 
 impl crate::glue::compat::ParticleProvider for Air {

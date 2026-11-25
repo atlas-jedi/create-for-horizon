@@ -11672,4 +11672,36 @@ mod tests {
         assert!(w.dims[0].detectors.target_of.contains_key(&s));
         states::clear_range();
     }
+
+    #[test]
+    fn a_backtank_under_a_turning_shaft_fills() {
+        let _guard = states::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let names = [
+            ("create:creative_motor", vec![("facing", "down")]),
+            (
+                "create:copper_backtank",
+                vec![("facing", "north"), ("waterlogged", "false")],
+            ),
+            ("create:shaft", vec![("axis", "y")]),
+        ];
+        states::set_range(10, names.len() as u32);
+        let mut w = CreateWorld::new(StateTable::new(
+            10,
+            names.iter().map(|(n, p)| (*n, p.iter().copied())),
+        ));
+        // `BacktankBlock.hasShaftTowards(UP)`: driven through the shaft on its top, either way.
+        let tank = [0, 64, 0];
+        w.block_changed(0, tank, 0, 11);
+        w.block_changed(0, [0, 65, 0], 0, 12);
+        w.block_changed(0, [0, 66, 0], 0, 10);
+        w.set_motor(0, [0, 66, 0], 64.0);
+        w.tick(0, &mut Vec::new());
+        let speed = w.speed(0, tank).expect("the backtank turns");
+        assert_eq!(speed.abs(), 64.0);
+        assert_eq!(w.filling_backtanks(0), vec![(tank, speed)]);
+        let b = w.dims[0].backtanks.get_mut(&tank).unwrap();
+        assert!(b.tick(speed, false).is_some());
+        assert_eq!(b.air, 1, "`(64 - 100) / 20` clamps to one air a fill");
+        states::clear_range();
+    }
 }

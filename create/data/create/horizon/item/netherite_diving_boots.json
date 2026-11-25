@@ -1,3 +1,10 @@
 {
-  "template": "minecraft:netherite_boots"
+  "template": "minecraft:netherite_boots",
+  "components": {
+    "minecraft:equippable": {
+      "slot": "feet",
+      "equip_sound": "minecraft:item.armor.equip_netherite",
+      "asset_id": "create:netherite_diving"
+    }
+  }
 }

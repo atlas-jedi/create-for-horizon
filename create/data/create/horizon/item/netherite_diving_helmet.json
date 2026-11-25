@@ -3,6 +3,11 @@
   "components": {
     "minecraft:enchantments": {
       "minecraft:aqua_affinity": 1
+    },
+    "minecraft:equippable": {
+      "slot": "head",
+      "equip_sound": "minecraft:item.armor.equip_netherite",
+      "asset_id": "create:netherite_diving"
     }
   }
 }

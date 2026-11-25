@@ -296,6 +296,25 @@ impl Hooks for Create {
         glue::equipment::grip_frame();
     }
 
+    /// Create's diving gear on the local player (`HumanoidArmorLayer` with Create's textures,
+    /// `BacktankArmorLayer`).
+    fn render_living_post(
+        &self,
+        host: &dyn ClientHost,
+        event: &mut mod_api::RenderLivingPostEvent<'_>,
+    ) {
+        glue::equipment::render_worn(host, event);
+    }
+
+    /// Create's tab shows the backtanks full (`AllCreativeModeTabs.makeStackFunc`).
+    fn build_creative_mode_tab_contents(
+        &self,
+        _host: &mut dyn ClientHost,
+        event: &mut mod_api::BuildCreativeModeTabContentsEvent<'_>,
+    ) {
+        glue::equipment::creative_tab(event);
+    }
+
     fn render_hand(
         &self,
         _host: &dyn ClientHost,

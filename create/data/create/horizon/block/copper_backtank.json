@@ -12,7 +12,7 @@
     "minecraft:equippable": {
       "slot": "chest",
       "equip_sound": "minecraft:item.armor.equip_gold",
-      "asset_id": "minecraft:copper"
+      "asset_id": "create:copper_diving"
     },
     "minecraft:attribute_modifiers": [
       {

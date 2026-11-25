@@ -10,6 +10,16 @@ const SHADER: &str = "assets/create/shaders/pipeline/textured.wgsl";
 const CONNECTED: &str = "assets/create/horizon/connected/";
 const CONNECTED_TABLES: &str = "assets/create/horizon/connected_tables/";
 
+/// Create's armour textures (`BaseArmorItem.getArmorTexture`: `<textureLoc>_layer_<n>`), which
+/// the glue draws on the game's armour models (`model_part` takes the blocks atlas' sprites).
+const ARMOR_TEXTURES: [&str; 5] = [
+    "copper_diving_layer_1",
+    "netherite_diving_layer_1",
+    "netherite_diving_layer_2",
+    "cardboard_layer_1",
+    "cardboard_layer_2",
+];
+
 pub(crate) const SPINNING_TOOLS: [(&str, &[&str]); 3] = [
     ("wrench", &["item", "gear"]),
     ("potato_cannon", &["item", "cog"]),
@@ -151,6 +161,18 @@ pub(super) fn assets(contains: impl Fn(&str) -> bool) -> Result<BTreeMap<String,
             "sprite": format!("create:block/special/{name}"),
         }));
     }
+    for name in ARMOR_TEXTURES {
+        let texture = format!("assets/create/textures/models/armor/{name}.png");
+        if !contains(&texture) {
+            return Err(format!(
+                "{texture}: missing armour texture in the pinned jar"
+            ));
+        }
+        sources.push(json!({
+            "type": "minecraft:single",
+            "resource": format!("create:models/armor/{name}"),
+        }));
+    }
     let (connected, sheets) = crate::ct::native_assets();
     for sheet in sheets {
         let path = format!(
@@ -261,12 +283,31 @@ mod tests {
     }
 
     #[test]
+    fn the_registry_names_create_s_armour_textures_at_their_own_paths() {
+        let generated = assets(|_| true).unwrap();
+        let atlas: Value = serde_json::from_slice(&generated[BLOCK_ATLAS]).unwrap();
+        let sources = atlas["sources"].as_array().unwrap();
+        for name in ARMOR_TEXTURES {
+            let expected = json!({
+                "type": "minecraft:single",
+                "resource": format!("create:models/armor/{name}"),
+            });
+            assert_eq!(sources.iter().filter(|s| **s == expected).count(), 1);
+        }
+        assert!(
+            assets(|path| !path.ends_with("/cardboard_layer_2.png"))
+                .unwrap_err()
+                .contains("cardboard_layer_2.png")
+        );
+    }
+
+    #[test]
     fn the_registry_stitches_each_referenced_connected_sheet_once() {
         let generated = assets(|_| true).unwrap();
         let atlas: Value = serde_json::from_slice(&generated[BLOCK_ATLAS]).unwrap();
         let sources = atlas["sources"].as_array().unwrap();
         let (rules, sheets) = crate::ct::native_assets();
-        assert_eq!(sources.len(), 23 + sheets.len());
+        assert_eq!(sources.len(), 23 + ARMOR_TEXTURES.len() + sheets.len());
         for sheet in sheets {
             let expected = json!({ "type": "minecraft:single", "resource": sheet });
             assert_eq!(sources.iter().filter(|s| **s == expected).count(), 1);

@@ -27,13 +27,21 @@ fn armor(slot: &str, kind: &str, defense: f64, toughness: f64, knockback: f64) -
 
 /// The components of a backtank's item (`BacktankItem`, a chestplate of copper or netherite;
 /// no durability, so one to a stack), or None for another block. Its air is the native mod's.
+///
+/// Create's armour is drawn with its own textures (`BaseArmorItem.getArmorTexture`:
+/// `create:textures/models/armor/<material>_diving_layer_<n>.png`) and the backtank's model
+/// on the back (`BacktankArmorLayer`), not with the game's copper or netherite armour, so the
+/// `equippable` names the equipment asset of Create's texture (`create:copper_diving`), which no
+/// pack declares: the game's armour layer draws no layer of it, its head layer leaves a helmet
+/// to the armour layer (an item with an `asset_id` is armour), and the native mod draws
+/// Create's look.
 pub fn backtank_item(name: &str) -> Option<Value> {
     Some(match name {
         // AllArmorMaterials.COPPER: 4 on the chest, enchantability 7.
         "copper_backtank" => json!({
             "minecraft:max_stack_size": 1,
             "minecraft:equippable": { "slot": "chest", "equip_sound": COPPER_EQUIP,
-                                      "asset_id": "minecraft:copper" },
+                                      "asset_id": COPPER_DIVING },
             "minecraft:attribute_modifiers": armor("chest", "chestplate", 4.0, 0.0, 0.0),
             "minecraft:enchantable": { "value": 7 }
         }),
@@ -45,7 +53,7 @@ pub fn backtank_item(name: &str) -> Option<Value> {
             "minecraft:max_stack_size": 1,
             "minecraft:equippable": { "slot": "chest",
                                       "equip_sound": "minecraft:item.armor.equip_netherite",
-                                      "asset_id": "minecraft:netherite" },
+                                      "asset_id": NETHERITE_DIVING },
             "minecraft:attribute_modifiers":
                 armor("chest", "chestplate", 8.0, 3.0, f64::from(0.1f32)),
             "minecraft:enchantable": { "value": 15 },
@@ -55,8 +63,20 @@ pub fn backtank_item(name: &str) -> Option<Value> {
     })
 }
 
+/// The equipment assets of Create's diving gear: the `textureLoc` its `BaseArmorItem` is made
+/// with (`AllItems`), which no pack declares (see [`backtank_item`]).
+const COPPER_DIVING: &str = "create:copper_diving";
+const NETHERITE_DIVING: &str = "create:netherite_diving";
+
+/// The equippable of a diving helmet or boots: the template's slot and sound, and Create's
+/// texture as its look (`asset_id`) in place of the game's armour (see [`backtank_item`]).
+fn diving(slot: &str, sound: &str, asset: &str) -> Value {
+    json!({ "slot": slot, "equip_sound": sound, "asset_id": asset })
+}
+
 /// The declaration of an equipment item that is not a block, or None.
 pub fn item(name: &str) -> Option<Value> {
+    const NETHERITE_EQUIP: &str = "minecraft:item.armor.equip_netherite";
     // DivingHelmetItem.getEnchantmentLevel/getAllEnchantments: Aqua Affinity always.
     let aqua = json!({ "minecraft:aqua_affinity": 1 });
     Some(match name {
@@ -67,17 +87,19 @@ pub fn item(name: &str) -> Option<Value> {
             "components": {
                 "minecraft:max_damage": 77,
                 "minecraft:enchantable": { "value": 7 },
-                "minecraft:equippable": { "slot": "head", "equip_sound": COPPER_EQUIP,
-                                          "asset_id": "minecraft:copper" },
+                "minecraft:equippable": diving("head", COPPER_EQUIP, COPPER_DIVING),
                 "minecraft:attribute_modifiers": armor("head", "helmet", 2.0, 0.0, 0.0),
                 "minecraft:enchantments": aqua
             }
         }),
         // NETHERITE_DIVING_HELMET: netherite armour, `getDurability(37)`, fire resistant: the
-        // game's netherite helmet, as its template.
+        // game's netherite helmet, as its template, drawn as Create's.
         "netherite_diving_helmet" => json!({
             "template": "minecraft:netherite_helmet",
-            "components": { "minecraft:enchantments": aqua }
+            "components": {
+                "minecraft:enchantments": aqua,
+                "minecraft:equippable": diving("head", NETHERITE_EQUIP, NETHERITE_DIVING)
+            }
         }),
         // COPPER_DIVING_BOOTS: `Type.BOOTS.getDurability(7)`, 91 (13 per point for boots).
         "copper_diving_boots" => json!({
@@ -85,13 +107,16 @@ pub fn item(name: &str) -> Option<Value> {
             "components": {
                 "minecraft:max_damage": 91,
                 "minecraft:enchantable": { "value": 7 },
-                "minecraft:equippable": { "slot": "feet", "equip_sound": COPPER_EQUIP,
-                                          "asset_id": "minecraft:copper" },
+                "minecraft:equippable": diving("feet", COPPER_EQUIP, COPPER_DIVING),
                 "minecraft:attribute_modifiers": armor("feet", "boots", 1.0, 0.0, 0.0)
             }
         }),
-        // NETHERITE_DIVING_BOOTS: `getDurability(37)`: the game's netherite boots, as template.
-        "netherite_diving_boots" => json!({ "template": "minecraft:netherite_boots" }),
+        // NETHERITE_DIVING_BOOTS: `getDurability(37)`: the game's netherite boots, as template,
+        // drawn as Create's.
+        "netherite_diving_boots" => json!({
+            "template": "minecraft:netherite_boots",
+            "components": { "minecraft:equippable": diving("feet", NETHERITE_EQUIP, NETHERITE_DIVING) }
+        }),
         // ExtendoGripItem: `durability(MAX_DAMAGE)` (200), uncommon.
         "extendo_grip" => json!({
             "template": "minecraft:stick",
@@ -214,6 +239,32 @@ mod tests {
         assert_eq!(netherite["minecraft:attribute_modifiers"][1]["amount"], 3.0);
         assert!(netherite.get("minecraft:damage_resistant").is_some());
         assert!(backtank_item("shaft").is_none());
+    }
+
+    #[test]
+    fn create_s_diving_gear_is_not_drawn_as_the_game_s_armour() {
+        let backtanks = ["copper_backtank", "netherite_backtank"].map(backtank_item);
+        let worn = ["copper_diving_helmet", "copper_diving_boots"]
+            .map(|n| item(n).unwrap()["components"].clone());
+        let netherite = ["netherite_diving_helmet", "netherite_diving_boots"]
+            .map(|n| item(n).unwrap()["components"].clone());
+        for (i, c) in backtanks
+            .into_iter()
+            .flatten()
+            .chain(worn)
+            .chain(netherite)
+            .enumerate()
+        {
+            let e = &c["minecraft:equippable"];
+            assert!(e["slot"].is_string(), "still worn: {c}");
+            // Create's texture, never the game's copper or netherite armour.
+            let asset = if i == 1 || i >= 4 {
+                NETHERITE_DIVING
+            } else {
+                COPPER_DIVING
+            };
+            assert_eq!(e["asset_id"], asset, "{c}");
+        }
     }
 
     #[test]

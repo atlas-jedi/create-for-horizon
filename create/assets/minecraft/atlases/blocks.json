@@ -117,6 +117,26 @@
     },
     {
       "type": "minecraft:single",
+      "resource": "create:models/armor/copper_diving_layer_1"
+    },
+    {
+      "type": "minecraft:single",
+      "resource": "create:models/armor/netherite_diving_layer_1"
+    },
+    {
+      "type": "minecraft:single",
+      "resource": "create:models/armor/netherite_diving_layer_2"
+    },
+    {
+      "type": "minecraft:single",
+      "resource": "create:models/armor/cardboard_layer_1"
+    },
+    {
+      "type": "minecraft:single",
+      "resource": "create:models/armor/cardboard_layer_2"
+    },
+    {
+      "type": "minecraft:single",
       "resource": "create:block/creative_casing_connected"
     },
     {
