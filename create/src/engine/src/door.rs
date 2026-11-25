@@ -55,6 +55,50 @@ impl Door {
     }
 }
 
+/// What `DoorBlock.getHinge` reads on one side of a door being placed: whether a lower half of
+/// the same door stands there, and whether the block there and the one above it are full
+/// collision cubes (`isCollisionShapeFullBlock`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct HingeSide {
+    pub door: bool,
+    pub full: bool,
+    pub full_above: bool,
+}
+
+/// The sides `DoorBlock.getHinge` looks at for a door facing `facing` at `pos`: its left
+/// (`facing.getCounterClockWise()`) and its right (`getClockWise()`).
+pub fn hinge_sides(facing: Dir, pos: [i32; 3]) -> [[i32; 3]; 2] {
+    [counter_clockwise(facing), clockwise(facing)].map(|d| {
+        let o = d.offset();
+        [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]]
+    })
+}
+
+/// `DoorBlock.getHinge` (`SlidingDoorBlock.getStateForPlacement` keeps its `super`'s hinge):
+/// true for the right hinge. A door beside a lower door on its left hinges right, and one on
+/// its right left, so a second door placed beside a first makes a double door; else the hinge
+/// goes to the side with more full blocks; else to the half of the block the click landed in.
+/// `click` is the click's place within the block, x and z.
+pub fn placement_hinge(facing: Dir, left: HingeSide, right: HingeSide, click: [f64; 2]) -> bool {
+    let full = |s: HingeSide| i32::from(s.full) + i32::from(s.full_above);
+    let i = full(right) - full(left);
+    if (!left.door || right.door) && i <= 0 {
+        if (!right.door || left.door) && i >= 0 {
+            let [j, _, k] = facing.offset();
+            let [d0, d1] = click;
+            let left_hinge = (j >= 0 || d1 >= 0.5)
+                && (j <= 0 || d1 <= 0.5)
+                && (k >= 0 || d0 <= 0.5)
+                && (k <= 0 || d0 >= 0.5);
+            !left_hinge
+        } else {
+            false
+        }
+    } else {
+        true
+    }
+}
+
 fn clockwise(d: Dir) -> Dir {
     match d {
         Dir::North => Dir::East,
@@ -303,6 +347,54 @@ mod tests {
             hinge_right,
             open,
             visible: !open,
+        }
+    }
+
+    #[test]
+    fn a_door_placed_in_a_doorway_hinges_like_the_game_s() {
+        let open = HingeSide::default();
+        let wall = HingeSide {
+            full: true,
+            full_above: true,
+            ..open
+        };
+        let door = HingeSide { door: true, ..open };
+        // Facing west, the left is south (+z) and the right north (-z).
+        assert_eq!(
+            hinge_sides(Dir::West, [-1, 63, -58]),
+            [[-1, 63, -57], [-1, 63, -59]]
+        );
+        // A two-wide doorway between walls, facing west: the south door hinges left on its wall
+        // whatever the click or the order, the north one right; they make a double door.
+        for click in [[0.2, 0.2], [0.8, 0.8], [0.5, 0.1]] {
+            assert!(!placement_hinge(Dir::West, wall, open, click));
+            assert!(!placement_hinge(Dir::West, wall, door, click));
+            assert!(placement_hinge(Dir::West, open, wall, click));
+            assert!(placement_hinge(Dir::West, door, wall, click));
+        }
+        let south = door_hinged(Dir::West, false);
+        let north = door_hinged(Dir::West, true);
+        // Opened, the south door takes the north one with it (`isDoubleDoor`).
+        assert!(south.with_open(true).is_double(&north));
+        assert_eq!(south.partner([-1, 63, -58]), [-1, 63, -59]);
+        // A lower door beside decides it, walls or not; with none, the click's half does
+        // (facing north: the west half hinges left).
+        assert!(placement_hinge(Dir::North, door, open, [0.9, 0.5]));
+        assert!(!placement_hinge(Dir::North, open, door, [0.1, 0.5]));
+        assert!(!placement_hinge(Dir::North, open, open, [0.3, 0.5]));
+        assert!(placement_hinge(Dir::North, open, open, [0.7, 0.5]));
+        // Doors on both sides: the click again.
+        assert!(placement_hinge(Dir::South, door, door, [0.3, 0.5]));
+        assert!(!placement_hinge(Dir::South, door, door, [0.7, 0.5]));
+    }
+
+    fn door_hinged(facing: Dir, hinge_right: bool) -> Door {
+        door(facing, hinge_right, false)
+    }
+
+    impl Door {
+        fn with_open(self, open: bool) -> Door {
+            Door { open, ..self }
         }
     }
 

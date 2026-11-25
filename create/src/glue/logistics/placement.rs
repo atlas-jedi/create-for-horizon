@@ -42,6 +42,46 @@ pub fn register(r: &mut dyn Registrar) {
     }
     let vault = r.item_key("create:item_vault");
     r.item_part(vault, VaultItem);
+    for block in [Block::Clutch, Block::Gearshift] {
+        let item = r.item_key(&format!("create:{}", block.name()));
+        r.item_part(item, ShiftItem);
+    }
+}
+
+/// `GearshiftBlock.getStateForPlacement` (inherited by ClutchBlock): a clutch or gearshift is
+/// placed powered when a neighbour already powers it. Horizon's `state_for_placement` gets a level
+/// that reads no redstone, so the power is read here, once the item has placed the block and
+/// before any tick runs, the way `ClutchBlock.neighborChanged` would set it.
+struct ShiftItem;
+
+#[mod_api::horizon_part]
+impl mod_api::ItemPart for ShiftItem {
+    fn on_block_placed_by(
+        &self,
+        host: &mut dyn mod_api::ServerHost,
+        event: &mut mod_api::OnBlockPlacedByEvent<'_>,
+    ) {
+        let Some(dimension) = crate::glue::compat::placed_level(&*host, event)
+            .and_then(|l| l.dimension().id(&*host))
+        else {
+            return;
+        };
+        let dimension = dimension.to_string();
+        let Some(mut lv) = super::super::server::ServerLevel::new(host, &dimension) else {
+            return;
+        };
+        let pos = event.pos;
+        let state = lv.block(pos);
+        let Some(was) = with_world(|w| w.powered(state)).flatten() else {
+            return;
+        };
+        let now = lv.has_neighbor_signal(pos);
+        if now != was {
+            with_world(|w| w.transmission_power_changing(lv.dim, pos));
+            let value = if now { "true" } else { "false" };
+            lv.set_property(pos, "powered", value, super::super::server::UPDATE_CLIENTS);
+        }
+    }
 }
 
 fn axis_name(a: Axis) -> &'static str {
@@ -227,16 +267,8 @@ impl BlockPart for Placement {
             }
             _ => {}
         }
-        // `GearshiftBlock.getStateForPlacement` (inherited by ClutchBlock):
-        // choose power here, not when an arbitrary state is inserted into the world.
-        let default = if matches!(block, Block::Clutch | Block::Gearshift)
-            // Horizon: placement sees no redstone; the neighbour update powers it after.
-            && let Some(powered) = None::<bool>
-        {
-            set(default, "powered", flag(powered))
-        } else {
-            default
-        };
+        // `GearshiftBlock.getStateForPlacement` (inherited by ClutchBlock) chooses power at
+        // placement. This hook's level reads no redstone, so `ShiftItem` sets it right after.
         let placement = placed_state(block, default, water, pos, ctx, &set, &neighbours);
         if let (Block::Shaft, Some(Some(shaft))) = (block, placement)
             && let Some((_, info)) = states::level_info(level, shaft)

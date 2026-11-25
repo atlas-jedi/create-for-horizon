@@ -15,7 +15,7 @@ use super::subsystem::Subsystem;
 use super::world::with_world;
 use crate::glue::names::Named as _;
 use create_engine::Block;
-use create_engine::door::{Door, Slide};
+use create_engine::door::{Door, HingeSide, Slide, hinge_sides, placement_hinge};
 use create_engine::dye::{self, DyeColor};
 use mod_api::{
     BlockPart, BlockState, Compound, Hand, Host, HostTransaction, InteractionResult, ItemStack,
@@ -37,6 +37,10 @@ impl Subsystem for Blocks {
                 || matches!(block, Block::TrainTrapdoor | Block::FramedGlassTrapdoor)
             {
                 r.block_part(states::key(block), TemplateBlock);
+            }
+            if dye::is_sliding_door(block) {
+                let item = r.item_key(&format!("create:{}", block.name()));
+                r.item_part(item, DoorPlacement);
             }
         }
         // Horizon: no menu screen API; the toolbox's own screen and buttons are off.
@@ -417,6 +421,94 @@ fn use_trapdoor(
     let pitch = door_pitch(lv);
     play(lv, sound, pos, 1.0, pitch);
     Some(InteractionResult::Success)
+}
+
+/// `SlidingDoorBlock.getStateForPlacement`: the hinge `DoorBlock.getHinge` gives a door a
+/// player places. Horizon: the door is placed by the iron door's template, whose hinge in game
+/// did not follow the game's own rule for Create's doors (two doors in a doorway between full
+/// walls both hinged right, where the rule hinges the one with a wall on its left left whatever
+/// the click), and Create's double doors need opposite hinges (`isDoubleDoor`). The placement
+/// hook can't read collision shapes, so the hinge is worked out once the door is placed, in the
+/// same placement (`setPlacedBy`, before any tick sees it), from the clicked point and what
+/// stands beside it.
+struct DoorPlacement;
+
+#[mod_api::horizon_part]
+impl mod_api::ItemPart for DoorPlacement {
+    fn on_block_placed_by(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::OnBlockPlacedByEvent<'_>,
+    ) {
+        let Some(dimension) = event
+            .placer
+            .and_then(|p| p.dimension(&*host))
+            .map(|d| d.to_string())
+        else {
+            return;
+        };
+        let Some(mut lv) = ServerLevel::new(host, &dimension) else {
+            return;
+        };
+        hinge_placed_door(&mut lv, event.pos, event.click);
+    }
+}
+
+/// The door just placed at `pos` (its lower half), clicked at `click`, takes `getHinge`'s
+/// hinge, both halves.
+fn hinge_placed_door(lv: &mut ServerLevel<'_>, pos: [i32; 3], click: [f64; 3]) {
+    let Some((block, door, _)) = door_at(lv, pos).filter(|(_, d, _)| !d.upper) else {
+        return;
+    };
+    let side = |lv: &ServerLevel<'_>, at: [i32; 3]| HingeSide {
+        door: door_at(lv, at).is_some_and(|(b, d, _)| b == block && !d.upper),
+        full: full_cube(lv, at),
+        full_above: full_cube(lv, [at[0], at[1] + 1, at[2]]),
+    };
+    let [left, right] = hinge_sides(door.facing, pos);
+    let within = [click[0] - f64::from(pos[0]), click[2] - f64::from(pos[2])];
+    let hinge_right = placement_hinge(door.facing, side(lv, left), side(lv, right), within);
+    if hinge_right == door.hinge_right {
+        return;
+    }
+    let hinge = if hinge_right { "right" } else { "left" };
+    for at in [pos, door.other_half(pos)] {
+        let Some((b, _, state)) = door_at(lv, at) else {
+            continue;
+        };
+        if b != block {
+            continue;
+        }
+        if let Some(next) =
+            with_props(&*lv.host, state, &[("hinge", hinge)]).filter(|n| *n != state)
+        {
+            lv.set_state(at, next, UPDATE_CLIENTS);
+        }
+    }
+}
+
+/// `BlockState.isCollisionShapeFullBlock` for the block at `at`: its collision is the whole
+/// block (a box from corner to corner; none of the game's full blocks is made of more).
+fn full_cube(lv: &ServerLevel<'_>, at: [i32; 3]) -> bool {
+    const IN: f64 = 1.0e-5;
+    const NEAR: f64 = 1.0e-4;
+    let [x, y, z] = at.map(f64::from);
+    let cube = [x, y, z, x + 1.0, y + 1.0, z + 1.0];
+    let inside = [
+        x + IN,
+        y + IN,
+        z + IN,
+        x + 1.0 - IN,
+        y + 1.0 - IN,
+        z + 1.0 - IN,
+    ];
+    lv.level
+        .collision_boxes(&*lv.host, inside)
+        .is_some_and(|boxes| {
+            boxes
+                .iter()
+                .any(|b| (0..6).all(|i| (b[i] - cube[i]).abs() <= NEAR))
+        })
 }
 
 /// The sliding door at `pos`: its block, door and state.
