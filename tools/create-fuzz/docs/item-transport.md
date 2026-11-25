@@ -188,9 +188,9 @@ keeps them as item entities until that disposal, spawned where the glue spawns t
   that needs a tool or in creative mode), brackets of removed shafts and pipes, a removed
   depot's or ejector's held and merging stacks and a removed brass tunnel's stack
   (`Block.popResource`: the block's centre, a quarter block each way, less half an item's
-  height), and a removed depot's outputs and chute's stack (`Containers.dropItemStack`: anywhere
-  an item's box fits inside the block, its feet in the lower three quarters, the stack split at
-  random).
+  height), and a removed depot's outputs, chute's stack and crushing wheel controller's or saw's
+  inventory (`Containers.dropItemStack`: anywhere an item's box fits inside the block, its feet
+  in the lower three quarters, the stack split at random).
 
 The comparison follows how a drop was placed. An exactly placed drop that joined after the
 level's entity pass is compared at its position and motion within the transport tolerance. The

@@ -112,16 +112,13 @@ impl Run {
     /// `millstone_take`: a stack landing on (or handed to) a millstone goes into its input as far
     /// as it fits, when it has a milling recipe. The count left.
     pub(super) fn millstone_take(&mut self, pos: Pos, stack: &Stack) -> u8 {
-        if self.books.milling.find_single(&stack.item).is_none() {
-            return stack.count;
-        }
         self.millstone_insert(pos, 0, stack, false)
     }
 
-    /// The millstone's container through its handler (`ModContainer`: slot 0 takes, 1 to 9 give):
-    /// `insertItem` into `slot`. The count left.
+    /// The millstone's container through its handler (`MillstoneInventoryHandler`: slot 0 takes
+    /// what `canProcess` mills, 1 to 9 give): `insertItem` into `slot`. The count left.
     fn millstone_insert(&mut self, pos: Pos, slot: u8, stack: &Stack, simulate: bool) -> u8 {
-        if slot != 0 {
+        if slot != 0 || self.books.milling.find_single(&stack.item).is_none() {
             return stack.count;
         }
         let max = limit(&stack.item);
@@ -183,9 +180,6 @@ impl Run {
         checks.dedup();
         for pos in checks {
             self.fix_controllers(pos);
-        }
-        for (pos, item, n) in std::mem::take(&mut self.w.dims[0].crusher_drops) {
-            self.pop_resource(pos, &item, n);
         }
         let running = self.w.dims[0].running_crushers.clone();
         for pos in running {
@@ -301,15 +295,6 @@ impl Run {
         }
         if let Some(e) = self.w.dims[0].crushers.get_mut(&pos) {
             e.0 = c;
-        }
-    }
-
-    /// `tick_saws`: what broken saws drop. Saws holding items tick at their turn in the transport
-    /// walk (`tick_saw`).
-    pub(super) fn tick_saws(&mut self) {
-        let drops = std::mem::take(&mut self.w.dims[0].saw_drops);
-        for (pos, item, n) in drops {
-            self.pop_resource(pos, &item, n);
         }
     }
 

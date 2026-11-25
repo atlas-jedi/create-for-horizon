@@ -87,8 +87,7 @@ impl Run {
         // block change).
         self.ejector_signals();
         self.tick_transport();
-        // `processing::Tools`: drills, saws, then the deployers the depots asked for.
-        self.tick_saws();
+        // `processing::Tools`: the deployers the depots asked for.
         self.tick_presses();
         self.ejectors_ticked();
         self.save_fluid_entities();

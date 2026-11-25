@@ -174,6 +174,9 @@ impl Run {
         {
             return item.count;
         }
+        if !self.w.funnel_inv_ready(0, p) {
+            return item.count;
+        }
         // `filtering.test`: a brass funnel takes only what its filter passes.
         if !self.funnel_passes(p, &item.item) {
             return item.count;
@@ -978,6 +981,9 @@ impl belt::Surroundings for Side<'_> {
         let at = belt::position_for_offset(self.controller, &self.segment, self.length, segment);
         let pos = [at[0], at[1] + 1, at[2]];
         let (facing, _) = self.run.belt_funnel_at(pos)?;
+        if !self.run.w.funnel_inv_ready(0, pos) {
+            return Some(item.count);
+        }
         // `filtering.test`: a brass funnel lets only what its filter passes in.
         if !self.run.funnel_passes(pos, &item.item) {
             return Some(item.count);

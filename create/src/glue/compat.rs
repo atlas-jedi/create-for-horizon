@@ -461,6 +461,64 @@ pub mod ext {
         }
     }
 
+    pub trait LivingExt {
+        fn knockback(self, host: &mut dyn ServerHost, strength: f64, direction: [f64; 2]) -> bool;
+    }
+
+    impl LivingExt for mod_api::LivingRef {
+        /// `LivingEntity.knockback(strength, x, z)` worked out here, as Horizon has no call for
+        /// it: less the knockback resistance, half the old motion pushed away from `(x, z)`,
+        /// lifted while on the ground (to 0.4 at most); a player's through its client
+        /// (`PlayerRef::set_velocity`, as `hurtMarked` sends it). The `living_knockback`
+        /// listeners are not told and cannot change or cancel it. False when nothing moved.
+        fn knockback(self, host: &mut dyn ServerHost, strength: f64, [x, z]: [f64; 2]) -> bool {
+            let resistance = self
+                .attribute_value(&*host, "minecraft:knockback_resistance")
+                .unwrap_or(0.0);
+            let strength = strength * (1.0 - resistance);
+            let len = (x * x + z * z).sqrt();
+            // Both callers give a unit direction: vanilla's random nudge of a near-zero one
+            // (`Math.random`) never runs.
+            if strength <= 0.0 || len < 1.0e-5 {
+                return false;
+            }
+            let entity = self.entity();
+            let Some(old) = entity.velocity(&*host) else {
+                return false;
+            };
+            let push = [x / len * strength, z / len * strength];
+            let y = if entity.on_ground(&*host).unwrap_or(false) {
+                (old[1] / 2.0 + strength).min(0.4)
+            } else {
+                old[1]
+            };
+            let new = [old[0] / 2.0 - push[0], y, old[2] / 2.0 - push[1]];
+            match entity.uuid(host).and_then(|uuid| host.player(uuid)) {
+                Some(player) => player.set_velocity(host, new),
+                None => entity.set_velocity(host, new),
+            }
+        }
+    }
+
+    pub trait RenderAssetsExt {
+        /// No baked model of a block state: Horizon resolves only registered standalone models
+        /// (`RenderAssets::model`), so what draws block states this way draws nothing.
+        fn block_state_model(&self, _state: BlockState) -> Result<mod_api::ModelRef, ()> {
+            Err(())
+        }
+    }
+
+    impl RenderAssetsExt for dyn mod_api::RenderAssets + '_ {}
+
+    pub trait ModelInstanceExt: Sized {
+        /// No per-copy face culling (`ModelInstance.hidden_faces`): every face is kept.
+        fn with_hidden_faces(self, _hidden: u8) -> Self {
+            self
+        }
+    }
+
+    impl ModelInstanceExt for mod_api::ModelInstance {}
+
     pub trait SoundExt {
         fn move_to(self, _host: &dyn ClientHost, _at: [f64; 3]) -> bool;
         fn set_pitch(self, _host: &dyn ClientHost, _pitch: f32) -> bool;

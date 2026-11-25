@@ -106,15 +106,28 @@ cannot differ from Create's.
 `ProcessingRecipe.rollResults` (`processing/recipe/ProcessingRecipe.java:148`) rolls each output
 below chance 1 once per count with `level.random` (`ProcessingOutput.rollOutput`, :87): the
 millstone (`MillstoneBlockEntity.java:164`), the crushing controller (`:312`) and the saw
-(`:371`). The port rolls the same odds from its own seed. Two Java runs of the same case differ
-too, so a case whose input has a rolled recipe compares what chance decides by structure
-(`processing::Rolls`): an item a rolled recipe makes for sure compares by presence, one it makes
-only by chance not at all, in machine slots, depots, thrown items and items given to a player.
-Depots' saved payloads are then not compared, nor the comparator of one holding such an item. Inputs, times and fixed recipes'
-results compare exactly. Where the rolls would change what happens next, the family does not
-go on: a depot below a controller takes one stack of the results, and how many more stay in the
-controller (so whether it takes the next insert) is chance's, so over a depot nothing is put in
-after a rolled input (seeds 5341 and 6109, where two Java runs disagreed on a later insert).
+(`:371`). `level.random` is the server's own and nothing reseeds it per case, so where its
+stream stands when a case starts is the batch's: two Java runs of one case roll differently. The
+port rolls the same odds from its own seed. A case whose input has a rolled recipe therefore
+compares what chance decides by structure (`processing::Rolls`): an item a rolled recipe makes
+for sure compares by presence, one it makes only by chance not at all, in machine slots, depots,
+thrown items and items given to a player. A machine's slots are then read by stack on both sides
+whenever either holds a rolled stack: results go to the first slot that fits
+(`MillstoneBlockEntity.java:165`), so a chance result being there or not moves the fixed results
+after it to other slots. Seed 7885's bone left white dye in one Java run and not in another, and
+the cobblestone milled after it sat in output slot 1 or 2. Depots' saved payloads are then not
+compared, nor the comparator of one holding such an item. Inputs, times and fixed recipes'
+results compare exactly.
+
+Where the rolls would change what happens next, the family does not go on:
+
+- A depot below a controller takes one stack of the results, and how many more stay in the
+  controller (so whether it takes the next insert) is chance's: over a depot nothing is put in
+  after a rolled input (seeds 5341 and 6109, where two Java runs disagreed on a later insert).
+- After a rolled input has reached a millstone's input slot, none of its output slots is drawn
+  on: which stack sits there is then chance's.
+- All a case's rolled inputs make less than a full slot of any one result, since a full one
+  stops the millstone (`MillstoneBlockEntity.tick`, :92) when chance says.
 
 ## Port differences found
 
@@ -129,25 +142,13 @@ Fixed, each with an engine test carrying Create's numbers and a case in `cases/`
 | `processing-saw-broken` | A broken saw cutting a log drops it, scattered in its block | Discarded it with the block entity (and would have spawned it at the middle, still) | `SawBlockEntity.java:284`, `ItemHelper.dropContents` |
 | `processing-crusher-removed` | A controller holding 8 cobblestone drops them when a wheel goes | Dropped nothing | `CrushingWheelControllerBlock.java:197` |
 | `processing-saw-depot-turn` | A depot placed after the saw moves the result 0.125 in the tick it arrives | Moved it a tick later (saws ticked after the transport walk) | `SawBlockEntity.java:170` in the level's block-entity order |
+| `processing-millstone-unmillable` | The millstone's handler refuses 19 dirt (no milling recipe) and takes 2 cobblestone | Took the dirt and held it | `MillstoneBlockEntity.java:236`, `canProcess` (:211) |
+| `processing-crusher-output-down`, `-north`, `-south` | Results leave 0.55 past the controller's middle along its facing (y − 0.55 facing down), tagged `BypassCrushingWheel` so its collision lets them through | Started clear of the controller: y − 0.8 facing down, 0.68 sideways | `CrushingWheelControllerBlockEntity.java:130`, `:193`; `CrushingWheelControllerBlock.java:169` |
 
 The driver spilled a broken millstone's slots as `Block.popResource` does; the game spills a
 mod container as `Containers.dropContents` does, as Create's `destroy` (:144,
 `ItemHelper.dropContents`) does, so seeds 973 and 1485 differed whenever Java's items landed
 outside the narrower range.
-
-Documented API gaps (`rust/src/allow.rs`, rows in `API_GAPS.md`; repro: `./run.sh fuzz gen <seed>`
-then `check`):
-
-- Seed 2765 (`processing/millstone`): the millstone's handler takes 19 dirt into slot 0. Create's
-  `MillstoneInventoryHandler.insertItem` (:236) refuses what it can't mill (`canProcess`, :211).
-  The port's container has no per-item rule; the SDK's `can_place_item` hook sees the entity's
-  slots but not its block, so a millstone cannot be told from a basin there. A case whose first
-  difference is this is counted as a documented API gap, not compared further.
-- Seeds 1757, 2269, 3805 and 5085 (`processing/crushing`): results thrown out of a controller
-  facing down appear at y − 0.8, Create's at y − 0.55 (`outPos`, :130). Create tags them
-  `BypassCrushingWheel` (:193) so the controller's collision for items lets them through; the
-  port has no such tag and starts them clear of it (`crusher::output`). Such a drop pairs with
-  Java's exactly and the rest of the case is compared.
 
 ## Not driven yet
 

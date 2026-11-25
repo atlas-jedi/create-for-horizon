@@ -91,6 +91,9 @@ crank (true: backwards). A `minecraft:redstone_block` powers the blocks beside i
 - Clearing a slot also discards its entities: a cleared depot or belt drops its items, which landed on the next case's
   depot in that slot and made it java-unstable.
 - A difference is rerun three times on Java first; a case Java disagrees with itself on is reported as unstable.
+- `level.random` is the server's and is not reseeded per case, so two Java runs of one case roll different
+  processing results: those compare by structure, and no family does what a roll would change
+  ([rolled results](docs/processing-scope.md#rolled-results)).
 - `rust/src/allow.rs` lists the differences confirmed not to be port bugs, each with its evidence.
 - A placed block's state starts from the port's `default_state` (`create/data/create/sunrise/block/<name>.json` in the
   checkout `run.sh` drives, `CREATE_HORIZON_DIR`), as the game's placement starts from the block's default.

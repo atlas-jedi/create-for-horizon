@@ -57,6 +57,13 @@ impl crate::world::CreateWorld {
         }
     }
 
+    /// Whether the funnel at `pos` has acquired its target inventory capability
+    /// (`InvManipulationBehaviour.targetCapability != null`): false after placement, load or a
+    /// neighbour change behind it until its own turn in `TransportTicks`.
+    pub fn funnel_inv_ready(&self, dim: usize, pos: [i32; 3]) -> bool {
+        !self.dims[dim].funnel_inv_pending.contains(&pos)
+    }
+
     /// `FunnelBlockEntity.write`'s `TransferCooldown` for the funnel at `pos` at game time `now`.
     pub fn saved_funnel_cooldown(&self, dim: usize, pos: [i32; 3], now: u64) -> Option<u32> {
         self.dims[dim]

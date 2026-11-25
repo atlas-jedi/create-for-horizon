@@ -231,6 +231,31 @@ impl Placing {
         add(q, self.position(pt))
     }
 
+    /// The affine map of [`apply`](Self::apply) split into the world-space image of `(0, 0, 0)`
+    /// (`origin`, in `f64`) and the 3×4 row-major linear part (`[f32; 12]`, zero translation) for
+    /// [`mod_api::ModelInstance`].
+    pub(super) fn block_transform(&self, pt: f32) -> (Vec3, [f32; 12]) {
+        let origin = self.apply([0.0, 0.0, 0.0], pt);
+        let ex = sub(self.apply([1.0, 0.0, 0.0], pt), origin);
+        let ey = sub(self.apply([0.0, 1.0, 0.0], pt), origin);
+        let ez = sub(self.apply([0.0, 0.0, 1.0], pt), origin);
+        let linear = [
+            ex[0] as f32,
+            ey[0] as f32,
+            ez[0] as f32,
+            0.0,
+            ex[1] as f32,
+            ey[1] as f32,
+            ez[1] as f32,
+            0.0,
+            ex[2] as f32,
+            ey[2] as f32,
+            ez[2] as f32,
+            0.0,
+        ];
+        (origin, linear)
+    }
+
     /// `isFlipped`.
     #[cfg(test)]
     fn is_flipped(&self) -> bool {
@@ -345,8 +370,7 @@ impl Placing {
     }
 
     /// The mirrors between ticks (`getScaleFB`, `getScaleLR`).
-    #[cfg(test)]
-    fn scales(&self, pt: f32) -> (f32, f32) {
+    pub(super) fn scales(&self, pt: f32) -> (f32, f32) {
         (self.scale_fb.get(pt), self.scale_lr.get(pt))
     }
 
@@ -616,6 +640,46 @@ mod tests {
         let back = t.to_local(t.apply(local, 1.0), 1.0);
         for i in 0..3 {
             assert!((back[i] - local[i]).abs() < 1e-4, "{back:?}");
+        }
+    }
+
+    #[test]
+    fn block_transform_matches_apply_at_every_corner() {
+        for size in [[3, 2, 1], [4, 3, 2]] {
+            for r in Rotation::ALL {
+                for m in Mirror::ALL {
+                    let mut t = Placing::default();
+                    t.init([10, 64, -20], r, m, size);
+                    // Also test mid-chase after a flip + rotation so scale != 1 and angle != 90*k.
+                    t.flip_x();
+                    t.rotate90(true);
+                    t.tick();
+                    let (origin, lin) = t.block_transform(0.5);
+                    for p in [[0.0, 0.0, 0.0], [1.0, 2.0, 3.0], [2.5, 0.5, 1.25]] {
+                        let got = [
+                            origin[0]
+                                + f64::from(lin[0]) * p[0]
+                                + f64::from(lin[1]) * p[1]
+                                + f64::from(lin[2]) * p[2],
+                            origin[1]
+                                + f64::from(lin[4]) * p[0]
+                                + f64::from(lin[5]) * p[1]
+                                + f64::from(lin[6]) * p[2],
+                            origin[2]
+                                + f64::from(lin[8]) * p[0]
+                                + f64::from(lin[9]) * p[1]
+                                + f64::from(lin[10]) * p[2],
+                        ];
+                        let want = t.apply(p, 0.5);
+                        for i in 0..3 {
+                            assert!(
+                                (got[i] - want[i]).abs() < 1e-5,
+                                "{size:?} {r:?} {m:?} {p:?}: got {got:?} want {want:?}"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
 

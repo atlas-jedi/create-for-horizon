@@ -109,6 +109,19 @@ pub fn roll(recipe: &Recipe, rng: &mut Rng) -> Vec<(String, u8)> {
 /// A slot: an item and its count, with the item's stack limit.
 pub type Slot = Option<(String, u8)>;
 
+/// `ProcessingInventory`'s slots (`super(32)`).
+pub const INVENTORY_SLOTS: usize = 32;
+
+/// A crushing wheel controller's or saw's `ProcessingInventory` slot by slot, as
+/// `ItemHelper.dropContents` walks it: the input in slot 0, the results from slot 1 once applied.
+pub fn inventory_slots(slots: Vec<(String, u8)>, applied: bool) -> Vec<Slot> {
+    let mut out = vec![None; INVENTORY_SLOTS];
+    for (slot, stack) in out.iter_mut().skip(usize::from(applied)).zip(slots) {
+        *slot = Some(stack);
+    }
+    out
+}
+
 /// `ItemHandlerHelper.insertItemStacked`: onto stacks of the same item first, then into empty
 /// slots. Returns what did not fit (Create's machines throw it away).
 pub fn insert_stacked(slots: &mut [Slot], item: &str, mut count: u8, max: u8) -> u8 {
@@ -288,6 +301,17 @@ mod tests {
         // Only the wider tries reach 16 blocks and more; none reach 32.
         assert!(animate_tick_chance([20, 0, 0]) < 0.02);
         assert_eq!(animate_tick_chance([32, 0, 0]), 0.0);
+    }
+
+    #[test]
+    fn an_applied_inventory_keeps_its_results_after_the_input_slot() {
+        let gravel = ("minecraft:gravel".to_owned(), 6);
+        let before = inventory_slots(vec![gravel.clone()], false);
+        assert_eq!(before.len(), INVENTORY_SLOTS);
+        assert_eq!(before[0], Some(gravel.clone()));
+        let after = inventory_slots(vec![gravel.clone()], true);
+        assert_eq!((&after[0], &after[1]), (&None, &Some(gravel)));
+        assert!(after[2..].iter().all(Option::is_none));
     }
 
     fn wheat_book() -> Book {

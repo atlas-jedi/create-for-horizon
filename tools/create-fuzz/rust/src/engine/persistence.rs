@@ -1451,4 +1451,71 @@ mod reload_order_tests {
         };
         assert_eq!(actual, expected);
     }
+
+    #[test]
+    fn reloaded_funnel_waits_for_its_first_tick_before_belt_end_inserts() {
+        // Issue #265 (seed 25255, belt/brass_funnels): belt (0,8,0..5) feeds upward brass funnel
+        // (0,8,6) over depot (0,7,6), saved and reloaded at tick 111. On tick 112 the belt ticks
+        // before the reloaded funnel has run SmartBlockEntity.tick -> InvManipulationBehaviour
+        // findNewCapability, so targetCapability is still null: Java keeps the 61 ingots on the
+        // belt at 5.75 on tick 112 and inserts them into the depot on tick 113.
+        let sc: Scenario = serde_json::from_value(serde_json::json!({
+            "version": 3,
+            "seed": 25255,
+            "ticks": 120,
+            "checkpoints": [111, 112, 113],
+            "blocks": [
+                {"pos": [0, 8, 0], "state": "create:shaft[axis=x,waterlogged=false]"},
+                {"pos": [0, 8, 5], "state": "create:shaft[axis=x,waterlogged=false]"},
+                {"pos": [-1, 8, 0], "state": "create:creative_motor[facing=east]", "motor": 32},
+                {"pos": [0, 7, 6], "state": "create:depot[waterlogged=false]"}
+            ],
+            "events": [
+                {"tick": 8, "pos": [0, 8, 0], "action": {"kind": "use", "item": "create:belt_connector", "face": "up", "hit": [0.5, 1.0, 0.5], "yaw": 0.0, "pitch": 0.0, "sneaking": false}},
+                {"tick": 14, "pos": [0, 8, 5], "action": {"kind": "use", "item": "create:belt_connector", "face": "up", "hit": [0.5, 1.0, 0.5], "yaw": 0.0, "pitch": 0.0, "sneaking": false}},
+                {"tick": 24, "pos": [0, 8, 6], "state": "create:brass_funnel[extracting=false,facing=up,powered=false,waterlogged=false]"},
+                {"tick": 32, "pos": [0, 8, 0], "action": {"kind": "item", "input": {"kind": "drop_on", "stack": {"item": "minecraft:iron_ingot", "count": 61}}}},
+                {"tick": 71, "pos": [0, 8, 0], "action": {"kind": "item", "input": {"kind": "drop_on", "stack": {"item": "minecraft:iron_ingot", "count": 41}}}},
+                {"tick": 111, "pos": [0, 8, 0], "action": {"kind": "reload"}}
+            ]
+        }))
+        .unwrap();
+        let snap = crate::engine::run(&sc);
+        let cp112 = &snap.checkpoints[&112];
+        let belt112 = cp112.blocks[&key([0, 8, 0])]
+            .transport
+            .as_ref()
+            .expect("belt at tick 112");
+        assert_eq!(
+            belt112.items.len(),
+            2,
+            "tick 112 belt items: {:?}",
+            belt112.items
+        );
+        let front = belt112
+            .items
+            .iter()
+            .max_by(|a, b| a.position.total_cmp(&b.position))
+            .unwrap();
+        assert_eq!(front.stack.count, 61);
+        assert!((front.position - 5.75).abs() < 1e-6);
+        let depot112 = cp112.blocks[&key([0, 7, 6])]
+            .transport
+            .as_ref()
+            .expect("depot at tick 112");
+        assert!(
+            depot112.items.is_empty(),
+            "tick 112 depot should be empty, got {:?}",
+            depot112.items
+        );
+
+        let cp113 = &snap.checkpoints[&113];
+        let depot113 = cp113.blocks[&key([0, 7, 6])]
+            .transport
+            .as_ref()
+            .expect("depot at tick 113");
+        assert_eq!(depot113.items.len(), 1);
+        assert_eq!(depot113.items[0].stack.item, "minecraft:iron_ingot");
+        assert_eq!(depot113.items[0].stack.count, 61);
+    }
 }

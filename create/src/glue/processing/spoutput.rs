@@ -103,6 +103,9 @@ fn has_target(lv: &mut ServerLevel<'_>, pos: [i32; 3], d: Dir) -> bool {
         return true;
     }
     if let Some(f) = logistics::funnel_at(lv, output) {
+        if with_world(|w| w.funnel_inv_ready(lv.dim, output)) != Some(true) {
+            return false;
+        }
         let behind = create_engine::funnel::behind(output, f.facing);
         return items::items_at(lv, behind, Some(items::face(f.facing))).is_some();
     }
@@ -138,6 +141,9 @@ fn insert(
     };
     let (at, side) = match logistics::funnel_at(lv, output) {
         Some(f) => {
+            if with_world(|w| w.funnel_inv_ready(lv.dim, output)) != Some(true) {
+                return 0;
+            }
             // `filter.test`: a brass funnel's filter.
             if !logistics::funnel_passes(lv, output, &stack) {
                 return 0;

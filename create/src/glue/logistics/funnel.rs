@@ -106,7 +106,11 @@ pub fn use_funnel_insert(
     let Some(stack) = click.stack.filter(|s| s.count() > 0).cloned() else {
         return true;
     };
-    if !funnel_passes(lv, pos, &stack) {
+    // `InvManipulationBehaviour.insert`: nothing goes in before the funnel's turn has found
+    // the inventory behind it.
+    if !funnel_passes(lv, pos, &stack)
+        || with_world(|w| w.funnel_inv_ready(lv.dim, pos)) != Some(true)
+    {
         return true;
     }
     let behind = create_engine::funnel::behind(pos, f.facing);
@@ -423,6 +427,9 @@ fn pull_from_depot(
 ) -> Option<Option<bool>> {
     let below = [pos[0], pos[1] - 1, pos[2]];
     let dim = lv.dim;
+    if with_world(|w| w.funnel_inv_ready(dim, pos)) != Some(true) {
+        return Some(None);
+    }
     // An ejector keeps the funnel facing its back for its launches (`canFunnelsPullFrom`).
     if let Some((Block::WeightedEjector, info)) = info_at(lv, below)
         && let Some(f) = funnel_at(lv, pos)
@@ -759,6 +766,9 @@ pub fn collect_inside(lv: &mut ServerLevel<'_>) {
             continue;
         };
         if f.belt.is_some() || f.powered || f.extracting {
+            continue;
+        }
+        if with_world(|w| w.funnel_inv_ready(dim, pos)) != Some(true) {
             continue;
         }
         let Some(e) = lv.host.entity(id) else {

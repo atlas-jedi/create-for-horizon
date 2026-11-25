@@ -28,7 +28,8 @@
 //!   (`requiresCorrectToolForDrops` and `isCorrectToolForDrops`): no query for either, so it
 //!   digs every block at its harvestable speed (the drops still follow the game's rules).
 //! - A hopper putting into a millstone what it can't mill (`MillstoneInventoryHandler`'s
-//!   `canProcess`): `ModContainer` has no per-slot insert check.
+//!   `canProcess`): Horizon has no `can_place_item` hook, and `ModContainer` no per-slot insert
+//!   check (see HORIZON_GAPS.md).
 //! - Create's own damage types (`create:crush`): a native mod's are not registered, so the
 //!   crushing wheels deal vanilla's cramming.
 //! - The deployer's punch at full strength (`DeployerFakePlayer.getCurrentItemAttackStrengthDelay`
@@ -86,6 +87,7 @@ pub(crate) use saw::saw_turn;
 // stack's sequenced progress onto and off a belt).
 pub use basin::basin_tanks;
 pub use press::{sequenced_for, sequenced_on_belt, sequenced_on_depot, sequenced_step_on_depot};
+pub(crate) use stacks::known_key as known_item_key;
 pub use stacks::{sequenced_progress, set_sequenced_progress};
 
 use super::server::ServerLevel;
@@ -99,6 +101,54 @@ use mod_api::{
     ItemAfterVerticalCollisionEvent, PlayerRef, Registrar, RegistrationContext,
     RightClickBlockEvent, ServerHost,
 };
+
+/// `Container.canPlaceItem` of a kinetic block entity's slots: the millstone's handler.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
+pub(crate) fn can_place_item(event: &mod_api::CanPlaceItemEvent<'_>) -> Option<bool> {
+    (event.state.block() == super::states::key(Block::Millstone))
+        .then(|| millstone::admits(event.slot, event.stack))
+}
+
+/// `CrushingWheelControllerBlock.onRemove`, `SawBlockEntity.destroy`
+/// (`ItemHelper.dropContents`) and `DeployerBlockEntity.discardPlayer`: the removed block's
+/// inventory slot by slot or its held stack, with their components and wear (a saw keeps a
+/// stack's components in its item's name, `logistics::belt_name`).
+pub(crate) fn spill_removed(event: &mut mod_api::PreRemoveSideEffectsEvent<'_>) {
+    let block = event.state.block();
+    let pos = [event.pos.x, event.pos.y, event.pos.z];
+    if block == super::states::key(Block::Deployer) {
+        let dp = with_world(|w| {
+            w.dims
+                .iter_mut()
+                .find_map(|d| d.removed_deployers.remove(&pos))
+        })
+        .flatten();
+        let make = super::logistics::items::known_stack_of;
+        if let Some(stack) = dp.and_then(|dp| deployer::held_stack(&dp, make)) {
+            event.drops.push(stack);
+        }
+        return;
+    }
+    if block != super::states::key(Block::CrushingWheelController)
+        && block != super::states::key(Block::MechanicalSaw)
+    {
+        return;
+    }
+    // The engine let go of it at the block change, earlier in this same write.
+    let slots = with_world(|w| {
+        w.dims
+            .iter_mut()
+            .find_map(|d| d.removed_inventories.remove(&pos))
+    })
+    .flatten()
+    .unwrap_or_else(|| vec![None; create_engine::processing::INVENTORY_SLOTS]);
+    event.drops.extend(
+        slots
+            .into_iter()
+            .flatten()
+            .filter_map(|(item, n)| super::logistics::items::known_stack_of(&item, u32::from(n))),
+    );
+}
 
 pub struct Processing;
 
@@ -163,6 +213,7 @@ impl Subsystem for Processing {
         let _ = deployer::ITEM_PARTICLE.set(r.particle_key("minecraft:item"));
         containers::register(r);
         recipes::register(r);
+        crusher::register(r);
         // The crafter's group inventory, ahead of the game's plain slot (it is the kinetic type's,
         // declared by `Kinetics`).
         let kind = r.block_entity_type_key(super::kinetics::TYPE);
@@ -185,6 +236,7 @@ impl Subsystem for Processing {
         for block in [Block::Basin, Block::CrushingWheel] {
             r.block_part(super::states::key(block), Survival);
         }
+        r.block_part(super::states::key(Block::MechanicalCrafter), CrafterUse);
         toolbelt::register(r);
         operator::register(r);
         for b in Block::ALL
@@ -197,8 +249,31 @@ impl Subsystem for Processing {
         }
     }
 
+    fn world_opened(&self, host: &mut dyn ServerHost) {
+        crusher::world_opened(&*host);
+    }
+
+    fn entity_join_level(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::EntityJoinLevelEvent<'_>,
+    ) -> mod_api::Flow {
+        crusher::item_joined(host, event);
+        mod_api::Flow::Continue
+    }
+
+    fn entity_leave_level(
+        &self,
+        _host: &mut dyn ServerHost,
+        event: &mut mod_api::EntityLeaveLevelEvent<'_>,
+    ) {
+        crusher::item_left(event.entity);
+    }
+
     fn world_closed(&self) {
         recipes::clear();
+        stacks::clear_items();
+        crusher::clear();
         saw::clear();
         press::clear();
         basin::clear();
@@ -209,6 +284,7 @@ impl Subsystem for Processing {
     }
 
     fn tags_updated(&self, cx: &dyn mod_api::Host) {
+        stacks::publish_items(cx);
         recipes::publish(cx);
         basin::recipes_changed();
     }
@@ -264,6 +340,12 @@ impl Subsystem for Processing {
     /// Legacy `level_tick_post` order: crafters, millstones, fans, crushers, burners, mixers.
     /// The drills, saws, presses and deployers are `Tools`', after logistics' belts.
     fn level_tick(&self, lv: &mut ServerLevel<'_>) {
+        // What a removal without side effects (`UPDATE_SKIP_BLOCK_ENTITY_SIDEEFFECTS`) left.
+        with_world(|w| {
+            let d = &mut w.dims[lv.dim];
+            d.removed_inventories.clear();
+            d.removed_deployers.clear();
+        });
         crafter::tick_crafters(lv);
         millstone::tick_millstones(lv);
         fan::tick_fans(lv);
@@ -493,7 +575,9 @@ impl Subsystem for Processing {
     ) -> mod_api::Flow {
         match host {
             HostSide::Server(host) => {
-                if application::apply_in_world(host, event) {
+                if deployer::calm_hive_harvest(host, event)
+                    || application::apply_in_world(host, event)
+                {
                     return mod_api::Flow::Cancel;
                 }
                 use_block(host, event)
@@ -586,7 +670,6 @@ pub struct Tools;
 impl Subsystem for Tools {
     fn level_tick(&self, lv: &mut ServerLevel<'_>) {
         saw::tick_drills(lv);
-        saw::tick_saws(lv);
         saw::hurt_inside(lv);
         press::tick_presses(lv);
         deployer::tick_deployers(lv);
@@ -736,9 +819,33 @@ impl BlockPart for BurnerPlacement {
     }
 }
 
-/// `useItemOn` of the machines a player clicks: the millstone, the
-/// mechanical crafter, the deployer and the blaze burner. Cancelled as used when it took the
-/// click.
+/// `MechanicalCrafterBlock.useItemOn`: runs after `ItemPart::on_item_use_first` so a cogwheel
+/// clicked off-centre on an idle crafter's front face places beside it before the crafter takes
+/// the held item.
+struct CrafterUse;
+
+#[mod_api::horizon_part]
+impl BlockPart for CrafterUse {
+    fn use_item_on(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::UseItemOnEvent<'_>,
+    ) -> Option<mod_api::InteractionResult> {
+        let click = event.click;
+        let dimension = click.dimension.key().id().to_owned();
+        let mut lv = ServerLevel::new(host, &dimension)?;
+        let player = lv.host.players().acting_player()?;
+        if player.entity().spectator(&*lv.host) == Some(true) {
+            return None;
+        }
+        let main = click.hand == mod_api::Hand::Main;
+        crafter::use_crafter(&mut lv, click.pos, click, player, main)
+            .then_some(mod_api::InteractionResult::Success)
+    }
+}
+
+/// `useItemOn` of the machines a player clicks in `right_click_block`: the millstone, the
+/// deployer, the blaze burner and the basin. Cancelled as used when it took the click.
 fn use_block(host: &mut dyn ServerHost, event: &mut RightClickBlockEvent<'_>) -> mod_api::Flow {
     let click = event.click;
     let dimension = click.dimension.key().id().to_owned();
@@ -783,7 +890,6 @@ fn use_block(host: &mut dyn ServerHost, event: &mut RightClickBlockEvent<'_>) ->
     }
     let used = match block {
         Block::Millstone => millstone::use_millstone(&mut lv, pos, player, click.stack),
-        Block::MechanicalCrafter => crafter::use_crafter(&mut lv, pos, click, player, main),
         Block::Deployer => info
             .facing
             .is_some_and(|f| deployer::use_deployer(&mut lv, pos, f, click, player, main)),

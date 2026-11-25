@@ -293,6 +293,24 @@ pub fn hit(t: &Type) -> (f32, Option<i32>) {
     )
 }
 
+/// `PotatoProjectileEntity.onHitEntity`: knockback strength and `LivingEntity.knockback`
+/// direction (`knockback * 0.6`, `-appliedMotion.x`, `-appliedMotion.z`) from the shot's
+/// horizontal motion. None when the type has no knockback or the shot has no horizontal
+/// motion (`Vec3.normalize()` threshold `1e-4`).
+pub fn knockback(t: &Type, motion: [f64; 3]) -> Option<(f64, [f64; 2])> {
+    if t.knockback <= 0.0 {
+        return None;
+    }
+    let len = (motion[0] * motion[0] + motion[2] * motion[2]).sqrt();
+    if !len.is_finite() || len < 1.0e-4 {
+        return None;
+    }
+    Some((
+        f64::from(t.knockback) * 0.6,
+        [-motion[0] / len, -motion[2] / len],
+    ))
+}
+
 /// `ShootableGadgetItemMethods.applyCooldown`: a cannon in the other hand too shortens it.
 pub fn cooldown(t: &Type, gun_in_other_hand: bool) -> i32 {
     if gun_in_other_hand {
@@ -311,6 +329,12 @@ mod tests {
         let potato = type_for("minecraft:potato").unwrap();
         assert_eq!((potato.damage, potato.reload_ticks), (5, 15));
         assert_eq!(potato.knockback, 1.5);
+        let (strength, dir) = knockback(potato, [3.0, -5.0, 4.0]).expect("horizontal knockback");
+        assert!((strength - 0.9).abs() < 1e-12);
+        assert!((dir[0] + 0.6).abs() < 1e-12 && (dir[1] + 0.8).abs() < 1e-12);
+        assert_eq!(knockback(potato, [0.0, -1.0, 0.0]), None);
+        let melon = type_for("minecraft:melon").unwrap();
+        assert!((knockback(melon, [1.0, 0.0, 0.0]).unwrap().0 - 1.2).abs() < 1e-12);
         assert_eq!(potato.drag, 0.99);
         assert_eq!(type_for("minecraft:salmon").unwrap().id, "fish");
         assert!(type_for("minecraft:dirt").is_none());

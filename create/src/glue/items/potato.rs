@@ -724,7 +724,7 @@ fn fly(host: &mut dyn ServerHost, level: LevelRef, e: EntityRef) {
             return;
         }
         if let Some(hit) = candidate {
-            match hit_entity(host, level, e, hit, owner, &ammo, flight) {
+            match hit_entity(host, level, (e, motion), hit, owner, &ammo, flight) {
                 Impact::Gone => {
                     e.remove(host, mod_api::RemovalReason::Discarded);
                     return;
@@ -863,7 +863,7 @@ enum Impact {
 fn hit_entity(
     host: &mut dyn ServerHost,
     level: LevelRef,
-    projectile: EntityRef,
+    (projectile, motion): (EntityRef, [f64; 3]),
     (target, at): (EntityRef, [f64; 3]),
     owner: Option<EntityRef>,
     ammo: &Ammo,
@@ -895,11 +895,14 @@ fn hit_entity(
     if !entity_hit(host, level, ammo, target) {
         leave_item(host, level, projectile, ammo, flight);
     }
-    if host.living(target).is_none() {
+    let Some(living) = host.living(target) else {
         return Impact::Gone;
-    }
+    };
     if let Some(ticks) = invulnerable {
         target.set_invulnerable_time(host, ticks);
+    }
+    if let Some((strength, dir)) = potato::knockback(ammo.kind, motion) {
+        living.knockback(host, strength, dir);
     }
     // `AllAdvancements.POTATO_CANNON`: a monster killed, or another player hit.
     let monster =

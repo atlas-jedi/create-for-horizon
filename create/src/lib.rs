@@ -145,7 +145,12 @@ impl Hooks for Create {
         };
         let pos = [event.pos.x, event.pos.y, event.pos.z];
         if old == 0 && new == 0 {
-            world::with_world(|w| w.fluid_neighbour_changed(dim, pos));
+            world::with_world(|w| {
+                w.fluid_neighbour_changed(dim, pos);
+                if event.old != event.new {
+                    w.funnel_neighbour_changed(dim, pos);
+                }
+            });
             return;
         }
         for s in SUBSYSTEMS {
@@ -378,6 +383,16 @@ impl Hooks for Create {
         event: &mut EntityJoinLevelEvent<'_>,
     ) -> Flow {
         until_cancel(|s| s.entity_join_level(host, event))
+    }
+
+    fn entity_leave_level(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut mod_api::EntityLeaveLevelEvent<'_>,
+    ) {
+        for s in SUBSYSTEMS {
+            s.entity_leave_level(host, event);
+        }
     }
 
     fn key_mapping_pre(
@@ -717,6 +732,7 @@ impl Hooks for Create {
         _event: &mut mod_api::ClientResourcesReloadedEvent,
     ) {
         glue::models::forget();
+        glue::schematics::forget_models();
         glue::pipelines::bind_steam_jets(cx.render_assets());
     }
 }

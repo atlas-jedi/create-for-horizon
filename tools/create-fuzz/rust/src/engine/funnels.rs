@@ -248,6 +248,9 @@ impl Run {
     /// `pull_from_depot` (`handleBeltFunnelOutput`): the depot's outputs, then its held stack
     /// when `held` lets it, into the inventory behind the funnel as far as they fit.
     fn pull_from_depot(&mut self, pos: Pos, facing: Dir, held: bool) -> Option<Turn> {
+        if !self.w.funnel_inv_ready(0, pos) {
+            return Some(Turn::Empty);
+        }
         let below = [pos[0], pos[1] - 1, pos[2]];
         if self.is_ejector(below) {
             self.note_once(format!("adapter gap: funnel over the ejector at {below:?}"));

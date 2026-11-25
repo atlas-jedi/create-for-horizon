@@ -678,8 +678,9 @@ impl arm::World for ArmWorld<'_, '_> {
             Kind::Deployer => {
                 let mut d = with_world(|w| w.dims[dim].deployers.get(&pos).cloned()).flatten()?;
                 let (item, count) = d.held.clone()?;
-                // An arm carries an item by its id: a stack with components stays in the hand.
-                if !d.held_components.is_empty() {
+                // An arm carries an item by its id: a stack with components or wear stays in the
+                // hand.
+                if !d.held_components.is_empty() || d.held_damage > 0 {
                     return None;
                 }
                 // `DeployerItemHandler.extractItem`: what its filter names stays in its hand.
@@ -739,7 +740,7 @@ impl arm::World for ArmWorld<'_, '_> {
                 let Some(f) = funnel_at(lv, pos) else {
                     return count;
                 };
-                if f.powered {
+                if f.powered || with_world(|w| w.funnel_inv_ready(lv.dim, pos)) != Some(true) {
                     return count;
                 }
                 let behind = create_engine::funnel::behind(pos, f.facing);
@@ -1302,7 +1303,10 @@ pub(super) fn export_to_belt_funnel(
         return None;
     }
     let count = stack.count();
-    if f.powered || !super::funnel::funnel_passes(lv, pos, stack) {
+    if f.powered
+        || with_world(|w| w.funnel_inv_ready(lv.dim, pos)) != Some(true)
+        || !super::funnel::funnel_passes(lv, pos, stack)
+    {
         return Some(count);
     }
     let behind = create_engine::funnel::behind(pos, f.facing);

@@ -39,9 +39,15 @@ pub mod body;
 mod deploy;
 mod quill;
 pub(crate) use quill::face_of;
+mod renderer;
 mod screens;
 mod tools;
 mod transform;
+
+/// Drop resolved schematic preview `ModelRef`s on client resource reload.
+pub(crate) fn forget_models() {
+    tools::forget_models();
+}
 
 use super::packages::{self, block_of, debug_verb, feedback, ints, text};
 use super::persist;

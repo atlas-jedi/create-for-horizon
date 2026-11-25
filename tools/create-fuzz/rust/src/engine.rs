@@ -556,6 +556,11 @@ impl Run {
         }
         self.w
             .apply_block_change(0, p, old, new, skip_shape_updates);
+        // `CrushingWheelControllerBlock.onRemove`, `SawBlockEntity.destroy`.
+        let removed = self.w.dims[0].removed_inventories.remove(&p);
+        for (item, count) in removed.into_iter().flatten().flatten() {
+            self.drop_item_stack(p.map(f64::from), &item, count);
+        }
         self.flush_block_drops();
         self.break_wheels();
         if self.w.table.get(new).map(|(b, _)| b)

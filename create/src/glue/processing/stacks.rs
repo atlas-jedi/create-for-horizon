@@ -12,6 +12,49 @@ use mod_api::{
     PlayerRef, Tag,
 };
 
+thread_local! {
+    /// Every item's id by key and key by id, read once per data load, for the hooks that are
+    /// given no `Host`.
+    static ITEMS: std::cell::RefCell<(
+        std::collections::HashMap<ItemKey, String>,
+        std::collections::HashMap<String, ItemKey>,
+    )> = std::cell::RefCell::default();
+}
+
+/// Reads every item's id for `known_id` and [`known_key`].
+pub fn publish_items(host: &dyn Host) {
+    let keys = host.item_keys();
+    ITEMS.with_borrow_mut(|(ids, keys_by_id)| {
+        ids.clear();
+        keys_by_id.clear();
+        for key in keys {
+            let id = key.name(host);
+            if !id.is_empty() {
+                keys_by_id.insert(id.clone(), key);
+                ids.insert(key, id);
+            }
+        }
+    });
+}
+
+pub fn clear_items() {
+    ITEMS.with_borrow_mut(|(ids, keys_by_id)| {
+        ids.clear();
+        keys_by_id.clear();
+    });
+}
+
+/// The id of item `key`, without a `Host`.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md (its one use, the millstone's admission)
+pub fn known_id(key: ItemKey) -> Option<String> {
+    ITEMS.with_borrow(|(ids, _)| ids.get(&key).cloned())
+}
+
+/// The key of item `id`, without a `Host`.
+pub fn known_key(id: &str) -> Option<ItemKey> {
+    ITEMS.with_borrow(|(_, keys)| keys.get(id).copied())
+}
+
 /// The key of item `id` (`minecraft:stone`).
 pub fn key(host: &dyn Host, id: &str) -> Option<ItemKey> {
     host.item_key(&Identifier::parse(id).ok()?)

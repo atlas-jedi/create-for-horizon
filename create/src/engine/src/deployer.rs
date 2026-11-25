@@ -336,6 +336,28 @@ impl Deployer {
     }
 }
 
+/// What a deployer's calm hive harvest (`BeehiveBlockMixin` + vanilla `BeehiveBlock.useItemOn`
+/// smoked branch) does to a full beehive or bee nest.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HiveHarvest {
+    Shear,
+    Bottle,
+}
+
+/// `BeehiveBlockMixin`: a deployer harvesting a full beehive or bee nest (`honey_level >= 5`)
+/// with shears or a glass bottle counts as smoked. Known limit: shears are matched by id
+/// `minecraft:shears` until the SDK exposes an item-ability query.
+pub fn hive_harvest(block: &str, honey_level: u8, item: &str) -> Option<HiveHarvest> {
+    if honey_level < 5 || !matches!(block, "minecraft:beehive" | "minecraft:bee_nest") {
+        return None;
+    }
+    match item {
+        "minecraft:shears" => Some(HiveHarvest::Shear),
+        "minecraft:glass_bottle" => Some(HiveHarvest::Bottle),
+        _ => None,
+    }
+}
+
 /// The block the fake player reaches (`activate`'s `clickedPos`): two ahead of the deployer.
 pub fn clicked(pos: [i32; 3], facing: Dir) -> [i32; 3] {
     let o = facing.offset();
@@ -843,5 +865,29 @@ mod tests {
             Some("minecraft:glass_bottle")
         );
         assert_eq!(d.held, Some(("minecraft:honey_bottle".into(), 2)));
+    }
+
+    #[test]
+    fn calm_hive_harvest_matches_full_hives_and_nests() {
+        assert_eq!(
+            hive_harvest("minecraft:beehive", 5, "minecraft:shears"),
+            Some(HiveHarvest::Shear)
+        );
+        assert_eq!(
+            hive_harvest("minecraft:bee_nest", 5, "minecraft:glass_bottle"),
+            Some(HiveHarvest::Bottle)
+        );
+        assert_eq!(
+            hive_harvest("minecraft:beehive", 4, "minecraft:shears"),
+            None
+        );
+        assert_eq!(
+            hive_harvest("minecraft:oak_planks", 5, "minecraft:shears"),
+            None
+        );
+        assert_eq!(
+            hive_harvest("minecraft:beehive", 5, "minecraft:bucket"),
+            None
+        );
     }
 }

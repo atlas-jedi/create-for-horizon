@@ -950,6 +950,28 @@ mod tests {
         };
         let at = cog_helper(true, [0, 0, 0], large, [0.95, 0.6, 0.5], valid, |_| true);
         assert_eq!(at, Some(([1, 1, 0], Axis::X)));
+        // A north-facing mechanical crafter carries a small Z-axis cog: off-centre on its front
+        // face places a cog beside it, dead centre passes to the crafter.
+        let crafter = crate::parts::cog(
+            Block::MechanicalCrafter,
+            &StateInfo {
+                facing: Some(Dir::North),
+                ..Default::default()
+            },
+        )
+        .expect("crafter cog");
+        let crafter = ClickedCog {
+            large: crafter.0,
+            axis: crafter.1,
+        };
+        assert_eq!(
+            cog_helper(false, [0, 0, 0], crafter, [0.95, 0.5, 0.0], valid, |_| true),
+            Some(([1, 0, 0], Axis::Z))
+        );
+        assert_eq!(
+            cog_helper(false, [0, 0, 0], crafter, [0.5, 0.5, 0.0], valid, |_| true),
+            None
+        );
     }
 
     #[test]

@@ -1,0 +1,70 @@
+{
+  "version": 3,
+  "seed": 0,
+  "ticks": 80,
+  "checkpoints": [
+    20,
+    66,
+    67,
+    68,
+    69,
+    70
+  ],
+  "blocks": [
+    {
+      "pos": [
+        0,
+        8,
+        -1
+      ],
+      "state": "create:crushing_wheel[axis=x]"
+    },
+    {
+      "pos": [
+        0,
+        8,
+        1
+      ],
+      "state": "create:crushing_wheel[axis=x]"
+    },
+    {
+      "pos": [
+        1,
+        8,
+        -1
+      ],
+      "state": "create:creative_motor[facing=west]",
+      "motor": 128
+    },
+    {
+      "pos": [
+        1,
+        8,
+        1
+      ],
+      "state": "create:creative_motor[facing=west]",
+      "motor": -128
+    }
+  ],
+  "events": [
+    {
+      "tick": 20,
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "action": {
+        "kind": "capability",
+        "side": null,
+        "slot": 0,
+        "insert": {
+          "item": "minecraft:obsidian",
+          "count": 2
+        },
+        "extract": null,
+        "simulate": false
+      }
+    }
+  ]
+}

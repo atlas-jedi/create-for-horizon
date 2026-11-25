@@ -9,7 +9,9 @@
 //! server's stack ten ticks after the last change (`SchematicSyncPacket`); Print places it at
 //! once in creative (`SchematicPlacePacket`, `super::print_instantly`).
 //!
-//! The deployed schematic's blocks are not drawn yet (`SchematicRenderer`, `API_GAPS.md`). Its
+//! The deployed schematic's blocks draw through `renderer::Preview` (`SchematicRenderer`,
+//! `RenderAssets::block_state_model` + `WorldDrawContext::draw_model_instances`; Horizon: no
+//! block state model resolves, so they are not drawn, see HORIZON_GAPS.md). Its
 //! outline, checkered faces, the face looked at, the rotation axis and the mirror plane are
 //! drawn as Create's (`AABBOutline`, `LineOutline`); the checkered faces sample Create's
 //! checkerboard (`AllSpecialTextures.CHECKERED`) through the glue's `Checkered` pipeline
@@ -19,6 +21,7 @@ use super::super::net;
 use super::super::pipelines::Textured;
 use super::body;
 use super::quill::CHANNEL;
+use super::renderer::Preview;
 use super::transform::{Placing, trace_until};
 use crate::glue::names::Named as _;
 use crate::glue::owned::OwnedEquipment as _;
@@ -163,6 +166,8 @@ struct Handler {
     slot: u8,
     /// The last press of the use key was a tool's (the held repeats are dropped with it).
     took_press: bool,
+    /// Prebuilt block-model preview for the deployed schematic (`renderers[0..3]`).
+    preview: Option<Preview>,
 }
 
 impl Handler {
@@ -179,6 +184,7 @@ impl Handler {
             sync_cooldown: 0,
             slot: 0,
             took_press: false,
+            preview: None,
         };
         h.equip(Tool::Deploy);
         h
@@ -213,6 +219,7 @@ impl Handler {
                 .init(anchor, data.rotation, data.mirror, size);
         }
         self.displayed = data.file.clone();
+        self.preview = None;
         self.active = true;
         if self.deployed {
             let before = self.tool;
@@ -224,6 +231,18 @@ impl Handler {
         } else {
             self.select_from(vec![Tool::Deploy]);
         }
+    }
+
+    /// `setupRenderer`: build the three mirrored block-model previews for the displayed file.
+    fn setup_preview(&mut self, host: &dyn ClientHost) {
+        let Some(file) = self.displayed.as_deref() else {
+            self.preview = None;
+            return;
+        };
+        if self.preview.as_ref().is_some_and(|p| p.matches(file)) {
+            return;
+        }
+        self.preview = Preview::load(host, file);
     }
 
     /// `deploy`.
@@ -253,6 +272,15 @@ thread_local! {
 pub(super) fn reset() {
     HANDLER.with_borrow_mut(|h| *h = Handler::new());
     OUT.with_borrow_mut(Vec::clear);
+}
+
+/// Drop resolved `ModelRef`s when client resources reload so they resolve fresh next frame.
+pub(super) fn forget_models() {
+    HANDLER.with_borrow_mut(|h| {
+        if let Some(preview) = h.preview.as_mut() {
+            preview.clear_models();
+        }
+    });
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -328,6 +356,9 @@ pub(super) fn tick(host: &mut dyn ClientHost) {
         h.slot = slot;
         if !h.active || data.file != h.displayed {
             h.init(&data, creative);
+            if h.deployed {
+                h.setup_preview(host);
+            }
         }
         if h.sync_cooldown > 0 {
             h.sync_cooldown -= 1;
@@ -639,6 +670,9 @@ pub(super) fn interaction_key(
     let creative = creative(&*host);
     let taken = HANDLER.with_borrow_mut(|h| {
         let taken = right_click(h, creative);
+        if taken && h.deployed {
+            h.setup_preview(&*host);
+        }
         h.took_press = taken;
         taken
     });
@@ -693,6 +727,7 @@ pub(super) fn edited(host: &dyn ClientHost, anchor: [i32; 3], rotation: Rotation
         }
         h.mark_dirty();
         h.deploy(creative);
+        h.setup_preview(host);
     });
 }
 
@@ -860,9 +895,21 @@ fn contains(min: [f64; 3], max: [f64; 3], p: [f64; 3]) -> bool {
     (0..3).all(|i| p[i] >= min[i] && p[i] < max[i])
 }
 
-/// `SchematicHandler.render`: the tool's own drawing, then, carried by the transformation,
-/// the deployed schematic's outline and the tool's drawing on it.
+/// `SchematicHandler.render`: the deployed schematic's blocks in `AfterOpaqueBlocks`, and
+/// the tool's own drawing, the deployed schematic's outline and tool guides in
+/// `AfterTranslucentBlocks`.
 pub(super) fn render_level_stage(host: &dyn ClientHost, event: &mut RenderLevelStageEvent<'_>) {
+    if event.stage == RenderLevelStage::AfterOpaqueBlocks {
+        HANDLER.with_borrow_mut(|h| {
+            if !h.active || !h.deployed {
+                return;
+            }
+            if let Some(preview) = h.preview.as_mut() {
+                preview.render(host, event, &h.transformation);
+            }
+        });
+        return;
+    }
     if event.stage != RenderLevelStage::AfterTranslucentBlocks {
         return;
     }

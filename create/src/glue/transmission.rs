@@ -23,21 +23,26 @@ use create_engine::Block;
 use create_engine::kinetics::{Axis, Dir};
 use create_engine::place;
 use mod_api::{
-    BlockClick, BlockState, Hand, HostBlockStates, InteractionResult, ItemStack, PlayerRef,
-    Registrar, ServerHost, SoundSource, UseItemOnEvent,
+    BlockClick, BlockState, Hand, HostBlockStates, InteractionResult, ItemStack,
+    OnItemUseFirstEvent, PlayerRef, Registrar, ServerHost, SoundSource, UseItemOnEvent,
 };
 
-/// Attaches the clicks to shafts, to every block with a cog and to the speed controller.
+/// Attaches the clicks to shafts, cogs and the speed controller, and
+/// `CogwheelBlockItem.onItemUseFirst` to both cog items.
 pub fn register(r: &mut dyn Registrar) {
-    for &block in Block::ALL.iter() {
-        if matches!(
-            block,
-            Block::Shaft | Block::PoweredShaft | Block::RotationSpeedController
-        ) || has_cog(block)
-        {
-            r.block_part(states::key(block), Clicked);
-        }
+    for block in [
+        Block::Shaft,
+        Block::PoweredShaft,
+        Block::Cogwheel,
+        Block::LargeCogwheel,
+        Block::RotationSpeedController,
+    ] {
+        r.block_part(states::key(block), Clicked);
     }
+    let cog = r.item_key("create:cogwheel");
+    r.item_part(cog, CogItem(false));
+    let large = r.item_key("create:large_cogwheel");
+    r.item_part(large, CogItem(true));
     r.block_part(states::key(Block::Gearbox), GearboxPick);
 }
 
@@ -64,24 +69,6 @@ impl mod_api::BlockPart for GearboxPick {
         let key = host.item_key(&mod_api::Identifier::parse("create:vertical_gearbox").ok()?)?;
         ItemStack::new(key, 1)
     }
-}
-
-/// Blocks with a cog of their own (`ICogWheel`).
-fn has_cog(block: Block) -> bool {
-    matches!(
-        block,
-        Block::Cogwheel
-            | Block::LargeCogwheel
-            | Block::AndesiteEncasedCogwheel
-            | Block::BrassEncasedCogwheel
-            | Block::AndesiteEncasedLargeCogwheel
-            | Block::BrassEncasedLargeCogwheel
-            | Block::MechanicalPump
-            | Block::MechanicalMixer
-            | Block::MechanicalCrafter
-            | Block::MechanicalArm
-            | Block::Millstone
-    ) || block.name().ends_with("display_board")
 }
 
 fn axis_name(a: Axis) -> &'static str {
@@ -145,6 +132,29 @@ fn use_one(host: &mut dyn ServerHost, player: PlayerRef, hand: Hand, stack: &Ite
     }
 }
 
+/// `CogwheelBlockItem.onItemUseFirst`: a cog item clicked on any cog block places beside or
+/// diagonally before the block's own `useItemOn` runs.
+struct CogItem(bool);
+
+#[mod_api::horizon_part]
+impl mod_api::ItemPart for CogItem {
+    fn on_item_use_first(
+        &self,
+        host: &mut dyn ServerHost,
+        event: &mut OnItemUseFirstEvent<'_>,
+    ) -> Option<InteractionResult> {
+        let click = event.click;
+        let player = host.players().acting_player()?;
+        // `if (player.isShiftKeyDown() || !player.mayBuild()) return PASS`.
+        if sneaking(&*host, player) || player.may_build(&*host) != Some(true) {
+            return None;
+        }
+        let dimension = click.dimension.key().id().to_owned();
+        let mut lv = ServerLevel::new(host, &dimension)?;
+        cog_helper(&mut lv, player, click, event.stack, self.0, click.pos)
+    }
+}
+
 struct Clicked;
 
 #[mod_api::horizon_part]
@@ -168,17 +178,6 @@ impl mod_api::BlockPart for Clicked {
             with_world(|w| w.table.get(states::id(event.state)?).map(|(b, i)| (b, *i)))
                 .flatten()?;
         let pos = click.pos;
-        // CogwheelBlockItem.onItemUseFirst: a cog item on a cog places beside it.
-        let held_cog = match item.as_str() {
-            "create:cogwheel" => Some(false),
-            "create:large_cogwheel" => Some(true),
-            _ => None,
-        };
-        if let Some(large) = held_cog
-            && let Some(result) = cog_helper(&mut lv, player, click, stack, large, pos)
-        {
-            return Some(result);
-        }
         match block {
             // ShaftBlock.useItemOn: casing, girder, then the shaft line extended.
             Block::Shaft => {

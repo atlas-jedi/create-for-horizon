@@ -410,20 +410,6 @@ impl mod_api::ResourceHandler<mod_api::ItemResource> for SawItems {
     }
 }
 
-/// What broken saws drop. The saws holding items (`SawBlockEntity.tick`: their cutting recipe
-/// in turn, applied near the end, the results thrown off the way the saw turns, onto a belt or
-/// depot there, else as items) tick at their turn in logistics' walk (`saw_turn`).
-pub fn tick_saws(lv: &mut ServerLevel<'_>) {
-    let dim = lv.dim;
-    // `destroy`: a broken saw's items scatter where it was (`ItemHelper.dropContents`).
-    let drops = with_world(|w| std::mem::take(&mut w.dims[dim].saw_drops)).unwrap_or_default();
-    for (pos, item, n) in drops {
-        if let Some(stack) = saw_stack(&*lv.host, &item, u32::from(n)) {
-            let _ = lv.level.pop_resource(&mut *lv.host, pos, stack);
-        }
-    }
-}
-
 /// The saw at `pos` holding items, at its turn in logistics' transport walk.
 pub fn saw_turn(lv: &mut ServerLevel<'_>, pos: [i32; 3]) {
     if !recipes::ready() {

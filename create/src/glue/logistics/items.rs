@@ -59,6 +59,21 @@ pub fn key_of(host: &dyn Host, stack: &ItemStack) -> String {
 /// named with its contents, `tank::potion_item`, as a spout fills one on a belt); None for an
 /// unknown item or a zero count.
 pub fn stack_of(host: &dyn Host, id: &str, count: u32) -> Option<ItemStack> {
+    stack_named(&|id| host.item_key(&Identifier::parse(id).ok()?), id, count)
+}
+
+/// [`stack_of`] for the hooks given no `Host` (a block entity's removal): the items found by the
+/// ids read at the last data load (`stacks::known_key`).
+pub fn known_stack_of(id: &str, count: u32) -> Option<ItemStack> {
+    stack_named(&crate::glue::processing::known_item_key, id, count)
+}
+
+/// [`stack_of`], the items found by `key`.
+fn stack_named(
+    key: &dyn Fn(&str) -> Option<mod_api::ItemKey>,
+    id: &str,
+    count: u32,
+) -> Option<ItemStack> {
     if let Some((_, hex)) = id.split_once('#') {
         let bytes: Option<Vec<u8>> = (0..hex.len() / 2)
             .map(|i| u8::from_str_radix(hex.get(2 * i..2 * i + 2)?, 16).ok())
@@ -67,15 +82,23 @@ pub fn stack_of(host: &dyn Host, id: &str, count: u32) -> Option<ItemStack> {
         let mod_api::Tag::Compound(nbt) = tag else {
             return None;
         };
-        let stack = ItemStack::from_nbt(host, &nbt)?;
+        // `ItemStack::from_nbt`, its item found by `key`; `key_of` keeps no count.
+        let Some(mod_api::Tag::String(item)) = nbt.get(&"id".into()) else {
+            return None;
+        };
+        let mut stack = ItemStack::new(key(&item.to_string_lossy())?, 1)?;
+        match nbt.get(&"components".into()) {
+            Some(mod_api::Tag::Compound(patch)) => stack.set_components(patch.clone()).ok()?,
+            None => {}
+            _ => return None,
+        }
         return with_count(&stack, count);
     }
     let (id, contents) = match create_engine::tank::split_potion_item(id) {
         Some((id, c)) => (id, Some(Contents::decode(c)?)),
         None => (id, None),
     };
-    let key = host.item_key(&Identifier::parse(id).ok()?)?;
-    let mut stack = ItemStack::new(key, count)?;
+    let mut stack = ItemStack::new(key(id)?, count)?;
     // `PotionFluidHandler.fillBottle`: the bottle holds the fluid's contents (none: empty).
     if let Some(tag) = contents.as_ref().and_then(contents_tag) {
         let patch = mod_api::Compound::from([(POTION_CONTENTS.into(), tag)]);

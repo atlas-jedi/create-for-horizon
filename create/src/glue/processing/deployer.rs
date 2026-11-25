@@ -27,7 +27,8 @@ use create_engine::deployer::{self, Deployer};
 use create_engine::kinetics::Dir;
 use create_engine::{belt, processing};
 use mod_api::{
-    BlockClick, BlockHit, Hand, ItemStack, PlayerAction, PlayerActionSetup, PlayerRef, ServerHost,
+    BlockClick, BlockHit, Hand, HostBlockStates as _, ItemStack, PlayerAction, PlayerActionSetup,
+    PlayerRef, ServerHost,
 };
 
 /// `DeployerFakePlayer`'s fallback profile: `9e2faded-cafe-4ec2-c314-dad129ae971d`, "Deployer".
@@ -336,9 +337,12 @@ fn crumbs(lv: &mut ServerLevel<'_>, pos: [i32; 3], facing: Dir, reach: f32, stac
 }
 
 /// The deployer's held stack as an item stack, with its components and its wear.
-fn held_of(lv: &ServerLevel<'_>, d: &Deployer) -> Option<ItemStack> {
+pub(crate) fn held_stack(
+    d: &Deployer,
+    make: impl FnOnce(&str, u32) -> Option<ItemStack>,
+) -> Option<ItemStack> {
     let held = d.held.as_ref()?;
-    let mut s = stacks::stack(&*lv.host, &held.0, u32::from(held.1))?;
+    let mut s = make(&held.0, u32::from(held.1))?;
     if !d.held_components.is_empty()
         && let Ok((mod_api::Tag::Compound(c), _)) =
             mod_api::Tag::from_network_bytes(&d.held_components, None)
@@ -349,6 +353,11 @@ fn held_of(lv: &ServerLevel<'_>, d: &Deployer) -> Option<ItemStack> {
         s.set_damage(d.held_damage);
     }
     Some(s)
+}
+
+/// The deployer's held stack as an item stack, with its components and its wear.
+fn held_of(lv: &ServerLevel<'_>, d: &Deployer) -> Option<ItemStack> {
+    held_stack(d, |id, n| stacks::stack(&*lv.host, id, n))
 }
 
 /// The deployer's hand takes `stack` (its id, count, wear and the rest of its components).
@@ -491,16 +500,12 @@ pub fn tick_deployers(lv: &mut ServerLevel<'_>) {
             deployer_activate(lv, pos);
         }
     }
-    let Some((changes, drops, cracks)) = with_world(|w| {
+    let Some((changes, cracks)) = with_world(|w| {
         let d = &mut w.dims[dim];
         let mut c = std::mem::take(&mut d.deployer_changes);
         c.sort();
         c.dedup();
-        (
-            c,
-            std::mem::take(&mut d.deployer_drops),
-            std::mem::take(&mut d.deployer_cracks),
-        )
+        (c, std::mem::take(&mut d.deployer_cracks))
     }) else {
         return;
     };
@@ -509,9 +514,6 @@ pub fn tick_deployers(lv: &mut ServerLevel<'_>) {
         let _ = lv
             .level
             .set_break_progress(&mut *lv.host, deployer::breaker_id(pos), at, -1);
-    }
-    for (pos, (item, n)) in drops {
-        lv.spawn_items(centre(pos), &item, u32::from(n));
     }
     if !changes.is_empty() {
         let players = lv.players();
@@ -1097,6 +1099,117 @@ fn punch(
         deployer::Punch::Crack(None) | deployer::Punch::Stop => {}
     }
     Vec::new()
+}
+
+/// `BeehiveBlockMixin`: a deployer harvesting a full beehive or bee nest (`honey_level` 5)
+/// counts as smoked — honey is taken, `honey_level` resets to 0 and the bees stay calm.
+/// Returns true when the event was handled and cancelled with `InteractionResult::Success`.
+pub fn calm_hive_harvest(
+    host: &mut dyn ServerHost,
+    event: &mut mod_api::RightClickBlockEvent<'_>,
+) -> bool {
+    let click = event.click;
+    if click.player != FAKE_UUID || *event.use_block == mod_api::TriState::False {
+        return false;
+    }
+    let Some(stack) = click.stack else {
+        return false;
+    };
+    let item = stacks::id(&*host, stack);
+    if !matches!(item.as_str(), "minecraft:shears" | "minecraft:glass_bottle") {
+        return false;
+    }
+    let dimension = click.dimension.key().id().to_owned();
+    let Some(mut lv) = ServerLevel::new(host, &dimension) else {
+        return false;
+    };
+    let pos = click.pos;
+    let Some(state) = lv.block_state(pos) else {
+        return false;
+    };
+    let Some(block) = lv.block_name(pos) else {
+        return false;
+    };
+    let Some(honey_level) = lv
+        .property(pos, "honey_level")
+        .and_then(|v| v.parse::<u8>().ok())
+    else {
+        return false;
+    };
+    let Some(harvest) = deployer::hive_harvest(&block, honey_level, &item) else {
+        return false;
+    };
+    let Ok(empty_hive) = state.with(&lv.host.block_states(), "honey_level", "0") else {
+        return false;
+    };
+    if empty_hive == state {
+        return false;
+    }
+    let Some(player) = lv.host.players().acting_player() else {
+        return false;
+    };
+    let context = mod_api::GameEventContext {
+        source_entity: Some(player.entity()),
+        ..Default::default()
+    };
+    match harvest {
+        deployer::HiveHarvest::Shear => {
+            lv.play_block_sound("minecraft:block.beehive.shear", pos, 1.0, 1.0);
+            if let Ok(Some(drops)) = lv.level.roll_loot(
+                &mut *lv.host,
+                "minecraft:harvest/beehive",
+                centre(pos),
+                Some(stack),
+                Some(player.entity()),
+            ) {
+                for drop in drops {
+                    let _ = lv.level.pop_resource(&mut *lv.host, pos, drop);
+                }
+            }
+            if let Some(living) = lv.host.living(player.entity()) {
+                let slot = match click.hand {
+                    Hand::Main => mod_api::EquipmentSlot::MainHand,
+                    Hand::Off => mod_api::EquipmentSlot::OffHand,
+                };
+                living.hurt_and_break(&mut *lv.host, slot, 1);
+            }
+            lv.level
+                .game_event(&mut *lv.host, "minecraft:shear", centre(pos), context);
+        }
+        deployer::HiveHarvest::Bottle => {
+            let Some(honey) = stacks::stack(&*lv.host, "minecraft:honey_bottle", 1) else {
+                return false;
+            };
+            lv.level.play_sound(
+                &mut *lv.host,
+                "minecraft:item.bottle.fill",
+                centre(pos),
+                mod_api::SoundSource::Neutral,
+                1.0,
+                1.0,
+            );
+            match stack.clone().shrink(1) {
+                None => {
+                    crate::glue::items::set_held(&mut *lv.host, player, click.hand, Some(honey));
+                }
+                Some(rest) => {
+                    crate::glue::items::set_held(&mut *lv.host, player, click.hand, Some(rest));
+                    // Horizon: what does not fit is thrown from the player's eyes by the host
+                    // (`Player.drop`, as `ItemUtils.createFilledResult` does).
+                    let _ = player.give_stack(&mut *lv.host, honey);
+                }
+            }
+            lv.level.game_event(
+                &mut *lv.host,
+                "minecraft:fluid_pickup",
+                centre(pos),
+                context,
+            );
+        }
+    }
+    lv.set_state(pos, empty_hive, crate::glue::server::update_all());
+    *event.cancellation_result = mod_api::InteractionResult::Success;
+    true
 }
 
 /// `DeployerBlockEntity.tick`: cracks on a block that is gone since are cleared.

@@ -155,30 +155,12 @@ fn knock_back(host: &mut dyn ServerHost, player: mod_api::PlayerRef, target: mod
     if knockback <= 0.0 {
         return;
     }
-    // `LivingEntity.knockback`: less the target's resistance.
-    let resistance = host
-        .living(target)
-        .and_then(|l| l.attribute_value(&*host, "minecraft:knockback_resistance"))
-        .unwrap_or(0.0);
-    let strength = knockback * 0.5 * (1.0 - resistance);
-    if strength <= 0.0 {
-        if let Some(v) = attacker.velocity(&*host) {
-            attacker.set_velocity(host, [v[0] * 0.6, v[1], v[2] * 0.6]);
-        }
-        attacker.set_sprinting(host, false);
-        return;
-    }
-    let (x, z) = (f64::from(yaw.sin()), f64::from(-yaw.cos()));
-    let len = (x * x + z * z).sqrt().max(1e-9);
-    let push = [x / len * strength, z / len * strength];
-    if let Some(old) = target.velocity(&*host) {
-        let on_ground = target.on_ground(&*host).unwrap_or(false);
-        let y = if on_ground {
-            (old[1] / 2.0 + strength).min(0.4)
-        } else {
-            old[1]
-        };
-        target.set_velocity(host, [old[0] / 2.0 - push[0], y, old[2] / 2.0 - push[1]]);
+    if let Some(living) = host.living(target) {
+        living.knockback(
+            host,
+            knockback * 0.5,
+            [f64::from(yaw.sin()), f64::from(-yaw.cos())],
+        );
     }
     if let Some(v) = attacker.velocity(&*host) {
         attacker.set_velocity(host, [v[0] * 0.6, v[1], v[2] * 0.6]);

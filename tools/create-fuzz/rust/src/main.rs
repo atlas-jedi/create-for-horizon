@@ -190,8 +190,6 @@ fn check(cases: &[Scenario], names: &[String]) -> usize {
             let diffs = compare::diff(j, &r);
             if diffs.is_empty() {
                 println!("{name}: match ({} blocks)", j.blocks.len());
-            } else if let Some(gap) = compare::api_gap(j, &r) {
-                println!("{name}: documented API gap ({gap})");
             } else {
                 failed += 1;
                 println!("{name}: {} differences", diffs.len());
@@ -306,13 +304,12 @@ struct Counts {
     differed: usize,
     unstable: usize,
     unsupported: usize,
-    api_gaps: usize,
 }
 impl Counts {
     fn print(&self) {
         println!(
-            "{} matched, {} differed, {} java-unstable, {} driver-unsupported, {} documented API gaps",
-            self.matched, self.differed, self.unstable, self.unsupported, self.api_gaps
+            "{} matched, {} differed, {} java-unstable, {} driver-unsupported",
+            self.matched, self.differed, self.unstable, self.unsupported
         );
     }
 }
@@ -396,16 +393,6 @@ fn record_inner(sc: &Scenario, j: &Snapshot, counts: &mut Counts, verify_java: b
     }
     if diffs.is_empty() {
         counts.matched += 1;
-        return true;
-    }
-    if let Some(gap) = compare::api_gap(j, &r) {
-        counts.api_gaps += 1;
-        println!(
-            "seed {} ({}): documented API gap ({gap}), first: {}",
-            sc.seed,
-            generate::family_name(sc.seed),
-            diffs[0]
-        );
         return true;
     }
     counts.differed += 1;

@@ -455,6 +455,14 @@ pub trait Subsystem: Sync {
         Flow::Continue
     }
 
+    /// `Hooks::entity_leave_level`: an entity left a server level (removed or unloaded).
+    fn entity_leave_level(
+        &self,
+        _host: &mut dyn ServerHost,
+        _event: &mut mod_api::EntityLeaveLevelEvent<'_>,
+    ) {
+    }
+
     /// `Hooks::movement_input_update`, on the client: the local player's movement keys.
     fn movement_input_update(&self, _host: &dyn ClientHost, _input: &mut mod_api::MovementInputEvent) {}
     /// `Hooks::key_mapping_pre`, on the client: `Flow::Cancel` keeps the key from the game.

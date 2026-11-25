@@ -314,9 +314,9 @@ pub struct Dimension {
     pub crusher_checks: Vec<[i32; 3]>,
     pub crushers: HashMap<[i32; 3], (crate::crusher::Crusher, f32)>,
     pub running_crushers: Vec<[i32; 3]>,
-    /// What removed controllers held (`CrushingWheelControllerBlock.onRemove` drops its
-    /// inventory).
-    pub crusher_drops: Vec<([i32; 3], String, u8)>,
+    /// The inventories of removed crushing wheel controllers and saws, for their block entities'
+    /// removal to spill (`CrushingWheelControllerBlock.onRemove`, `SawBlockEntity.destroy`).
+    pub removed_inventories: HashMap<[i32; 3], Vec<crate::processing::Slot>>,
     crusher_saved: HashMap<[i32; 3], crate::crusher::Crusher>,
     /// Blaze burners' fuel, the burning ones (the only ones that tick), and fuel saved with a
     /// column waiting for its burner.
@@ -354,7 +354,9 @@ pub struct Dimension {
     deployer_saved: HashMap<[i32; 3], crate::deployer::Deployer>,
     brass_saved: HashMap<[i32; 3], crate::tunnel::SavedBrass>,
     pub deployer_changes: Vec<[i32; 3]>,
-    pub deployer_drops: Vec<([i32; 3], (String, u8))>,
+    /// Removed deployers that were holding a stack, for their block entity's removal to spill
+    /// with its components and wear (`DeployerBlockEntity.discardPlayer`).
+    pub removed_deployers: HashMap<[i32; 3], crate::deployer::Deployer>,
     pub deployer_cracks: Vec<([i32; 3], [i32; 3])>,
     /// Gantry shafts whose place in their line may have changed (`updateShape`), carriages to try
     /// to start (`queueAssembly`), and the moving gantries.
@@ -465,8 +467,6 @@ pub struct Dimension {
     pub cuckoos: HashMap<[i32; 3], (crate::cuckoo::Animation, u32)>,
     /// Saws holding items (the only ones that tick) and their processing.
     pub saws: HashMap<[i32; 3], crate::saw::Saw>,
-    /// What removed saws held (`SawBlockEntity.destroy` drops its inventory).
-    pub saw_drops: Vec<([i32; 3], String, u8)>,
     /// Spouts and their tank and cycle; those holding fluid tick.
     pub spouts: HashMap<[i32; 3], crate::spout::Spout>,
     /// Item drains, their held stack and tank; those holding items tick.
@@ -477,6 +477,11 @@ pub struct Dimension {
     pub funnels: HashMap<[i32; 3], u64>,
     /// `TransferCooldown` read before the funnel's block loads, as a due tick.
     pub(crate) funnel_saved: HashMap<[i32; 3], u64>,
+    /// Funnels whose `InvManipulationBehaviour.targetCapability` is still null: freshly placed or
+    /// loaded (until `SmartBlockEntity.tick` -> `initialize` -> `findNewCapability` runs at the
+    /// funnel's turn in `TransportTicks`), or invalidated by a neighbour change behind the funnel
+    /// (`AbstractFunnelBlock.neighborChanged` -> `CapManipulationBehaviourBase.onNeighborChanged`).
+    pub(crate) funnel_inv_pending: HashSet<[i32; 3]>,
     /// Funnels whose block below changed (`updateShape`): a horizontal funnel over a belt becomes
     /// a belt funnel, a belt funnel off its belt a funnel again, and a belt funnel's shape
     /// follows the belt.
@@ -906,8 +911,14 @@ impl TransportTicks {
             {
                 return Some(TransportTick::Brass(p));
             }
-            if d.funnels.get(&p).is_some_and(|due| *due <= self.now) {
-                return Some(TransportTick::Funnel(p));
+            if let Some(&due) = world.dims[self.dim].funnels.get(&p) {
+                // `SmartBlockEntity.tick` -> `InvManipulationBehaviour.initialize` / `tick`:
+                // `findNewCapability` acquires the target inventory at the funnel's own turn,
+                // before `FunnelBlockEntity.tick` acts or counts down its cooldown.
+                world.dims[self.dim].funnel_inv_pending.remove(&p);
+                if due <= self.now {
+                    return Some(TransportTick::Funnel(p));
+                }
             }
             if world.block_at(self.dim, p) == Some(Block::Belt) {
                 world.initialize_belt(self.dim, p);
@@ -1240,6 +1251,17 @@ impl CreateWorld {
                 | Block::AndesiteBeltFunnel
                 | Block::BrassBeltFunnel
         ) {
+            // A fresh `FunnelBlockEntity` (placed or loaded) starts with
+            // `InvManipulationBehaviour.targetCapability == null` until its first tick;
+            // a state change that keeps the block entity (`keeps_block_entity`) keeps it.
+            let same_funnel = d
+                .states
+                .get(&pos)
+                .and_then(|s| self.table.get(*s))
+                .is_some_and(|(b, _)| keeps_block_entity(b, block));
+            if !same_funnel {
+                d.funnel_inv_pending.insert(pos);
+            }
             // Placed or changed (extracting, powered, shape): looked at again.
             let due = d.funnel_saved.remove(&pos).unwrap_or(0);
             d.funnels.insert(pos, due);
@@ -1537,6 +1559,28 @@ impl CreateWorld {
         }
     }
 
+    /// `AbstractFunnelBlock.neighborChanged` -> `CapManipulationBehaviourBase.onNeighborChanged`:
+    /// changing the block behind a funnel invalidates its cached `targetCapability` until the
+    /// funnel's next turn in `TransportTicks`.
+    pub fn funnel_neighbour_changed(&mut self, dim: usize, pos: [i32; 3]) {
+        if self.dims[dim].funnels.is_empty() {
+            return;
+        }
+        for dir in crate::kinetics::Dir::ALL {
+            let o = dir.offset();
+            let n = [pos[0] + o[0], pos[1] + o[1], pos[2] + o[2]];
+            if self.dims[dim].funnels.contains_key(&n)
+                && self.dims[dim]
+                    .states
+                    .get(&n)
+                    .and_then(|s| self.table.get(*s))
+                    .is_some_and(|(_, i)| i.facing == Some(dir))
+            {
+                self.dims[dim].funnel_inv_pending.insert(n);
+            }
+        }
+    }
+
     #[cfg(test)]
     pub(crate) fn block_changed(&mut self, dim: usize, pos: [i32; 3], old: u32, new: u32) {
         self.apply_block_change(dim, pos, old, new, false);
@@ -1657,6 +1701,9 @@ impl CreateWorld {
         {
             self.dims[dim].plumbing.hose_speeds.push((hose, f32::NAN));
         }
+        if old != new {
+            self.funnel_neighbour_changed(dim, pos);
+        }
         let (was, is) = (self.table.is_kinetic(old), self.table.is_kinetic(new));
         if !was && !is {
             return;
@@ -1693,8 +1740,8 @@ impl CreateWorld {
                 Block::Spout => d.spouts.remove(&pos).is_some(),
                 // `SawBlockEntity.destroy`: its inventory drops.
                 Block::MechanicalSaw => d.saws.remove(&pos).is_some_and(|s| {
-                    d.saw_drops
-                        .extend(s.slots.into_iter().map(|(item, n)| (pos, item, n)));
+                    d.removed_inventories
+                        .insert(pos, crate::processing::inventory_slots(s.slots, s.applied));
                     true
                 }),
                 _ => false,
@@ -1753,6 +1800,18 @@ impl CreateWorld {
         if kind(old) == Some(Block::ItemVault) && kind(new) != Some(Block::ItemVault) {
             // `ItemVaultBlock.onRemove`: its vault splits.
             self.dims[dim].vaults.removed(pos);
+        }
+        // `AbstractFunnelBlock.onRemove` / `FunnelBlock.onRemove`: a funnel replaced by any block
+        // that does not keep the same `FunnelBlockEntity` (including another Create block) drops
+        // its funnel entries before `place` runs for the new block.
+        if kind(old).is_some_and(crate::funnel::is_funnel)
+            && !kind(old)
+                .zip(kind(new))
+                .is_some_and(|(o, n)| keeps_block_entity(o, n))
+        {
+            let d = &mut self.dims[dim];
+            d.funnels.remove(&pos);
+            d.funnel_inv_pending.remove(&pos);
         }
         // The blocks whose filter slot `chute_filters` holds, by the blocks it stays with: a
         // brass funnel's filter goes with it onto a belt and off it again.
@@ -1917,12 +1976,13 @@ impl CreateWorld {
             d.chutes.remove(&pos);
             d.sequencers.remove(&pos);
             if let Some(s) = d.saws.remove(&pos) {
-                d.saw_drops
-                    .extend(s.slots.into_iter().map(|(item, n)| (pos, item, n)));
+                d.removed_inventories
+                    .insert(pos, crate::processing::inventory_slots(s.slots, s.applied));
             }
             d.spouts.remove(&pos);
             d.drains.remove(&pos);
             d.funnels.remove(&pos);
+            d.funnel_inv_pending.remove(&pos);
             if let Some((item, n)) = d.arms.removed(pos) {
                 // `ArmBlockEntity.destroy`: its held stack drops.
                 d.arm_drops.push((pos, item, n));
@@ -2004,13 +2064,14 @@ impl CreateWorld {
                 d.deploying.retain(|p| *p != pos);
                 d.deployer_changes.push(pos);
                 d.unsaved.push((pos[0] >> 4, pos[2] >> 4));
-                if let Some(held) = dp.held {
-                    // `IBE.onRemove`: its held stack drops.
-                    d.deployer_drops.push((pos, held));
-                }
                 // `DeployerFakePlayer.remove` (`discardPlayer`): its cracks go.
                 if let Some((at, _)) = dp.breaking {
                     d.deployer_cracks.push((pos, at));
+                }
+                if dp.held.is_some() {
+                    // `DeployerBlockEntity.discardPlayer`: its held stack drops with its
+                    // components and wear.
+                    d.removed_deployers.insert(pos, dp);
                 }
             }
             if d.burners.remove(&pos).is_some() {
@@ -2020,8 +2081,8 @@ impl CreateWorld {
             if let Some((c, _)) = d.crushers.remove(&pos) {
                 d.running_crushers.retain(|p| *p != pos);
                 d.unsaved.push((pos[0] >> 4, pos[2] >> 4));
-                d.crusher_drops
-                    .extend(c.slots.into_iter().map(|(item, n)| (pos, item, n)));
+                d.removed_inventories
+                    .insert(pos, crate::processing::inventory_slots(c.slots, c.applied));
             }
             if d.fans.remove(&pos).is_some() {
                 d.running_fans.retain(|p| *p != pos);
@@ -2217,6 +2278,8 @@ impl CreateWorld {
             d.funnels.retain(|p, _| (p[0] >> 4, p[2] >> 4) != (cx, cz));
             d.funnel_saved
                 .retain(|p, _| (p[0] >> 4, p[2] >> 4) != (cx, cz));
+            d.funnel_inv_pending
+                .retain(|p| (p[0] >> 4, p[2] >> 4) != (cx, cz));
             d.arms.column_unloaded(cx, cz);
             d.ejectors.retain(|p, _| (p[0] >> 4, p[2] >> 4) != (cx, cz));
             d.chute_pulls.column_unloaded(cx, cz);
@@ -6763,6 +6826,103 @@ mod tests {
         w.column_unloaded(0, 0, 0);
         w.block_loaded(0, funnel, 10);
         assert_eq!(w.dims[0].funnels[&funnel], 0);
+        states::clear_range();
+    }
+
+    #[test]
+    fn funnel_inventory_acquires_at_its_turn_and_invalidates_on_behind_change() {
+        let _guard = states::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<(&str, Vec<(&str, &str)>)> = vec![
+            ("create:depot", vec![]),
+            (
+                "create:brass_funnel",
+                vec![
+                    ("facing", "up"),
+                    ("extracting", "false"),
+                    ("powered", "false"),
+                ],
+            ),
+            (
+                "create:brass_funnel",
+                vec![
+                    ("facing", "up"),
+                    ("extracting", "false"),
+                    ("powered", "true"),
+                ],
+            ),
+            (
+                "create:brass_belt_funnel",
+                vec![
+                    ("facing", "south"),
+                    ("shape", "pulling"),
+                    ("powered", "false"),
+                ],
+            ),
+        ];
+        states::set_range(10, names.len() as u32);
+        let mut w = CreateWorld::new(StateTable::new(
+            10,
+            names.iter().map(|(n, p)| (*n, p.iter().copied())),
+        ));
+        let (depot, funnel, side) = ([0, 7, 6], [0, 8, 6], [1, 8, 6]);
+        // Depot placed before funnel: on the first tick, depot ticks before funnel has acquired
+        // `InvManipulationBehaviour.targetCapability`.
+        w.block_changed(0, depot, 0, 10);
+        w.block_changed(0, funnel, 0, 11);
+        assert!(!w.funnel_inv_ready(0, funnel));
+        let mut phase = w.transport_ticks(0, 1);
+        assert_eq!(phase.next(&mut w), Some(TransportTick::Depot(depot)));
+        assert!(!w.funnel_inv_ready(0, funnel));
+        assert_eq!(phase.next(&mut w), Some(TransportTick::Funnel(funnel)));
+        assert!(w.funnel_inv_ready(0, funnel));
+        assert_eq!(phase.next(&mut w), None);
+
+        // Same-entity state updates (powered toggle, brass funnel <-> brass belt funnel) keep
+        // the acquired capability.
+        w.block_changed(0, funnel, 11, 12);
+        assert!(w.funnel_inv_ready(0, funnel));
+        w.block_changed(0, funnel, 12, 13);
+        assert!(w.funnel_inv_ready(0, funnel));
+        w.block_changed(0, funnel, 13, 11);
+        assert!(w.funnel_inv_ready(0, funnel));
+
+        // Changing an unrelated neighbour does not invalidate; changing the block behind the
+        // funnel (`depot` below an upward funnel, Create or vanilla) invalidates until the
+        // funnel's next turn.
+        w.block_changed(0, side, 0, 1);
+        assert!(w.funnel_inv_ready(0, funnel));
+        w.block_changed(0, depot, 10, 0);
+        assert!(!w.funnel_inv_ready(0, funnel));
+        let mut phase = w.transport_ticks(0, 2);
+        assert_eq!(phase.next(&mut w), Some(TransportTick::Funnel(funnel)));
+        assert!(w.funnel_inv_ready(0, funnel));
+        w.funnel_neighbour_changed(0, depot);
+        assert!(!w.funnel_inv_ready(0, funnel));
+        let mut phase = w.transport_ticks(0, 3);
+        assert_eq!(phase.next(&mut w), Some(TransportTick::Funnel(funnel)));
+        assert!(w.funnel_inv_ready(0, funnel));
+
+        // Replacing a funnel directly with another Create block clears both funnel maps.
+        w.block_changed(0, funnel, 11, 10);
+        assert!(!w.dims[0].funnels.contains_key(&funnel));
+        assert!(!w.dims[0].funnel_inv_pending.contains(&funnel));
+        w.block_changed(0, funnel, 10, 11);
+
+        // After reload with a saved cooldown (due > now), the funnel still acquires its
+        // capability at its first tick's turn even though it does not extract yet.
+        w.schedule_funnel(0, funnel, 20, 3);
+        let saved = w.column_funnels(0, 0, 0, 3);
+        w.column_unloaded(0, 0, 0);
+        w.load_funnels(0, 3, saved.into_iter());
+        w.block_loaded(0, funnel, 11);
+        w.block_loaded(0, depot, 10);
+        assert!(!w.funnel_inv_ready(0, funnel));
+        // Funnel loaded before depot: its turn resolves before depot ticks.
+        let mut phase = w.transport_ticks(0, 4);
+        assert_eq!(phase.next(&mut w), Some(TransportTick::Depot(depot)));
+        assert!(w.funnel_inv_ready(0, funnel));
+        assert_eq!(phase.next(&mut w), None);
+        states::clear_range();
     }
 
     #[test]
@@ -7626,10 +7786,11 @@ mod tests {
         states::clear_range();
     }
 
-    /// Create: a controller holding 8 cobblestone drops them where it stood when a wheel goes
-    /// and takes it (`CrushingWheelControllerBlock.onRemove`, `ItemHelper.dropContents`).
+    /// Create: a controller holding 8 cobblestone leaves its inventory for its removal to spill
+    /// when a wheel goes and takes it (`CrushingWheelControllerBlock.onRemove`,
+    /// `ItemHelper.dropContents`).
     #[test]
-    fn a_removed_crushing_wheel_controller_drops_what_it_held() {
+    fn a_removed_crushing_wheel_controller_hands_its_inventory_to_its_removal() {
         let _guard = states::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let names: Vec<(&str, Vec<(&str, &str)>)> = vec![(
             "create:crushing_wheel_controller",
@@ -7643,17 +7804,17 @@ mod tests {
         let (c, _) = w.dims[0].crushers.get_mut(&at).unwrap();
         crate::crusher::intake(c, "minecraft:cobblestone", 8, Some(250));
         w.block_changed(0, at, 2, 0);
-        assert_eq!(
-            w.dims[0].crusher_drops,
-            [(at, "minecraft:cobblestone".to_owned(), 8)]
-        );
+        let removed = &w.dims[0].removed_inventories[&at];
+        assert_eq!(removed.len(), crate::processing::INVENTORY_SLOTS);
+        assert_eq!(removed[0], Some(("minecraft:cobblestone".to_owned(), 8)));
+        assert!(removed[1..].iter().all(Option::is_none));
         states::clear_range();
     }
 
-    /// Create: an upward saw cutting an oak log drops it where it stood when it is broken
-    /// (`SawBlockEntity.destroy`, `ItemHelper.dropContents`).
+    /// Create: an upward saw cutting an oak log leaves its inventory for its removal to spill
+    /// when it is broken (`SawBlockEntity.destroy`, `ItemHelper.dropContents`).
     #[test]
-    fn a_broken_saw_drops_what_it_held() {
+    fn a_broken_saw_hands_its_inventory_to_its_removal() {
         let _guard = states::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let names: Vec<(&str, Vec<(&str, &str)>)> = vec![(
             "create:mechanical_saw",
@@ -7672,10 +7833,9 @@ mod tests {
         s.insert(0, "minecraft:oak_log", &[], true);
         w.dims[0].saws.insert(at, s);
         w.block_changed(0, at, 2, 0);
-        assert_eq!(
-            w.dims[0].saw_drops,
-            [(at, "minecraft:oak_log".to_owned(), 1)]
-        );
+        let removed = &w.dims[0].removed_inventories[&at];
+        assert_eq!(removed[0], Some(("minecraft:oak_log".to_owned(), 1)));
+        assert!(removed[1..].iter().all(Option::is_none));
         states::clear_range();
     }
 
@@ -7863,6 +8023,36 @@ mod tests {
         w.block_changed(0, pos, 0, 10);
         w.block_changed(0, pos, 10, 0);
         assert!(w.dims[0].deployer_cracks.is_empty());
+        states::clear_range();
+    }
+
+    /// Create: a broken deployer leaves its held stack, with its damage and components, for its
+    /// removal to spill (`DeployerBlockEntity.discardPlayer`).
+    #[test]
+    fn a_removed_deployer_preserves_its_held_stack_for_removal() {
+        let _guard = states::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let names: Vec<(&str, Vec<(&str, &str)>)> = vec![(
+            "create:deployer",
+            vec![("axis_along_first", "false"), ("facing", "down")],
+        )];
+        states::set_range(10, 1);
+        let mut w = CreateWorld::new(StateTable::new(
+            10,
+            names.iter().map(|(n, p)| (*n, p.iter().copied())),
+        ));
+        let pos = [0, 64, 0];
+        w.block_changed(0, pos, 0, 10);
+        let mut d = w.dims[0].deployers[&pos].clone();
+        d.held = Some(("minecraft:shears".to_owned(), 1));
+        d.held_damage = 42;
+        d.held_components = vec![10, 0, 1, 2];
+        w.set_deployer(0, pos, d.clone());
+        w.block_changed(0, pos, 10, 0);
+        assert_eq!(w.dims[0].removed_deployers.remove(&pos), Some(d));
+        // An empty deployer leaves no entry.
+        w.block_changed(0, pos, 0, 10);
+        w.block_changed(0, pos, 10, 0);
+        assert!(w.dims[0].removed_deployers.is_empty());
         states::clear_range();
     }
 

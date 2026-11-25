@@ -654,6 +654,9 @@ fn funnel_direct_input(
     if f.belt.is_some() || f.extracting || f.facing != Dir::Up || f.powered {
         return item.count;
     }
+    if with_world(|w| w.funnel_inv_ready(lv.dim, pos)) != Some(true) {
+        return item.count;
+    }
     let Some(stack) = belt_stack(lv, item) else {
         return item.count;
     };
@@ -1102,6 +1105,9 @@ impl belt::Surroundings for BeltSide<'_, '_> {
         let at = self.at(segment);
         let pos = [at[0], at[1] + 1, at[2]];
         let f = funnel_at(self.lv, pos)?;
+        if with_world(|w| w.funnel_inv_ready(self.lv.dim, pos)) != Some(true) {
+            return Some(item.count);
+        }
         let behind = create_engine::funnel::behind(pos, f.facing);
         let stack = belt_stack(self.lv, item)?;
         // `filtering.test`: a brass funnel lets only what its filter passes in.

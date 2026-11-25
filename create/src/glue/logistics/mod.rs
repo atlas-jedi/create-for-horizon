@@ -984,6 +984,7 @@ fn item_landed(
             if f.extracting
                 || f.powered
                 || !create_engine::funnel::past_opening(spot, f.facing, at)
+                || with_world(|w| w.funnel_inv_ready(lv.dim, spot)) != Some(true)
                 || !funnel::funnel_passes(lv, spot, &s)
             {
                 return;

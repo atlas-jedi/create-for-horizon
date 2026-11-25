@@ -1,0 +1,70 @@
+{
+  "version": 3,
+  "seed": 0,
+  "ticks": 40,
+  "checkpoints": [
+    10,
+    11,
+    12,
+    20
+  ],
+  "blocks": [
+    {
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "state": "create:millstone"
+    },
+    {
+      "pos": [
+        0,
+        7,
+        0
+      ],
+      "state": "create:creative_motor[facing=up]",
+      "motor": 32
+    }
+  ],
+  "events": [
+    {
+      "tick": 10,
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "action": {
+        "kind": "capability",
+        "side": "up",
+        "slot": 0,
+        "insert": {
+          "item": "minecraft:dirt",
+          "count": 19
+        },
+        "extract": null,
+        "simulate": false
+      }
+    },
+    {
+      "tick": 11,
+      "pos": [
+        0,
+        8,
+        0
+      ],
+      "action": {
+        "kind": "capability",
+        "side": "up",
+        "slot": 0,
+        "insert": {
+          "item": "minecraft:cobblestone",
+          "count": 2
+        },
+        "extract": null,
+        "simulate": false
+      }
+    }
+  ]
+}

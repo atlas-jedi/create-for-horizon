@@ -1,14 +1,15 @@
 # Validation
 
-Checked on 2026-11-22 on branch `pin/dev-7cfdf81` (Linux x86_64, Rust 1.99.1, a fresh clone), pinned to the Sunrise
-Dev build `dev-2026-11-22-7cfdf81` (main at `7cfdf81463ebb4a19705768273909f7f3f03601d`) in `create/sunrise-mod.toml`.
+Checked on 2026-11-24 on branch `create-sunrise-pin-3d34bbe` (Linux x86_64, Rust 1.99.1), pinned to the Sunrise
+Dev build `dev-2026-11-24-3d34bbe` (main at `3d34bbe63d71bb24c098c1e4021ef866be12fe2d`) in `create/sunrise-mod.toml`.
 A Dev build is a test build with no stable mod API. `cargo sunrise-mod` uses the signature-verified release tool and
-SDK from `sdk-7cfdf81463ebb4a19705768273909f7f3f03601d`, with the published release key.
+SDK from `sdk-3d34bbe63d71bb24c098c1e4021ef866be12fe2d`, with the published release key.
 No SDK mirror or trusted-key override is used. Mixins stays at
 `e59da9094f0c2fdda6c627fe9eff22dec6a906f0`, as the release SDK specifies.
 
-`b680a0f` on the Dev build passed the in-game checks in "Dev build `7cfdf81` in game" below. On `9425651`, `684e89b` passed the in-game smoke test below, `c6f9470` was tried in game for the fixes merged
-since (#203-#224), and `11c43ca` for those merged after (#227-#234). Earlier in-game results are historical: `6373106` ran on `520fc48`, the developer build was `b77574e`,
+On `3d34bbe`, only #261-#264 and #266 have been checked in game (the section below), and `tools/create-fuzz/` has not
+been run. Earlier in-game results are historical: `b680a0f` on the Dev build `7cfdf81` passed the in-game checks in "Dev build `7cfdf81` in game" below, `684e89b` on `9425651` passed the in-game smoke test below, `c6f9470` was tried in game for the fixes merged
+since (#203-#224), `11c43ca` for those merged after (#227-#234), `6373106` ran on `520fc48`, the developer build was `b77574e`,
 the first nightly smoke test used `2d81263`, and the registry smoke tests used `ed3ac19`.
 
 ## Checks
@@ -20,20 +21,55 @@ In a fresh clone run `cargo sunrise-mod check` first: it fetches the SDK into `c
 |---|---|---|
 | `create/` | `cargo +1.99.1 fmt --check` | Pass |
 | `create/` | `cargo +1.99.1 check` and `cargo +1.99.1 clippy --all-targets -- -D warnings` | Pass |
-| `create/` | `cargo +1.99.1 test` | Pass (120 glue tests) |
-| `create/` | `cargo +1.99.1 test -p create-engine` | Pass (916 engine tests) |
-| `create/` | `cargo sunrise-mod check` | Pass (official `7cfdf81463` SDK) |
+| `create/` | `cargo +1.99.1 test` | Pass (121 glue tests) |
+| `create/` | `cargo +1.99.1 test -p create-engine` | Pass (919 engine tests) |
+| `create/` | `cargo sunrise-mod check` | Pass (official `3d34bbe63d` SDK) |
 | `create/` | `cargo sunrise-mod build` | Pass (native library and `.smod` package) |
-| `create/` | `cargo sunrise-mod fits target/sunrise-mod/create.smod --build 7cfdf81463ebb4a19705768273909f7f3f03601d` | Pass (`made for`) |
+| `create/` | `cargo sunrise-mod check target/sunrise-mod/create.smod --build 3d34bbe63d71bb24c098c1e4021ef866be12fe2d` | Pass (`made for`) |
 | `create/src/engine/` | `cargo +1.99.1 fmt --check` | Pass |
 | `create/src/engine/` | `cargo +1.99.1 check` and `cargo +1.99.1 clippy --all-targets -- -D warnings` | Pass |
 | `tools/create-data/` | `cargo +1.99.1 fmt --check` | Pass |
 | `tools/create-data/` | `cargo +1.99.1 check --locked` and `cargo +1.99.1 clippy --locked --all-targets -- -D warnings` | Pass |
-| `tools/create-data/` | `cargo +1.99.1 test --locked` | Pass (55 tests, including `committed_assets` with `CREATE_JAR` set to the pinned jar) |
+| `tools/create-data/` | `cargo +1.99.1 test --locked` | Pass (55 tests) |
 | `tools/create-data/` | `cargo run --locked -- registry --out ../../create --check` | Pass |
-| `tools/create-fuzz/rust/` | `cargo +1.99.1 fmt --check`, `cargo +1.99.1 clippy --release --all-targets -- -D warnings` | Pass |
-| `tools/create-fuzz/rust/` | `cargo +1.99.1 test --release` with `CREATE_HORIZON_DIR` set to the checkout | Pass (124 tests) |
-| `tools/create-fuzz/` | `./run.sh fuzz check cases/*.json` against a running server | Pass (119 of 119 cases match) |
+| `tools/create-fuzz/rust/` | `cargo +1.99.1 fmt --check`, `cargo +1.99.1 clippy --release --all-targets -- -D warnings` | Not run on `3d34bbe` |
+| `tools/create-fuzz/rust/` | `cargo +1.99.1 test --release` with `CREATE_HORIZON_DIR` set to the checkout | Not run on `3d34bbe` |
+| `tools/create-fuzz/` | `./run.sh fuzz check cases/*.json` against a running server | Not run on `3d34bbe` |
+
+## #261-#264 and #266 in game on Dev `3d34bbe` (main `46eb2c2`)
+
+Built with `sunrise-launcher` 1.2.0 `native-build` for `dev-2026-11-24-3d34bbe`, resources prepared for that build with
+its `sunrise-prepare`. In the creative world `ari266`, on a smooth stone platform at y 149, driven by `sunrise-ctl`,
+read back with `/data get`, `sunrise-ctl container` and `sunrise-ctl entities`, then saved, quit and relaunched.
+Compared with Create 6.0.11 (`b62e837`) Java. Screenshots are in `/mnt/lanes/game-main/game/`.
+
+| # | Item | Result | Evidence |
+|---|---|---|---|
+| 1 | #261 deployer calm hive harvest | Pass | An east-facing deployer from `/setblock`, given shears by hand, on a full beehive holding 2 bees: `honey_level` went to 0, 3 honeycomb popped out, both bees stayed in the hive and the shears took 1 damage (0 → 1 on a single harvest, repeated). A north-facing deployer placed by hand while sneaking, given 3 glass bottles, on a full bee nest holding 3 bees: the bees stayed, the bottles went 3 → 2 with a honey bottle in its overflow; it then waited until a hopper below drained the overflow (`DeployerBlockEntity.tick`: `if (!overflowItems.isEmpty()) { timer = ...; return; }`), and the last bottle left the honey bottle in its hand (the PR's `shrink` then `set_held` path). A player shearing a full hive with bees, as the control, still released them all. This matches `BeehiveBlockMixin` (`original \|\| player instanceof DeployerFakePlayer`). The held shears, their damage and the held honey bottle were kept over the reload. See `261-01-shears.png` to `261-03-player-control.png`. |
+| 2 | #262 knockback through `LivingRef::knockback` | Pass | Cardboard sword on a pig, four hits from three directions: pushed straight away from the player by 5.17 blocks each time. A simulation of `LivingEntity.knockback(1.0, ...)` with vanilla friction (`2 * 0.5` from `CardboardSwordItem.knockback`) gives 5.173. A fifth hit, after the relaunch, pushed the pig 5.3 blocks and gave it slowness amplifier 9 for 60 ticks (55 left when read), as in `CardboardSwordItem`. An earlier try is not counted, because the pig's position at the hit was not read. Potato cannon at 5 blocks: the pig lost 5 health and was pushed 5.6 blocks along the shot, close to the hurt knockback 0.4 plus `knockback * 0.6` = 0.9 from `PotatoProjectileEntity.onHitEntity` (`target.hurt`, then `livingentity.knockback(knockback * 0.6, ...)`; the potato type's `knockback` is 1.5) (5.69 in the same simulation; the pig also panics after the hit). Without Create's knockback, hurt's 0.4 alone would push it 2.07 blocks. See `262-02-potato-pig.png`. |
+| 3 | #263 cog helper before the crafter | Pass | A north-facing idle crafter from `/setblock`: a cogwheel used off-centre on its front face went beside it, at the east with `axis=z`, and the crafter stayed empty; used at the centre (the shaft, `hitOnShaft`) it went into the crafter. A crafter placed by hand (`facing=west`): a large cogwheel used off-centre went to the diagonal `(16,151,21)` with `axis=x`, as `DiagonalCogHelper` picks (`closest`, then the nearest other side). A cogwheel on a millstone's top went beside it at the nearest side with `axis=y`. This is `CogwheelBlockItem.onItemUseFirst` running before `MechanicalCrafterBlock.useItemOn`. The crafter kept its cog over the reload. Breaking it then dropped that cog, and breaking the helper-placed cog left the crafter in place. See `263-01-crafter-offcentre-centre.png` and `263-01-crafter-cogs.png`. |
+| 4 | #264 schematic block preview | Pass | Selected a 3x3x3 build with the schematic and quill, saved it as `ghosttest.nbt` with the prompt's convert button, and deployed the creative-given schematic: its blocks were drawn at the anchor, matching the original block for block. A copy turned `CLOCKWISE_90` drew log, bricks, glass and wool turned a quarter clockwise. A `FRONT_BACK` copy drew them with x flipped. A deployed schematic held in hand through a save and relaunch drew again at once. Switching straight between two hotbar schematics of the same file keeps the first one's placement, as Java's `SchematicHandler.tick` only calls `init` when `!active` or the file differs; going through an empty slot shows the other. The turned and mirrored copies were made with `/give`, since `sunrise-ctl` has no Alt key for the tool menu. The schematic table and schematicannon flows and block-entity previews were not tried. See `264-01-quill-selection.png` to `264-08-after-reload.png`. |
+| 5 | #266 funnel inventory from its first tick | Pass | A 6-long belt from the connector into an upward brass funnel on a depot: 16 iron ingots went through into the depot while playing. Then 20 gold ingots waited at the belt's end (position 5.75) behind the iron and were saved there. After the relaunch they were still at 5.75 and went in once a hopper drained the depot. Replacing the depot with a chest (the block behind the funnel changed) let 24 copper ingots in. A `/setblock` andesite funnel on a chest took 5 thrown diamonds. A brass funnel placed by hand on a chest was extracting (`FunnelBlock.getStateForPlacement`: `EXTRACTING, !sneak`); placed while sneaking, it took 7 thrown emeralds. Belt funnels placed by hand on chests beside the belt: an extracting one pushed 10 redstone onto the belt and a sneak-placed inserting one downstream took all 10. Saved with 30 lapis mid-belt and coal and quartz still in the source chest; after the relaunch all 90 reached the inserting funnel's chest. Breaking the inserting belt funnel by hand let 9 flint ride on to the belt-end funnel. The one-tick wait itself is too short to see in game. The fuzz regression test was not run here. See `266-01-gold-waiting-before-save.png` and `266-02-after-reload-chest.png`. |
+
+Found along the way, and not from these PRs: a broken deployer drops its held item by id and count only
+(`Deployer.held` into `deployer_drops` in `engine/src/world.rs`, unchanged since `b3b56ed`), so shears with 1 damage dropped as new shears. Java
+drops the fake player's own stacks: `DeployerBlockEntity.discardPlayer` calls `player.getInventory().dropAll()`.
+
+## PR #243 processing on the Dev APIs in game (main `43aa858`)
+
+Built with `sunrise-launcher` 1.2.0 for `dev-2026-11-22-7cfdf81`. In the creative world `proc243`, placed the
+millstone by hand, set the other fixtures with `/setblock`, and changed the motors' speeds with clipboards.
+Checked held items and timers with `/data get` and loose items with `sunrise-ctl entities`. Compared with
+Create 6.0.11 (`b62e837`) Java. Screenshots are in `/mnt/lanes/agent-procgame/game/`.
+
+| # | Item | Result | Evidence |
+|---|---|---|---|
+| 1 | Millstone admission | Pass | At 16 rpm, all 4 dirt stayed in the hopper. Swapping to 4 cobblestone filled the input and produced 4 gravel in the output. Dirt thrown by hand stayed a loose item. An inserting andesite funnel admitted all 3 cobblestone while 3 dirt stayed loose on the funnel, as in `MillstoneInventoryHandler.isItemValid` and `MillstoneBlock.updateEntityAfterFallOn`. See `01-millstone-dirt.png`, `03-millstone-gravel.png` and `14-millstone-funnel.png`. |
+| 2 | Crushing wheel exits | Pass | With opposite 128 rpm motors, cobblestone dropped from above produced gravel below the downward controller at (8,105,0). Cobblestone thrown horizontally into the controller at (18,106,0) yielded gravel north at z≈−1.99 and south at z≈2.74 after reversing the motors. The results remained loose outside the controller. With the controller facing up and fed by a hopper removed after intake, gravel rose and settled directly on top at (8.5,106,0.5). This follows `CrushingWheelControllerBlockEntity.tick` and the tagged-item collision rule in `CrushingWheelControllerBlock.getCollisionShape`. See `04-crusher-up.png` through `07-crusher-south.png`. |
+| 3 | Controller and saw removal spills | Pass | Breaking a wheel at 16 rpm removed the controller and spilled all 12 cobblestone it held with the recipe still unapplied. Breaking the powered upward saw at −16 rpm with 31 of 50 ticks left spilled its uncut oak log. An intact run yielded a stripped oak log. Both spills match the Java removal paths through `ItemHelper.dropContents`. See `10-crusher-spill.png` and `15-saw-powered-spill.png`. |
+| 4 | Save, quit, relaunch mid-process | Pass | Saved with 2 cobblestone and 4 gravel in the millstone (timer 218 before save) and 12 cobblestone in the crusher (remaining time about 240.36). After reopening, both retained those stacks and their timers counted down (millstone 125 → 95, crusher 206.80 → 197.52). The millstone finished with 6 gravel and the crusher ejected 12 gravel. This agrees with both Java block entities' inventory and timer serialization. See `11-before-save.png` through `13-reloaded-output.png`. |
+
+The three `committed_assets` tests passed, including the comparison with the cached Create jar.
 
 ## Dev build `7cfdf81` in game (branch `pin/dev-7cfdf81`)
 

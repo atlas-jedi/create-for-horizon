@@ -82,6 +82,18 @@ pub fn tick_millstones(lv: &mut ServerLevel<'_>) {
     }
 }
 
+/// `MillstoneBlockEntity.canProcess`: a milling recipe takes `item`.
+fn can_process(item: &str) -> bool {
+    recipes::with(|r| r.milling.find_single(item).is_some()).unwrap_or(false)
+}
+
+/// `MillstoneInventoryHandler.isItemValid`: the input takes what `canProcess` mills, the outputs
+/// nothing.
+#[cfg(any())] // Horizon: API missing, see HORIZON_GAPS.md
+pub(crate) fn admits(slot: usize, stack: &ItemStack) -> bool {
+    slot == 0 && stacks::known_id(stack.item()).is_some_and(|item| can_process(&item))
+}
+
 /// `MillstoneBlock.updateEntityAfterFallOn`: an item landing on a millstone goes into its input
 /// as far as it fits, when it has a milling recipe (`MillstoneInventoryHandler.insertItem`:
 /// `canProcess`). `stack` keeps what is left.
@@ -91,10 +103,7 @@ pub fn millstone_take(lv: &mut ServerLevel<'_>, pos: [i32; 3], stack: &mut Optio
     };
     let host = &*lv.host;
     let item = stacks::id(host, s);
-    if recipes::with(|r| r.milling.find_single(&item))
-        .flatten()
-        .is_none()
-    {
+    if !can_process(&item) {
         return;
     }
     let max = stacks::limit(host, &item);
