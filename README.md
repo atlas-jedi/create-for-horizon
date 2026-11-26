@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/media/horizon/factory-line.webp" alt="A Create production line on Horizon: a belt between two shafts, a mechanical press, a mixer over a basin and blaze burner, creative motors and cogwheels on an andesite platform by the water" width="100%">
+  <img src="docs/media/banner.webp" alt="Create for Sunrise and Horizon: a copper locomotive on a stone viaduct at sunset beside a Create factory and windmill" width="100%">
 </p>
 
 <h1 align="center">Create for Horizon</h1>
@@ -36,13 +36,18 @@ presses, contraptions and trains.
 
 <table>
   <tr>
-    <td width="50%"><img src="docs/media/horizon/belt-press.webp" alt="An iron ingot riding a belt under a mechanical press, with cogwheels and creative motors"></td>
-    <td width="50%"><img src="docs/media/horizon/water-wheel.webp" alt="A water wheel in a copper frame driving a shaft, beside a copper house with train doors, on a beach"></td>
+    <td width="50%"><img src="docs/media/readme/anim-factory.webp" alt="Belts, mechanical arms, mixers and presses working in a factory hall"><br><sub>The factory at work</sub></td>
+    <td width="50%"><img src="docs/media/readme/anim-train-arrival.webp" alt="A train arriving over a viaduct"><br><sub>A train on its schedule</sub></td>
+  </tr>
+  <tr>
+    <td width="50%"><img src="docs/media/readme/anim-windmill.webp" alt="Windmill sails turning"><br><sub>Windmill bearing</sub></td>
+    <td width="50%"><img src="docs/media/readme/anim-water-wheel.webp" alt="A large water wheel turning in a stream"><br><sub>Water wheel and gearing</sub></td>
   </tr>
 </table>
 
-<sub>Captured in Horizon on Windows, HUD hidden. Create's textures and models, © the Create Team, come from its
-official jar.</sub>
+<sub>Banner and animations by Ola Hulleberg, captured on Sunrise with the same engine this fork runs. On Horizon,
+trains and contraptions are not played yet: see [Status](#status). Create's textures and models, © the Create
+Team, come from its official jar.</sub>
 
 ## Status
 
