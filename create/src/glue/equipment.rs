@@ -288,7 +288,7 @@ impl Subsystem for Equipment {
         HEARD.with_borrow_mut(HashMap::clear);
     }
 
-    /// The game's armour models Create's diving gear is drawn on (`render_worn`).
+    /// The game's armour models Create's diving gear is drawn on (`WornLayer`).
     fn models_baked(&self, host: &mut dyn mod_api::ClientHost) {
         bake_armor(host);
     }
@@ -1573,50 +1573,92 @@ fn pose_like(part: &mut mod_api::ModelPart, posed: &mod_api::PosedParts) {
     }
 }
 
-/// Create's armour on the local player in third person: `HumanoidArmorLayer` with Create's
-/// armour textures (`BaseArmorItem.getArmorTexture`, `LayeredArmorItem`) and
-/// `BacktankArmorLayer` (the backtank's model on the back, its cogs turning). The game draws
-/// none of it: their `equippable` names an equipment asset no pack has. Horizon: a client
-/// reads no one's equipment but its own player's, so other players and mobs wearing Create's
-/// armour show none of it (HORIZON_GAPS.md).
-pub(crate) fn render_worn(
-    host: &dyn mod_api::ClientHost,
-    event: &mut mod_api::RenderLivingPostEvent<'_>,
-) {
-    let Some(posed) = event.parts else {
-        return;
-    };
-    let Some(me) = host.local_player().map(|p| p.entity()) else {
-        return;
-    };
-    if me.id() != event.entity.id {
-        return;
+/// The local player's network id and the items on its head, chest, legs and feet, read once a
+/// frame (`render_frame_pre`): a layer's frame has no host to read them from.
+static WORN: std::sync::Mutex<Option<(u32, [String; 4])>> = std::sync::Mutex::new(None);
+
+pub(crate) fn read_worn(host: &dyn mod_api::ClientHost) {
+    let worn = host.local_player().map(|p| p.entity()).and_then(|me| {
+        let living = host.living(me)?;
+        let item = |slot| {
+            living
+                .equipment(host, slot)
+                .map(|s| s.item().name(host))
+                .unwrap_or_default()
+        };
+        Some((
+            me.id(),
+            [
+                item(EquipmentSlot::Head),
+                item(EquipmentSlot::Chest),
+                item(EquipmentSlot::Legs),
+                item(EquipmentSlot::Feet),
+            ],
+        ))
+    });
+    *WORN.lock().unwrap_or_else(|e| e.into_inner()) = worn;
+}
+
+/// Create's armour on the local player, as a layer of the player models (Create adds its layers
+/// in `EntityRenderersEvent.AddLayers`): `HumanoidArmorLayer` with Create's armour textures
+/// (`BaseArmorItem.getArmorTexture`, `LayeredArmorItem`) and `BacktankArmorLayer` (the
+/// backtank's model on the back, its cogs turning). The game draws none of it: their
+/// `equippable` names an equipment asset no pack has. Horizon: a client reads no one's
+/// equipment but its own player's, so other players and mobs wearing Create's armour show none
+/// of it, and the inventory screen's player draws no mod layer (HORIZON_GAPS.md).
+pub(crate) struct WornLayer;
+
+impl mod_api::EntityRenderLayer for WornLayer {
+    fn submit(
+        &self,
+        entity: &mod_api::EntityRenderState,
+        parts: Option<&mod_api::PosedParts>,
+        draw: &mut dyn mod_api::BlockEntityDrawContext,
+    ) -> Result<(), String> {
+        let Some(posed) = parts else {
+            return Ok(());
+        };
+        let worn = WORN.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some((me, [head, chest, legs, feet])) = worn else {
+            return Ok(());
+        };
+        if me == entity.id {
+            draw_worn(posed, draw, &head, &chest, &legs, &feet);
+        }
+        Ok(())
     }
-    let Some(living) = host.living(me) else {
-        return;
-    };
-    let worn = |slot| {
-        living
-            .equipment(host, slot)
-            .map(|s| s.item().name(host))
-            .unwrap_or_default()
-    };
-    let (pieces, backtank) = worn_pieces(
-        &worn(EquipmentSlot::Head),
-        &worn(EquipmentSlot::Chest),
-        &worn(EquipmentSlot::Legs),
-        &worn(EquipmentSlot::Feet),
-    );
+}
+
+/// [`WornLayer`] on every player model.
+pub(crate) fn register_layers(layers: &mut dyn mod_api::EntityLayers) {
+    for model in layers.player_models() {
+        if let Err(e) = layers.add(
+            mod_api::LayerTarget::Player(model),
+            std::sync::Arc::new(WornLayer),
+        ) {
+            crate::create_log!("[create] the diving gear layer was refused: {e}");
+        }
+    }
+}
+
+fn draw_worn(
+    posed: &mod_api::PosedParts,
+    draw: &mut dyn mod_api::BlockEntityDrawContext,
+    head: &str,
+    chest: &str,
+    legs: &str,
+    feet: &str,
+) {
+    let (pieces, backtank) = worn_pieces(head, chest, legs, feet);
     if pieces.is_empty() {
         return;
     }
-    let draw = &mut *event.draw;
     draw.push();
-    // `LivingEntityRenderer.render`: from the feet, turned with the body (the hook's frame, in
+    // `LivingEntityRenderer.render`: from the feet, turned with the body (the layer's frame, in
     // blocks: +z the way the body faces, +x its left, +y up; a crouching body's armour lines
     // up in game, so the frame has `getRenderOffset`), into the model's frame (+y down, its
     // front towards -z, its feet 24 texels down), the player at 15/16
-    // (`AvatarRenderer.scale`), which the hook's frame leaves out.
+    // (`AvatarRenderer.scale`), which the layer's frame leaves out.
     draw.scale([1.0, -1.0, -1.0]);
     draw.scale([0.9375; 3]);
     draw.translate([0.0, -1.501, 0.0]);

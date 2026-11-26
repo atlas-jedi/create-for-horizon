@@ -290,20 +290,21 @@ impl Hooks for Create {
 
     fn render_frame_pre(
         &self,
-        _host: &mut dyn ClientHost,
+        host: &mut dyn ClientHost,
         _event: &mut mod_api::RenderFramePreEvent,
     ) {
         glue::equipment::grip_frame();
+        glue::equipment::read_worn(host);
     }
 
-    /// Create's diving gear on the local player (`HumanoidArmorLayer` with Create's textures,
-    /// `BacktankArmorLayer`).
-    fn render_living_post(
+    /// Create's diving gear and cardboard armour on the player models (`BacktankArmorLayer`,
+    /// `HumanoidArmorLayer` with Create's textures).
+    fn register_entity_layers(
         &self,
-        host: &dyn ClientHost,
-        event: &mut mod_api::RenderLivingPostEvent<'_>,
+        _context: &RegistrationContext,
+        event: &mut mod_api::RegisterEntityLayersEvent<'_>,
     ) {
-        glue::equipment::render_worn(host, event);
+        glue::equipment::register_layers(&mut *event.layers);
     }
 
     /// Create's tab shows the backtanks full (`AllCreativeModeTabs.makeStackFunc`).
