@@ -23,23 +23,17 @@ impl Run {
         };
         Some((info.facing?, belt, info.extracting))
     }
-    /// `filter_max` (`getMaxStackSize`): the filter's stack size, 99 without one.
+    /// `filter_max`: the filter's stack size, 64 without one.
     fn funnel_filter_max(&self, p: Pos) -> i32 {
-        board::filter_max(
-            self.funnel_filters
-                .get(&p)
-                .map(|item| self.funnel_filter_stack_size(item)),
-        )
+        self.funnel_filters
+            .get(&p)
+            .map_or(64, |item| self.funnel_filter_max_of(item))
     }
-    /// The stack size of a filter of `item` (99, an empty slot's, for an empty hand).
+    /// The stack size of a filter of `item` (64 for an empty hand).
     pub(super) fn funnel_filter_max_of(&self, item: &str) -> i32 {
         if item == "minecraft:air" {
-            return board::filter_max(None);
+            return 64;
         }
-        self.funnel_filter_stack_size(item)
-    }
-    /// `filter_stack_size`: the stack size of `item`.
-    fn funnel_filter_stack_size(&self, item: &str) -> i32 {
         i32::from(
             crate::transport::Stack {
                 item: item.to_string(),
@@ -71,8 +65,8 @@ impl Run {
         self.funnel_filters.get(&p).is_none_or(|f| f == item)
     }
     /// `funnel_extraction` (`getAmountToExtract`, `getModeToExtract`): a stack without an
-    /// amount, one item for an andesite funnel, else the count (99 up to as placed), exactly on
-    /// its second row.
+    /// amount, one item for an andesite funnel, else the board's count, exactly on its second
+    /// row.
     pub(super) fn funnel_extraction(&self, p: Pos) -> (u32, bool) {
         let Some((block, info)) = self.w.table.get(self.at(p)) else {
             return (64, false);
@@ -90,7 +84,8 @@ impl Run {
             return (1, false);
         }
         let a = self.filter_amounts.get(&p).copied().unwrap_or_default();
-        (a.count().max(0) as u32, !a.up_to())
+        let count = a.count(self.funnel_filter_max(p));
+        (count.max(1) as u32, !a.up_to)
     }
     /// `set_funnel_filter` (`FilteringBehaviour.onShortInteract`): the held item becomes the
     /// filter, an empty hand clears it; an exact amount fits the new filter's stack size.
@@ -100,12 +95,9 @@ impl Run {
         } else {
             self.funnel_filters.insert(p, item.to_string());
         }
-        let stack = self
-            .funnel_filters
-            .get(&p)
-            .map(|item| self.funnel_filter_stack_size(item));
+        let max = self.funnel_filter_max(p);
         if let Some(a) = self.filter_amounts.get_mut(&p) {
-            *a = a.with_filter(stack);
+            *a = a.fitted(max);
         }
         self.wake_funnel(p);
         self.w.mark_unsaved(0, p);
@@ -231,10 +223,10 @@ impl Run {
             Some(item) => self.set_funnel_filter(p, item),
             None => {
                 let now = self.filter_amounts.get(&p).copied().unwrap_or_default();
-                let pick = create_engine::board::Settings { row, value };
-                if now.settings() != pick {
-                    self.filter_amounts
-                        .insert(p, FilterAmount::from_settings(pick, max));
+                let next =
+                    FilterAmount::from_settings(create_engine::board::Settings { row, value }, max);
+                if now.settings(max) != next.settings(max) {
+                    self.filter_amounts.insert(p, next);
                     self.wake_funnel(p);
                     self.w.mark_unsaved(0, p);
                 }
@@ -249,8 +241,8 @@ impl Run {
         let max = self.funnel_filter_max(p);
         Some((
             self.funnel_filters.get(&p).cloned(),
-            a.count().min(max),
-            a.up_to(),
+            a.count(max).min(max),
+            a.up_to,
         ))
     }
 }

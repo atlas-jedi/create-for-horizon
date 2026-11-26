@@ -737,96 +737,75 @@ pub const fn filter(max: i32) -> Board {
     }
 }
 
-/// `Item.ABSOLUTE_MAX_STACK_SIZE`.
-pub const ABSOLUTE_MAX_STACK_SIZE: i32 = 99;
-
-/// `FilteringBehaviour.getMaxStackSize(filter)`: the filter stack's size (`stack_size`),
-/// `Item.ABSOLUTE_MAX_STACK_SIZE` (99) for an empty slot.
-pub fn filter_max(stack_size: Option<i32>) -> i32 {
-    stack_size.unwrap_or(ABSOLUTE_MAX_STACK_SIZE)
-}
-
 /// `FilteringBehaviour`'s `count` and `upTo`: how much a brass funnel or smart chute takes at
-/// once (saved as `FilterAmount`, `UpTo`). The count is always explicit, as Create's is: 99 up
-/// to (`Item.ABSOLUTE_MAX_STACK_SIZE`) from the constructor, whatever the filter; a filter set
-/// later leaves it be in "Up to" (an up-to 99 under a 16-stack filter stays 99, and so does an
-/// up-to 16 once the filter is gone). `read` turns a count of 0 (saves from before it was
-/// explicit) into the filter's stack size, so `getValueSettings`' and `anyAmount`'s `count == 0`
-/// never hold.
+/// once (`FilterAmount`, `UpTo`). Without a setting (`count` 0, as read from an empty save) it
+/// is up to the filter's stack size.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct FilterAmount {
-    count: i32,
-    up_to: bool,
+    /// 0: the filter's stack size.
+    pub count: u8,
+    pub up_to: bool,
 }
 
-/// The constructor's `count = Item.ABSOLUTE_MAX_STACK_SIZE, upTo = true`.
+/// `FilteringBehaviour`'s `count = 64, upTo = true`: up to a stack.
 impl Default for FilterAmount {
     fn default() -> FilterAmount {
         FilterAmount {
-            count: ABSOLUTE_MAX_STACK_SIZE,
+            count: 0,
             up_to: true,
         }
     }
 }
 
 impl FilterAmount {
-    /// `FilteringBehaviour.read` of `FilterAmount` and `UpTo` (0 and false when not saved):
-    /// "Migrate from previous behaviour", a count of 0 is up to `max`, the stack size
-    /// (`getMaxStackSize`, [`filter_max`]) of the filter read with it.
-    pub fn read(count: i32, up_to: bool, max: i32) -> FilterAmount {
-        if count == 0 {
-            return FilterAmount {
-                count: max,
-                up_to: true,
-            };
+    /// `FilteringBehaviour.read`: `count` 0 is up to a stack.
+    pub fn new(count: u8, up_to: bool) -> FilterAmount {
+        FilterAmount {
+            count,
+            up_to: up_to || count == 0,
         }
-        FilterAmount { count, up_to }
     }
 
-    /// `getAmount`: the count, as `write` saves it.
-    pub fn count(self) -> i32 {
-        self.count
-    }
-
-    /// `upTo`: the board's first row.
-    pub fn up_to(self) -> bool {
-        self.up_to
+    /// The count, `max` (the filter's stack size) for none.
+    pub fn count(self, max: i32) -> i32 {
+        if self.count == 0 {
+            max
+        } else {
+            i32::from(self.count)
+        }
     }
 
     /// `getValueSettings`.
-    pub fn settings(self) -> Settings {
+    pub fn settings(self, max: i32) -> Settings {
         Settings {
             row: if self.up_to { 0 } else { 1 },
-            value: self.count,
+            value: self.count(max),
         }
     }
 
-    /// `setValueSettings`: `count` within 1 and `max` (`getMaxStackSize`), "Up to" on the first
-    /// row.
+    /// `setValueSettings`: `count` within 1 and `max`, "Up to" on the first row.
     pub fn from_settings(s: Settings, max: i32) -> FilterAmount {
         FilterAmount {
-            count: s.value.clamp(1, max.max(1)),
+            count: s.value.clamp(1, max.clamp(1, 255)) as u8,
             up_to: s.row == 0,
         }
     }
 
-    /// `setFilter(stack)`: on the "Exactly" row a new, non-empty filter (`stack_size`, its
-    /// stack's `getMaxStackSize`) lowers the count to its stack size; "Up to", or a cleared
-    /// filter (None), leaves it.
-    pub fn with_filter(self, stack_size: Option<i32>) -> FilterAmount {
-        match stack_size {
-            Some(max) if !self.up_to => FilterAmount {
-                count: self.count.min(max.max(1)),
-                ..self
-            },
-            _ => self,
+    /// `setFilter`: an exact count fits the new filter's stack size (`max`).
+    pub fn fitted(self, max: i32) -> FilterAmount {
+        if self.up_to || self.count == 0 {
+            return self;
+        }
+        FilterAmount {
+            count: (i32::from(self.count).min(max.max(1))) as u8,
+            ..self
         }
     }
 
     /// The value a `create:value` message carries for it: the row in the second byte.
-    pub fn word(self) -> i32 {
-        let s = self.settings();
-        s.row << 8 | (s.value & 0xFF)
+    pub fn word(self, max: i32) -> i32 {
+        let s = self.settings(max);
+        s.row << 8 | s.value
     }
 }
 
@@ -880,90 +859,22 @@ mod tests {
     #[test]
     fn filter_amounts_round_trip_through_the_board() {
         let any = FilterAmount::default();
-        assert_eq!(any.settings(), Settings { row: 0, value: 99 });
-        assert_eq!(filter_text(any.settings(), filter_max(None)), "Any");
+        assert_eq!(any.settings(64), Settings { row: 0, value: 64 });
+        assert_eq!(filter_text(any.settings(64), 64), "Any");
+        assert_eq!(filter_text(any.settings(16), 16), "Any");
         let exact = FilterAmount::from_settings(Settings { row: 1, value: 0 }, 64);
-        assert_eq!(exact, FilterAmount::read(1, false, 64));
-        assert_eq!(filter_text(exact.settings(), 64), "=1");
+        assert_eq!(exact, FilterAmount::new(1, false));
+        assert_eq!(filter_text(exact.settings(64), 64), "=1");
         let up = FilterAmount::from_settings(Settings { row: 0, value: 20 }, 64);
-        assert_eq!(filter_text(up.settings(), 64), "\u{2264}20");
-        assert_eq!(filter_settings(up.word()), up.settings());
-        assert_eq!(filter_settings(exact.word()), exact.settings());
-        assert_eq!(filter_settings(any.word()), any.settings());
+        assert_eq!(filter_text(up.settings(64), 64), "\u{2264}20");
+        assert_eq!(filter_settings(up.word(64)), up.settings(64));
+        assert_eq!(filter_settings(exact.word(64)), exact.settings(64));
+        // An exact count fits a smaller stack; up to stays.
+        assert_eq!(FilterAmount::new(40, false).fitted(16).count, 16);
+        assert_eq!(FilterAmount::new(40, true).fitted(16).count, 40);
+        assert!(FilterAmount::new(0, false).up_to);
         let b = filter(64);
         assert_eq!((b.milestone_count(), b.scale()), (5, 2));
-        let b = filter(filter_max(None));
-        assert_eq!((b.max, b.milestone_count(), b.scale()), (99, 7, 2));
-    }
-
-    #[test]
-    fn a_fresh_filter_slot_is_up_to_99_whatever_its_filter() {
-        // The constructor's count, `Item.ABSOLUTE_MAX_STACK_SIZE`, without a filter...
-        let fresh = FilterAmount::default();
-        assert_eq!((fresh.count(), fresh.up_to()), (99, true));
-        assert_eq!(filter_max(None), 99);
-        assert_eq!(filter_max(Some(16)), 16);
-        // ...and once one is set: "Up to" keeps the count (`setFilter` only fits "Exactly").
-        let pearls = fresh.with_filter(Some(16));
-        assert_eq!(pearls.count(), 99);
-        assert_eq!(pearls.settings(), Settings { row: 0, value: 99 });
-        // Not "Any" under a 16-stack filter (`formatValue` compares with getMaxStackSize).
-        assert_eq!(filter_text(pearls.settings(), 16), "\u{2264}99");
-    }
-
-    #[test]
-    fn an_up_to_count_stays_when_its_filter_goes() {
-        // Up to 16 under ender pearls, then the filter removed: still 16 of 99, not "Any".
-        let up = FilterAmount::from_settings(Settings { row: 0, value: 16 }, 16);
-        let cleared = up.with_filter(None);
-        assert_eq!(cleared, up);
-        assert_eq!(cleared.count(), 16);
-        assert_eq!(
-            filter_text(cleared.settings(), filter_max(None)),
-            "\u{2264}16"
-        );
-        // Any other filter leaves an up-to count too, even above its stack size.
-        assert_eq!(up.with_filter(Some(1)).count(), 16);
-    }
-
-    #[test]
-    fn an_exact_count_fits_a_new_filter_but_not_a_cleared_one() {
-        // `setFilter`: `if (!upTo && !stack.isEmpty()) count = min(count, max)`.
-        let exact = FilterAmount::from_settings(Settings { row: 1, value: 40 }, 99);
-        assert_eq!(exact.settings(), Settings { row: 1, value: 40 });
-        let pearls = exact.with_filter(Some(16));
-        assert_eq!(pearls.settings(), Settings { row: 1, value: 16 });
-        // A larger stack does not raise it back, and an empty hand leaves it.
-        assert_eq!(pearls.with_filter(Some(64)).count(), 16);
-        assert_eq!(pearls.with_filter(None).count(), 16);
-        assert_eq!(exact.with_filter(None).count(), 40);
-        // `setValueSettings` clamps to the filter's stack size, at least 1.
-        let over = FilterAmount::from_settings(Settings { row: 1, value: 99 }, 16);
-        assert_eq!(over.count(), 16);
-        let none = FilterAmount::from_settings(Settings { row: 0, value: 0 }, 99);
-        assert_eq!(none.settings(), Settings { row: 0, value: 1 });
-    }
-
-    #[test]
-    fn a_count_of_0_from_an_older_save_reads_as_up_to_the_filter_s_stack() {
-        // `read`'s migration: 0 (or nothing saved) is up to `getMaxStackSize`, "Exactly" too.
-        assert_eq!(
-            FilterAmount::read(0, false, filter_max(Some(16))),
-            FilterAmount::read(16, true, 16)
-        );
-        assert_eq!(
-            FilterAmount::read(0, false, filter_max(None)),
-            FilterAmount::default()
-        );
-        assert_eq!(
-            FilterAmount::read(0, true, filter_max(Some(64))).count(),
-            64
-        );
-        // A saved count stays as saved, above the filter's stack size too.
-        let saved = FilterAmount::read(99, true, 16);
-        assert_eq!((saved.count(), saved.up_to()), (99, true));
-        let exact = FilterAmount::read(5, false, 64);
-        assert_eq!((exact.count(), exact.up_to()), (5, false));
     }
 
     fn motor(label: i32) -> Layout {

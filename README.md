@@ -114,7 +114,8 @@ Try it in a new world first.
 - **Differential fuzzing.** [tools/create-fuzz](tools/create-fuzz/README.md) runs the same random setups in
   Create's Java, on a headless server, and in the engine. When they differ, it shrinks the case to the smallest
   one that still differs. On 2026-11-25, its 124 recorded cases and 1,000 random scenarios (kinetics, belts,
-  funnels, chutes, depots, processing, fluids) matched Create 6.0.11.
+  funnels, chutes, depots, processing, fluids) matched Create's development branch at `37ea4af`, once the funnels
+  and chutes took its 99 items. That limit isn't in a release yet, so the port keeps 64, as the 6.0.10 jar does.
 - **Gaps written down.** When Horizon can't do something, the mod leaves it out and
   [HORIZON_GAPS.md](create/HORIZON_GAPS.md) says what and why. There are no stubs that pretend.
 

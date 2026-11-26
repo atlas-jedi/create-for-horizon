@@ -2466,21 +2466,17 @@ fn funnel_moved(lv: &mut ServerLevel<'_>, key: [i32; 3], a: &Actor, pos: [i32; 3
     if !lv.items_in(cell, cell.map(|v| v + 1.0)).is_empty() {
         return;
     }
-    // `FilterAmount` and `UpTo` as the funnel wrote them (`carry_out`: none for the
-    // constructor's up to 99 without a filter; a 0 or none beside a filter, carried by an older
-    // version, read as `FilteringBehaviour.read` would have: up to the filter's stack size); an
-    // andesite funnel's `hasFilter` is false: exactly one.
+    // `FilterAmount` and `UpTo` (a brass funnel's default: up to a stack); an andesite funnel's
+    // `hasFilter` is false: exactly one.
     let (amount, up_to) = if brass {
-        let (count, up_to) = match carried.as_ref().and_then(|c| c.get(&"FilterAmount".into())) {
-            Some(Tag::IntArray(v)) if v.len() == 2 => (v[0], v[1] != 0),
-            _ => (0, false),
-        };
-        let a =
-            crate::glue::logistics::amount::read_amount(&*lv.host, count, up_to, filter.as_ref());
-        (a.count().max(0) as u32, a.up_to())
+        match carried.as_ref().and_then(|c| c.get(&"FilterAmount".into())) {
+            Some(Tag::IntArray(v)) if v.len() == 2 => (v[0].clamp(0, 255) as u32, v[1] != 0),
+            _ => (0, true),
+        }
     } else {
         (1, false)
     };
+    let amount = if amount == 0 { 64 } else { amount };
     let taken = {
         let host = &*lv.host;
         extract_from(
@@ -3390,9 +3386,8 @@ pub fn psi_insert(
 }
 
 /// `InterfaceItemHandler.extractItem` through `ItemHelper.extract` (up to `amount` of the first
-/// item `test` passes, gathered from the slots in order, no more than its stack size:
-/// `canItemStackAmountsStack`) from the storage of the contraption the interface at `pos` is
-/// connected to. Err(()) when no connected item interface is there.
+/// item `test` passes, gathered from the slots in order) from the storage of the contraption the
+/// interface at `pos` is connected to. Err(()) when no connected item interface is there.
 pub fn psi_extract(
     lv: &ServerLevel<'_>,
     pos: [i32; 3],
@@ -3404,10 +3399,9 @@ pub fn psi_extract(
     let taken = STORAGE.with_borrow_mut(|m| {
         let list = m.get_mut(&(dim, key))?;
         let mut out: Option<ItemStack> = None;
-        let mut limit = amount;
         for (_, s) in list.iter_mut() {
             for slot in s.iter_mut() {
-                let want = limit - out.as_ref().map_or(0, ItemStack::count);
+                let want = amount - out.as_ref().map_or(0, ItemStack::count);
                 if want == 0 {
                     return out;
                 }
@@ -3421,10 +3415,6 @@ pub fn psi_extract(
                 if !fits {
                     continue;
                 }
-                if out.is_none() {
-                    limit = amount.min(slot_limit(lv, stack).max(1));
-                }
-                let want = limit - out.as_ref().map_or(0, ItemStack::count);
                 let n = want.min(stack.count());
                 match &mut out {
                     Some(o) => {

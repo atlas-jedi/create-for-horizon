@@ -1038,12 +1038,12 @@ pub(crate) fn set_smart_chute_filter(
     hand: mod_api::Hand,
 ) {
     let filter = filters::take_filter(lv.host, p, hand);
-    let stack = super::amount::filter_stack_size(&*lv.host, filter.as_ref());
+    let max = super::amount::filter_max(&*lv.host, filter.as_ref());
     let dim = lv.dim;
     let shown = filter.clone();
     let old = with_world(|w| {
         if let Some(a) = w.dims[dim].filter_amounts.get_mut(&pos) {
-            *a = a.with_filter(stack);
+            *a = a.fitted(max);
         }
         w.set_chute_filter(dim, pos, filter)
     })

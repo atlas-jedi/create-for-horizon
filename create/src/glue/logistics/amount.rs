@@ -12,39 +12,22 @@ use super::super::states;
 use super::super::world::with_world;
 use super::items;
 use create_engine::Block;
-use create_engine::board::{self, FilterAmount};
+use create_engine::board::FilterAmount;
 use create_engine::filter::Filter;
 use create_engine::funnel::BeltShape;
 use create_engine::kinetics::Dir;
 use mod_api::{ClientHost, Host, HostBlockStates, PlayerRef, Tag};
 
-/// The filter stack's `getMaxStackSize`, None for an empty slot (what `setFilter` fits an
-/// exact amount to, `FilterAmount::with_filter`).
-pub(crate) fn filter_stack_size(host: &dyn Host, filter: Option<&Filter>) -> Option<i32> {
+/// `getMaxStackSize(filter)`: 64 for an empty slot, else the filter stack's size.
+pub(crate) fn filter_max(host: &dyn Host, filter: Option<&Filter>) -> i32 {
     filter
         .and_then(|f| filters::filter_stack(host, f))
-        .map(|s| i32::from(items::stack_limit(host, &items::id_of(host, &s))))
+        .map_or(64, |s| {
+            i32::from(items::stack_limit(host, &items::id_of(host, &s)))
+        })
 }
 
-/// `getMaxStackSize(filter)`: the filter stack's size, 99 (`Item.ABSOLUTE_MAX_STACK_SIZE`) for
-/// an empty slot.
-pub(crate) fn filter_max(host: &dyn Host, filter: Option<&Filter>) -> i32 {
-    board::filter_max(filter_stack_size(host, filter))
-}
-
-/// `FilteringBehaviour.read` of the `FilterAmount` and `UpTo` saved for a filter slot (0 and
-/// false when none were), with the filter read with them: a count of 0, from a save older than
-/// the explicit count, is up to the filter's stack size.
-pub(crate) fn read_amount(
-    host: &dyn Host,
-    count: i32,
-    up_to: bool,
-    filter: Option<&Filter>,
-) -> FilterAmount {
-    FilterAmount::read(count, up_to, filter_max(host, filter))
-}
-
-/// The amount set on the filter slot at `pos` (the constructor's, up to 99, without one).
+/// The amount set on the filter slot at `pos` (up to a stack without one).
 fn amount_at(dim: usize, pos: [i32; 3]) -> FilterAmount {
     with_world(|w| w.dims[dim].filter_amounts.get(&pos).copied())
         .flatten()
@@ -103,15 +86,13 @@ pub(crate) fn settings(
     lv: &ServerLevel<'_>,
     pos: [i32; 3],
 ) -> Option<create_engine::board::Settings> {
-    shown(lv, pos)?;
-    Some(amount_at(lv.dim, pos).settings())
+    let max = shown(lv, pos)?;
+    Some(amount_at(lv.dim, pos).settings(max))
 }
 
 /// `FunnelBlockEntity.getAmountToExtract` and `getModeToExtract` for the funnel `f` at `pos`:
 /// a stack when it supports no amount, one item at a time for an andesite funnel (its filter
-/// is never active), else the count (`getAmountFromFilter`, `anyAmount` never holding), whether
-/// or not its board shows, exactly on its second row. Up to 99 takes no more than a stack
-/// (`ItemHelper.extract`).
+/// is never active), else the board's count, exactly on its second row.
 pub(crate) fn funnel_extraction(
     lv: &ServerLevel<'_>,
     pos: [i32; 3],
@@ -125,19 +106,21 @@ pub(crate) fn funnel_extraction(
     if !f.brass {
         return (1, false);
     }
-    let a = amount_at(lv.dim, pos);
-    (a.count().max(0) as u32, !a.up_to())
+    let dim = lv.dim;
+    let filter = with_world(|w| w.dims[dim].chute_filters.get(&pos).cloned()).flatten();
+    let a = amount_at(dim, pos);
+    let count = a.count(filter_max(&*lv.host, filter.as_ref()));
+    (count.max(1) as u32, !a.up_to)
 }
 
-/// `SmartChuteBlockEntity.getExtractionAmount` and `getExtractionMode`: the count while the
-/// board shows (`isCountVisible`; `anyAmount` never holds), exactly on its second row; else up
-/// to a stack.
+/// `SmartChuteBlockEntity.getExtractionAmount` and `getExtractionMode`: the board's count
+/// while it shows, exactly on its second row; else up to a stack.
 pub(crate) fn chute_extraction(lv: &ServerLevel<'_>, pos: [i32; 3]) -> (u32, bool) {
-    if shown(lv, pos).is_none() {
+    let Some(max) = shown(lv, pos) else {
         return (create_engine::chute::SMART_AMOUNT, false);
-    }
+    };
     let a = amount_at(lv.dim, pos);
-    (a.count().max(0) as u32, !a.up_to())
+    (a.count(max).max(1) as u32, !a.up_to)
 }
 
 /// `ValueSettingsPacket` on a filter slot (only while its board shows, `acceptsValueSettings`):
@@ -173,9 +156,9 @@ pub(crate) fn value_settings(
             }
         }
     } else if let Some(pick) = pick {
-        // `if (getValueSettings().equals(settings)) return;`, then the clamp.
-        if amount_at(dim, pos).settings() != pick {
-            let next = FilterAmount::from_settings(pick, max);
+        let now = amount_at(dim, pos);
+        let next = FilterAmount::from_settings(pick, max);
+        if now.settings(max) != next.settings(max) {
             with_world(|w| {
                 let d = &mut w.dims[dim];
                 d.filter_amounts.insert(pos, next);
@@ -186,7 +169,9 @@ pub(crate) fn value_settings(
             feedback_sound(lv, pos);
         }
     }
-    Some(amount_at(dim, pos).word())
+    // The stack size may have changed with the filter.
+    let max = shown(lv, pos).unwrap_or(max);
+    Some(amount_at(dim, pos).word(max))
 }
 
 /// `ValueSettingsBehaviour.playFeedbackSound`.
@@ -218,8 +203,7 @@ fn client_info(
     super::super::client_table(host, |t| t.get(state).map(|(b, i)| (b, *i))).flatten()
 }
 
-/// The filter slot's stack size as this client sees it (the filter its block entity shows; 99
-/// without one).
+/// The filter slot's stack size as this client sees it (the filter its block entity shows).
 fn client_filter_max(host: &dyn ClientHost, pos: [i32; 3]) -> i32 {
     let id = host
         .level(host.dimension())
@@ -230,7 +214,7 @@ fn client_filter_max(host: &dyn ClientHost, pos: [i32; 3]) -> i32 {
             _ => None,
         })
         .filter(|s| !s.is_empty());
-    board::filter_max(id.map(|id| i32::from(items::stack_limit(host, &id))))
+    id.map_or(64, |id| i32::from(items::stack_limit(host, &id)))
 }
 
 /// `isCountVisible` as this client sees it: the board's top value when it shows (`shown`; a

@@ -139,7 +139,7 @@ pub(crate) fn set_funnel_filter(
 ) {
     use crate::glue::items::filters;
     let filter = filters::take_filter(lv.host, p, hand);
-    let stack = super::amount::filter_stack_size(&*lv.host, filter.as_ref());
+    let max = super::amount::filter_max(&*lv.host, filter.as_ref());
     let dim = lv.dim;
     let old = with_world(|w| {
         let d = &mut w.dims[dim];
@@ -149,7 +149,7 @@ pub(crate) fn set_funnel_filter(
         };
         d.unsaved.push((pos[0] >> 4, pos[2] >> 4));
         if let Some(a) = d.filter_amounts.get_mut(&pos) {
-            *a = a.with_filter(stack);
+            *a = a.fitted(max);
         }
         old
     })
